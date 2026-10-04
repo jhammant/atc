@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 ATC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "atc.py")
 TMUX = shutil.which("tmux")
+NAMES = ("alpha-11", "beta-22", "gamma-33", "delta-44")
 
 
 def iso(seconds_ago):
@@ -124,12 +125,12 @@ class Fixture:
         os.makedirs(sleeper_dir)
         os.symlink(shutil.which("sleep"), os.path.join(sleeper_dir, "claude"))  # a process named claude
         cwds = {"beta-22": self.work, "alpha-11": os.path.join(self.work, "alpha"),
-                "gamma-33": os.path.join(self.work, "gamma")}
+                "gamma-33": os.path.join(self.work, "gamma"), "delta-44": os.path.join(self.root, "parked")}
         for cwd in cwds.values():
             os.makedirs(cwd, exist_ok=True)
         sleeper = os.path.join(sleeper_dir, "claude")
         first = True
-        for name in ("alpha-11", "beta-22", "gamma-33"):
+        for name in NAMES:
             cmd = f"exec {sleeper} 3600"
             if first:
                 subprocess.run([TMUX, "new-session", "-d", "-s", self.tmux_session, "-x", "120", "-y", "30",
@@ -140,22 +141,40 @@ class Fixture:
         out = subprocess.run([TMUX, "list-panes", "-s", "-t", self.tmux_session, "-F",
                               "#{window_index} #{pane_pid} #{pane_tty}"], capture_output=True, text=True, check=True).stdout
         panes = [line.split() for line in out.splitlines()]
-        for (window, pid, tty), name in zip(panes, ("alpha-11", "beta-22", "gamma-33")):
+        for (window, pid, tty), name in zip(panes, NAMES):
             self.sessions[name] = {"sid": self.sid(name), "pid": int(pid), "tty": tty, "window": window,
                                    "cwd": cwds[name]}
         self.write_registry()
         self.write_transcripts()
         self.write_agents_json()
+        self.make_repo()
+        codex = os.path.join(sleeper_dir, "codex")  # an agent process outside every session...
+        os.symlink(shutil.which("sleep"), codex)
+        out = subprocess.run(["/bin/sh", "-c", f"{codex} 3600 >/dev/null 2>&1 </dev/null & echo $!"],
+                             capture_output=True, text=True, check=True)
+        self.stray = int(out.stdout.strip())  # ...orphaned to launchd, like a forgotten one
         return self
+
+    def make_repo(self):
+        """The work folder is a git repo with one uncommitted file: unsaved work atc should flag."""
+        git = ["git", "-C", self.work, "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", self.work], check=True)
+        with open(os.path.join(self.work, "README.md"), "w") as fh:
+            fh.write("fixture\n")
+        subprocess.run(git + ["add", "README.md"], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "init"], check=True)
+        with open(os.path.join(self.work, "notes.txt"), "w") as fh:
+            fh.write("not committed yet\n")
 
     @staticmethod
     def sid(name):
-        n = {"alpha-11": 1, "beta-22": 2, "gamma-33": 3, "bg": 4}[name]
+        n = {"alpha-11": 1, "beta-22": 2, "gamma-33": 3, "bg": 4, "delta-44": 5}[name]
         return f"0000000{n}-0000-4000-8000-00000000000{n}"
 
     def write_registry(self):
         os.makedirs(os.path.join(self.claude_home, "sessions"), exist_ok=True)
-        status = {"alpha-11": ("busy", 20), "beta-22": ("idle", 600), "gamma-33": ("waiting", 30)}
+        status = {"alpha-11": ("busy", 20), "beta-22": ("idle", 600), "gamma-33": ("waiting", 30),
+                  "delta-44": ("idle", 13 * 3600)}
         for i, (name, s) in enumerate(self.sessions.items()):
             st, ago = status[name]
             data = {"pid": s["pid"], "sessionId": s["sid"], "cwd": s["cwd"], "name": name, "status": st,
@@ -165,7 +184,8 @@ class Fixture:
                 json.dump(data, fh)
 
     def write_agents_json(self, overrides=None):
-        status = {"alpha-11": ("busy", None), "beta-22": ("idle", None), "gamma-33": ("waiting", "permission prompt")}
+        status = {"alpha-11": ("busy", None), "beta-22": ("idle", None), "gamma-33": ("waiting", "permission prompt"),
+                  "delta-44": ("idle", None)}
         status.update(overrides or {})
         entries = []
         for i, (name, s) in enumerate(self.sessions.items()):
@@ -245,6 +265,12 @@ class Fixture:
                         "Please review the API before we ship</cross-session-message>"},
             assistant(610, text("Done. Want me to ship it?"), stop="end_turn"),
         ])
+        d = self.sessions["delta-44"]
+        write_jsonl(os.path.join(self.transcript_dir("delta-44"), f"{d['sid']}.jsonl"), [
+            user(13 * 3600 + 60, "Tidy the old notes"),
+            {"type": "ai-title", "aiTitle": "Old notes"},
+            assistant(13 * 3600, text("Tidied; nothing else to do."), stop="end_turn"),
+        ])
         write_jsonl(os.path.join(self.transcript_dir("gamma-33"), f"{g['sid']}.jsonl"), [
             user(120, "Clean up the build output"),
             {"type": "ai-title", "aiTitle": "Cleanup"},
@@ -286,5 +312,10 @@ class Fixture:
                               capture_output=True, text=True).stdout.strip()
 
     def stop(self):
+        if getattr(self, "stray", None):
+            try:
+                os.kill(self.stray, 9)
+            except OSError:
+                pass
         subprocess.run([TMUX, "kill-session", "-t", self.tmux_session], capture_output=True)
         shutil.rmtree(self.root, ignore_errors=True)

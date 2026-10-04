@@ -36,6 +36,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -644,6 +645,59 @@ def process_table():
     return table
 
 
+class Repos:
+    """Uncommitted and unpushed work in each session's repo, refreshed in the background (git is slow on big repos)."""
+
+    EVERY = 30.0
+
+    def __init__(self, background=True):
+        self.folders = set()   # session folders to watch
+        self.roots = {}        # folder -> repo root (or "")
+        self.state = {}        # repo root -> {"dirty", "unpushed", "branch", "upstream"}
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def watch(self, folders):
+        self.folders = set(f for f in folders if f)
+
+    def root(self, folder):
+        if folder not in self.roots:
+            code, out, _err = run(["git", "-C", folder, "rev-parse", "--show-toplevel"], timeout=10)
+            self.roots[folder] = out.strip() if code == 0 else ""
+        return self.roots[folder]
+
+    def fetch(self):
+        state = {}
+        for folder in list(self.folders):
+            root = self.root(folder)
+            if not root or root in state:
+                continue
+            _c, status, _e = run(["git", "-C", root, "status", "--porcelain", "--branch"], timeout=20)
+            lines = status.splitlines()
+            head = lines[0] if lines and lines[0].startswith("## ") else ""
+            code, ahead, _e = run(["git", "-C", root, "rev-list", "--count", "@{upstream}..HEAD"], timeout=10)
+            upstream = code == 0
+            if not upstream:  # no upstream: commits that are on no remote at all
+                code, ahead, _e = run(["git", "-C", root, "rev-list", "--count", "HEAD", "--not", "--remotes"], timeout=10)
+            state[root] = {"dirty": sum(1 for ln in lines if not ln.startswith("## ")),
+                           "unpushed": int(ahead.strip()) if code == 0 and ahead.strip().isdigit() else 0,
+                           "branch": head[3:].split("...")[0] if head else "", "upstream": upstream}
+        self.state = state
+        return state
+
+    def loop(self):
+        checked, at = None, 0.0
+        while True:  # check at once when the set of folders changes (start-up, a new session), else every 30s
+            folders = frozenset(self.folders)
+            if folders != checked or time.time() - at >= self.EVERY:
+                self.fetch()
+                checked, at = folders, time.time()
+            time.sleep(1)
+
+    def of(self, folder):
+        return self.state.get(self.roots.get(folder) or "", None)
+
+
 class Procs:
     """The process table, refreshed in the background: `ps -A` takes ~1s on a busy Mac, too slow for the screen loop."""
 
@@ -885,11 +939,12 @@ class Remote:
 # ---------------------------------------------------------------- the fleet
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
         self.proc_watch = procs or Procs(background=False)
+        self.repos = repos
         self.sessions = {}       # sid -> Session
         self.activity = []       # (ts, agent, tool, detail)
         self.addresses = {}      # messaging address -> session name
@@ -955,6 +1010,8 @@ class Fleet:
             if sid not in seen:
                 del self.sessions[sid]
         self.agents = loose_agents(self.procs, {s.pid for s in self.sessions.values() if s.pid}) if not self.only else []
+        if self.repos is not None:
+            self.repos.watch(s.cwd for s in self.sessions.values())
         order = sorted(self.sessions.values(), key=lambda s: parse_ts(s.entry.get("startedAt")) or 0)
         for i, session in enumerate(order):
             session.color = SESSION_COLORS[i % len(SESSION_COLORS)]
@@ -1022,6 +1079,8 @@ class Fleet:
 
     def model(self, now, quota=None, remotes=()):
         sessions = [session_view(s, now, self) for s in self.sessions.values()]
+        for v in sessions:
+            v["repo"] = self.repos.of(v["cwd"]) if self.repos is not None else None
         if self.herdr and self.herdr.running:
             panes = self.herdr.by_session()
             for v in sessions:
@@ -1059,6 +1118,8 @@ class Fleet:
                 "helpers": len(helpers),
                 "helpers_working": sum(1 for h in helpers if h["working"]),
                 "agents": len(self.agents),
+                "unsaved": len({(self.repos.roots.get(v["cwd"]) if self.repos else v["cwd"]) for v in sessions
+                                if v.get("repo") and (v["repo"]["dirty"] or v["repo"]["unpushed"])}),
             },
             "agents": self.agents,
             "comms": self.comms(),
@@ -1402,6 +1463,8 @@ class Terminals:
 
 
 def terminal_kind():
+    """Where new tabs open. ATC_TERMINAL: iterm, terminal, tmux, tmux-bg (windows in a detached `atc` tmux
+    session you attach to from anywhere, ssh included), or none."""
     forced = os.environ.get("ATC_TERMINAL")
     if forced:
         return None if forced == "none" else forced
@@ -1424,6 +1487,13 @@ def open_tab(cwd, command, dry_run=False):
     if kind == "tmux":
         code, _out, err = run(["tmux", "new-window", "-c", cwd, command])
         return "opened a tmux window" if code == 0 else f"tmux failed: {first_line(err)}"
+    if kind == "tmux-bg":
+        exists = run(["tmux", "has-session", "-t", "atc"])[0] == 0
+        args = (["tmux", "new-window", "-t", "atc:", "-c", cwd, command] if exists
+                else ["tmux", "new-session", "-d", "-s", "atc", "-c", cwd, command])
+        code, _out, err = run(args)
+        return ("started in tmux session atc (tmux attach -t atc)" if code == 0
+                else f"tmux failed: {first_line(err)}")
     if kind == "iterm":
         script = f"""tell application "iTerm2"
  if (count of windows) is 0 then create window with default profile
@@ -1537,20 +1607,32 @@ def session_lines(v, name_w, now):
         row.append(("   " + clean(v["title"]), "dim"))
     elif v["title"]:
         row.append(("   " + clean(v["title"]), "dim"))
+    repo = v.get("repo")
+    if repo and (repo["dirty"] or repo["unpushed"]):
+        row.append(("   " + unsaved_text(repo), "warn"))
     lines = [(row, v["sid"])]
     for team in v["teams"]:
         lines.append(([("     ⎿ ", "dim"), (clean(team["name"]) + "  ", v["color"])] + phase_marks(team), None))
         label_w = min(28, max(len(clean(a["label"])) for a in team["agents"]))
         for a in team["agents"]:
-            lines.append((helper_line(a, now, "         ", label_w), None))
+            lines.append((helper_line(a, now, "         ", label_w), f"{v['sid']}::{a['id']}"))
     if v["helpers"]:
         label_w = min(34, max(len(clean(a["label"])) for a in v["helpers"]))
         for a in v["helpers"]:
-            lines.append((helper_line(a, now, "     ⎿ ", label_w), None))
+            lines.append((helper_line(a, now, "     ⎿ ", label_w), f"{v['sid']}::{a['id']}"))
     for w in v["workers"]:
         lines.append(([("     ⎿ ", "dim"), ("⚙ ", "c2"), (f"pid {w['pid']} up {human_age(etime_seconds(w['etime']))}  ", "dim"),
                        (clean(w["command"]), "plain")], None))
     return lines
+
+
+def unsaved_text(repo):
+    parts = []
+    if repo["dirty"]:
+        parts.append(f"{repo['dirty']} uncommitted")
+    if repo["unpushed"]:
+        parts.append(f"{repo['unpushed']} unpushed" + ("" if repo.get("upstream") else " (no upstream)"))
+    return "⚠ " + " · ".join(parts)
 
 
 def helper_dot(a):
@@ -1594,7 +1676,7 @@ def fleet_lines(model, width, show_all):
             if model.get("agents"):
                 out.append((rule(f"Other agents ({len(model['agents'])})", width, "outside any Claude session"), None))
                 for a in model["agents"]:
-                    out.append((agent_row(a, name_w), None))
+                    out.append((agent_row(a, name_w), f"@local::p::{a['pid']}"))
             continue
         if not groups[key]:
             continue
@@ -1634,12 +1716,13 @@ def host_lines(h, width, name_w):
     for v in remote_sessions:
         dot, dot_style = GROUP_LOOK.get(v.get("group"), ("○", "dim"))
         out.append(([(dot + " ", dot_style), (col(v.get("name"), name_w) + " ", "c3"),
-                     (col(v.get("state"), 13) + " ", "plain"), (clean(v.get("doing")), "plain")], None))
+                     (col(v.get("state"), 13) + " ", "plain"), (clean(v.get("doing")), "plain")],
+                    f"@{h['host']}::s::{v.get('sid')}"))
     quiet = sum(len(h["groups"].get(k, [])) for k in ("parked", "background", "other"))
     if quiet:
         out.append(([(f"  + {quiet} idle Claude sessions", "dim")], None))
     for a in h["agents"]:
-        out.append((agent_row(a, name_w), None))
+        out.append((agent_row(a, name_w), f"@{h['host']}::p::{a['pid']}"))
     if not remote_sessions and not quiet and not h["agents"]:
         out.append(([("  no Claude sessions or agent processes", "dim")], None))
     return out
@@ -1675,6 +1758,130 @@ def comm_lines(items, limit):
     return [comm_line(item) for item in reversed(items[-limit:])] or [[("No messages yet.", "dim")]]
 
 
+def resolve(fleet, model, key):
+    """What a selected row is: ("session", v) | ("helper", v, row, helper) | ("process", host, agent) |
+    ("remote", host, v) | (None,)."""
+    if not key:
+        return (None,)
+    if key.startswith("@"):
+        parts = key[1:].split("::", 2)
+        if len(parts) != 3:
+            return (None,)
+        host, kind, ident = parts
+        if host == "local":
+            agent = next((a for a in model.get("agents", []) if str(a["pid"]) == ident), None)
+            return ("process", None, agent) if agent else (None,)
+        h = next((x for x in model.get("hosts", []) if x["host"] == host), None)
+        if h is None:
+            return (None,)
+        if kind == "p":
+            agent = next((a for a in h["agents"] if str(a["pid"]) == ident), None)
+            return ("process", h, agent) if agent else (None,)
+        v = next((x for g in h["groups"].values() for x in g if str(x.get("sid")) == ident), None)
+        return ("remote", h, v) if v else (None,)
+    sid, _, hid = key.partition("::")
+    v = next((x for x in ordered_sessions(model, True) if x["sid"] == sid), None)
+    if v is None:
+        return (None,)
+    if not hid:
+        return ("session", v)
+    session = fleet.sessions.get(sid)
+    helper = next((h for h in session.helpers.values() if h.hid == hid), None) if session else None
+    row = next((a for a in v["helpers"] + [a for t in v["teams"] for a in t["agents"]] if a["id"] == hid), None)
+    return ("helper", v, row, helper) if helper and row else ("session", v)
+
+
+def selection_name(item):
+    kind = item[0]
+    if kind == "session":
+        return item[1]["name"]
+    if kind == "helper":
+        return f"{item[2]['label']} (in {item[1]['name']})"
+    if kind == "process":
+        return f"{item[2]['tool']} pid {item[2]['pid']}" + (f" on {item[1]['host']}" if item[1] else "")
+    if kind == "remote":
+        return f"{item[2].get('name')} on {item[1]['host']}"
+    return "-"
+
+
+def selection_lines(fleet, model, item, limit, width):
+    """The bottom panel, or the full view, for whatever row is selected."""
+    kind = item[0]
+    if kind == "session":
+        return detail_lines(fleet, item[1], limit)
+    if kind == "helper":
+        return helper_lines(fleet, item[1], item[2], item[3], limit, width)
+    if kind == "process":
+        host, a = item[1], item[2]
+        lines = [[("process  ", "dim"), (f"{a['tool']}  pid {a['pid']}", "c2"),
+                  (f"   on {host['host'] if host else 'this Mac'}", "plain"),
+                  (f"   up {human_age(a.get('age', etime_seconds(a['etime'])))}", "warn" if a.get("stale") else "dim")]]
+        if a.get("parent"):
+            lines.append([("started by ", "dim"), (clean(a["parent"]), "plain")])
+        if a.get("stale"):
+            lines.append([("stale?  ", "warn"), ("running for over a day: probably stuck or never cleaned up", "warn")])
+        lines.append([("command ", "dim")])
+        lines += [[("  " + part, "plain")] for part in wrap(a["command"], width - 4)]
+        lines.append([("x x stops it (SIGTERM" + (" over ssh)" if host else ")"), "dim")])
+        return lines[:limit] if limit else lines
+    if kind == "remote":
+        h, v = item[1], item[2]
+        lines = [[(clean(v.get("name")) + "  ", "c3"), (f"on {h['host']}  ", "plain"), (short_path(v.get("cwd")), "dim")],
+                 [("state  ", "dim"), (clean(v.get("state")) + "   ", "plain"), (clean(v.get("doing")), "plain")],
+                 [("title  ", "dim"), (clean(v.get("title")) or "-", "plain")],
+                 [("enter opens an ssh shell there in a new tab", "dim")]]
+        return lines
+    return [[("Select a row with up/down.", "dim")]]
+
+
+def helper_lines(fleet, v, row, helper, limit, width):
+    """A subagent or workflow agent: who started it, its task, its steps and its report."""
+    session = fleet.sessions.get(v["sid"])
+    parent = session.by_hid().get(row["parent"]) if session and row["parent"] else None
+    dot, style = helper_dot(row)
+    tags = "  ".join(t for t in (row["model"], f"phase {row['phase']}" if row["phase"] else "",
+                                  "worktree" if row["worktree"] else "") if t)
+    lines = [[(dot + " ", style), (clean(row["label"]) + "  ", v["color"]), (tags, "dim")],
+             [("started by ", "dim"), (clean(parent.label if parent else v["name"]), "plain"),
+              ("   " + ("done" if row["finished"] else clean(row["doing"])), "plain" if row["working"] else "dim")]]
+    text, _ts = helper.get_task()
+    if text:
+        lines.append([("task", "head")])
+        task = wrap(text, width - 4)
+        lines += [[("  " + part, "plain")] for part in task[:8]]
+        if len(task) > 8:
+            lines.append([(f"  … {len(task) - 8} more lines (c shows the whole message)", "dim")])
+    if row["finished"] and helper.last_text_full:
+        lines.append([("report", "head")])
+        lines += [[("  " + part, "ok")] for part in wrap(helper.last_text_full, width - 4)[:8]]
+    kids = [h for h in (session.helpers.values() if session else []) if h.parent_id == helper.hid]
+    if kids:
+        lines.append([("its own helpers: ", "dim"), (", ".join(clean(k.label) for k in kids), "plain")])
+    steps = [item for item in fleet.activity if item[1] is helper]
+    lines.append([("its steps, newest first", "head")])
+    lines += activity_lines(steps, max(1, (limit or 200) - len(lines)))
+    return lines[:limit] if limit else lines
+
+
+def stop_process(host, pid, dry_run=False):
+    """SIGTERM an agent process here, or on a server over ssh."""
+    where = f" on {host}" if host else ""
+    if dry_run:
+        return f"dry run: would stop pid {pid}{where}"
+    if not host:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            return f"stopped pid {pid}"
+        except ProcessLookupError:
+            return f"pid {pid} had already gone"
+        except PermissionError:
+            return f"not allowed to stop pid {pid}: it belongs to another user"
+    ssh = shlex.split(os.environ.get("ATC_SSH") or "ssh")
+    code, _out, err = run(ssh + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, "kill", str(int(pid))],
+                          timeout=20)
+    return f"stopped pid {pid}{where}" if code == 0 else f"couldn't stop pid {pid}{where}: {first_line(err) or code}"
+
+
 def detail_lines(fleet, v, limit):
     if not v:
         return [[("Select a session with up/down.", "dim")]]
@@ -1688,6 +1895,11 @@ def detail_lines(fleet, v, limit):
         lines.append([("said   ", "dim"), (clean(v["said"]), "plain")])
     if v["alert"]:
         lines.append([("alert  ", "dim"), (clean(v["alert"]), v["alert_style"])])
+    if v.get("repo"):
+        repo = v["repo"]
+        state = unsaved_text(repo) if repo["dirty"] or repo["unpushed"] else "everything committed and pushed"
+        lines.append([("git    ", "dim"), (f"{repo['branch'] or '?'}  ", "plain"),
+                      (state, "warn" if repo["dirty"] or repo["unpushed"] else "ok")])
     session = fleet.sessions.get(v["sid"])
     mine = [item for item in fleet.activity if item[1] is session or getattr(item[1], "owner", None) is session]
     lines.append(rule("its activity", 40))
@@ -1709,6 +1921,8 @@ def header_line(model):
     ]
     if c["agents"]:
         line.append((f" · other agents {c['agents']}", "c2"))
+    if c.get("unsaved"):
+        line.append((f" · ⚠ unsaved work in {c['unsaved']} repo{'s' if c['unsaved'] != 1 else ''}", "warn"))
     for h in model.get("hosts", []):
         if not h["ok"]:
             line.append((f" · {h['host']} unreachable", "err"))
@@ -1878,14 +2092,17 @@ def draw_tree(nodes, prefix=""):
 
 # ---------------------------------------------------------------- the screen
 
-KEYS = ("↑↓ select · enter jump · m msg · M broadcast · x interrupt · c comms · h tree · n task · "
-        "+/- cap · tab panel · p more · ? help · q quit")
+KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · c comms · "
+        "h tree · n task · +/- cap · tab · p · ? help · q quit")
 
 HELP = [
     "enter      jump to the session's terminal tab; a background session opens attached in a new tab",
     "m          type a message into the selected session, as if you typed it in its tab",
     "M          type the same message into every session in the selected session's project (its folder)",
-    "x x        interrupt the selected session (sends Esc); for a background session, `claude stop`",
+    "x x        interrupt the selected session (sends Esc); a background session: `claude stop`;",
+    "           an agent process (here or on a server): SIGTERM, over ssh for a server",
+    "enter      on a subagent, a process or a server row: open it (its task, steps, report, command)",
+    "C C / F F  type /closecode or /forkcode into the selected session (wrap it up, or split work off)",
     "           Steering never types into a session that is blocked on a prompt: that would answer it.",
     "c          comms: every message: session to session (✉), task to a helper (→), report back (←)",
     "h          the hierarchy: session > workflow > phase > agent > nested agent, worker processes",
@@ -1893,7 +2110,7 @@ HELP = [
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
     "tab        bottom panel: all activity, the selected session, comms",
-    "p          list parked, background and other sessions too",
+    "p          hide or show parked, background and other sessions (shown by default)",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
 ]
@@ -1905,7 +2122,7 @@ def render(fleet, model, ui, width, height=None):
     frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
     rows = fleet_lines(model, width, ui["show_all"] or height is None)
     selectable = [sid for _l, sid in rows if sid]
-    selected = next((v for v in ordered_sessions(model, True) if v["sid"] == ui["selected"]), None)
+    item = resolve(fleet, model, ui.get("selected"))
 
     if height is None:  # --once: everything, no scrolling
         frame += [fit(line, width) for line, _sid in rows]
@@ -1936,7 +2153,7 @@ def render(fleet, model, ui, width, height=None):
     panel = ui["panel"]
     room = bottom_h - 1
     if panel == "session":
-        title, left = f"Selected: {selected['name'] if selected else '-'}", detail_lines(fleet, selected, room)
+        title, left = f"Selected: {selection_name(item)}", selection_lines(fleet, model, item, room, width)
     elif panel == "comms" and width < 150:
         title, left = "Comms (c opens the full view)", comm_lines(model["comms"], room)
     else:
@@ -1970,12 +2187,22 @@ def render_view(fleet, model, ui, width, height):
     view = ui["view"]
     selected = ui["selected"]
     mine = ui["view_mine"] and selected
+    key = selected  # the full row key: the detail view needs it whole
+    selected = (selected or "").split("::")[0] or None  # comms and tree filter by the session
     name = next((v["name"] for v in ordered_sessions(model, True) if v["sid"] == selected), None)
+    if mine and name is None:
+        mine = False  # a process or a server row: show everything
     frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
     room = height - 4
     if view == "help":
         frame.append(rule("Keys", width))
         frame += [[(line, "plain")] for line in HELP]
+    elif view == "detail":
+        item = resolve(fleet, model, key)
+        lines = selection_lines(fleet, model, item, 0, width)
+        ui["view_scroll"] = max(0, min(ui["view_scroll"], max(0, len(lines) - room)))
+        frame.append(rule(selection_name(item), width, "↑↓ PgUp PgDn scroll · esc closes"))
+        frame += [fit(line, width) for line in lines[ui["view_scroll"]: ui["view_scroll"] + room]]
     elif view == "tree":
         lines = tree_lines(fleet, model, selected if mine else None)
         ui["view_scroll"] = max(0, min(ui["view_scroll"], max(0, len(lines) - room)))
@@ -2051,7 +2278,7 @@ class App:
         self.route_cmd = route_cmd
         self.claude_cmd = claude_cmd
         self.dry_run = dry_run
-        self.ui = {"selected": None, "panel": "activity", "show_all": False, "scroll": 0, "top_scroll": 0,
+        self.ui = {"selected": None, "panel": "activity", "show_all": True, "scroll": 0, "top_scroll": 0,
                    "footer": [], "view": None, "view_mine": False, "view_scroll": 0, "view_pick": 0}
         self.selectable = []
         self.flash = ("", 0.0)
@@ -2066,7 +2293,9 @@ class App:
         self.flash = (message, time.time())
 
     def selected_view(self, model):
-        return next((v for v in ordered_sessions(model, True) if v["sid"] == self.ui["selected"]), None)
+        """The selected session, when a session row (not a helper, process or server row) is selected."""
+        item = resolve(self.fleet, model, self.ui["selected"])
+        return item[1] if item[0] == "session" else None
 
     def footer(self, now):
         if self.mode == "task":
@@ -2121,7 +2350,13 @@ class App:
                 self.ui["panel"] = order[-1]
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
-            self.jump(v)
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] in ("helper", "process"):
+                self.ui.update(view="detail", view_scroll=0)
+            elif item[0] == "remote":
+                self.open_remote(item[1], item[2])
+            else:
+                self.jump(v)
         elif key == "p":
             self.ui["show_all"] = not self.ui["show_all"]
         elif key in ("c", "h", "?"):
@@ -2136,14 +2371,55 @@ class App:
         elif key == "n":
             self.task = {"cwd": v["cwd"] if v else os.getcwd(), "text": "", "plan": None, "error": None}
             self.buffer, self.mode = "", "task"
+        elif key in ("C", "F"):
+            self.session_command(v, {"C": "/closecode", "F": "/forkcode"}[key], key)
         elif key == "m":
+            if v is None:
+                return self.say("select a session row to message it (subagents are steered through their session)") or True
             self.start_message([v] if v else [])
         elif key == "M":
             peers = [p for p in ordered_sessions(model, True) if v and within(p["cwd"], v["cwd"])]
             self.start_message(peers)
         elif key == "x":
-            self.interrupt(v)
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] == "process":
+                self.stop(item)
+            elif item[0] == "helper":
+                self.say("a subagent stops with its session: select the session row, x x interrupts it")
+            else:
+                self.interrupt(v)
         return True
+
+    def confirm(self, key, what):
+        """True on the second press of `key` within a few seconds; the first press says what will happen."""
+        armed, at = self.armed
+        if armed != key or time.time() - at > CONFIRM_SECONDS:
+            self.armed = (key, time.time())
+            self.say(f"press {key[0]} again within {int(CONFIRM_SECONDS)}s to {what}")
+            return False
+        self.armed = (None, 0.0)
+        return True
+
+    def stop(self, item):
+        host, agent = item[1], item[2]
+        where = f" on {host['host']}" if host else ""
+        if self.confirm(f"x:{agent['pid']}{where}", f"stop {agent['tool']} pid {agent['pid']}{where}"):
+            self.say(stop_process(host["host"] if host else None, agent["pid"], self.dry_run))
+
+    def session_command(self, v, command, key):
+        if v is None or v["kind"] not in ("interactive", "herdr"):
+            return self.say(f"select a live session row to run {command} in it")
+        if v["group"] == "blocked":
+            return self.say(f"{v['name']} is blocked on a prompt: answer it first (enter jumps there)")
+        if self.confirm(f"{key}:{v['sid']}", f"type {command} into {v['name']}"):
+            self.targets = [v]
+            self.submit_message(command)
+
+    def open_remote(self, host, v):
+        ssh = shlex.split(os.environ.get("ATC_SSH") or "ssh")
+        remote = f"cd {shlex.quote(v.get('cwd') or '~')} 2>/dev/null; exec $SHELL -l"
+        command = " ".join(shlex.quote(p) for p in ssh + ["-t", host["host"], remote])
+        self.say(open_tab(HOME, command, self.dry_run))
 
     def handle_view_key(self, key):
         ui = self.ui
@@ -2230,12 +2506,9 @@ class App:
     def interrupt(self, v):
         if not v:
             return self.say("nothing selected")
-        armed_sid, at = self.armed
-        if armed_sid != v["sid"] or time.time() - at > CONFIRM_SECONDS:
-            self.armed = (v["sid"], time.time())
-            verb = "stop the background session" if v["kind"] == "background" else "interrupt"
-            return self.say(f"press x again within {int(CONFIRM_SECONDS)}s to {verb} {v['name']}")
-        self.armed = (None, 0.0)
+        verb = "stop the background session" if v["kind"] == "background" else "interrupt"
+        if not self.confirm(f"x:{v['sid']}", f"{verb} {v['name']}"):
+            return
         if v["kind"] == "background":
             if self.dry_run:
                 return self.say(f"dry run: claude stop {v['id']}")
@@ -2373,7 +2646,8 @@ def main():
 
     feed = Feed(claude_cmd if shutil.which(claude_cmd[0]) else None, background=not one_shot)
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), args.dry_run, background=not one_shot)
-    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot))
+    repos = Repos(background=not one_shot)
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
@@ -2390,6 +2664,7 @@ def main():
             w.join()
         now = time.time()
         fleet.refresh(now)
+        repos.fetch()
         model = fleet.model(now, quota, remotes)
         if args.jump:
             target = next((v for v in ordered_sessions(model, True) if v["sid"] == args.jump), None)

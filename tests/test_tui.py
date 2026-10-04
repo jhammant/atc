@@ -32,19 +32,20 @@ def tearDownModule():
 class Screen:
     """atc running in a tmux window of its own, with keys in and the screen out."""
 
-    def __init__(self, width, height, *args):
+    def __init__(self, width, height, *args, hosts=False, extra_env=None, ready="Blocked on you"):
         self.name = f"atc-ui-{os.getpid()}-{width}x{height}"
         self.err = os.path.join(FX.root, f"{self.name}.err")
         self.code = os.path.join(FX.root, f"{self.name}.code")
         self.debug = os.path.join(FX.root, f"{self.name}.debug")
-        env = FX.env(ATC_DEBUG_LOG=self.debug)
+        env = FX.env(ATC_DEBUG_LOG=self.debug, **(extra_env or {}))
         exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items() if k.startswith(("ATC_", "CLAUDE_", "TERM")))
+        hosts_arg = "" if hosts else "--no-hosts"
         command = (f"cd {shlex.quote(FX.work)} && env {exports} HOME={shlex.quote(env['HOME'])} "
-                   f"{shlex.quote(sys.executable)} {shlex.quote(fixture.ATC)} --no-hosts {' '.join(args)} "
+                   f"{shlex.quote(sys.executable)} {shlex.quote(fixture.ATC)} {hosts_arg} {' '.join(args)} "
                    f"2> {shlex.quote(self.err)}; echo $? > {shlex.quote(self.code)}; sleep 30")
         subprocess.run([TMUX, "new-session", "-d", "-s", self.name, "-x", str(width), "-y", str(height), command],
                        check=True)
-        self.wait_for("Blocked on you")
+        self.wait_for(ready)
 
     def text(self):
         return subprocess.run([TMUX, "capture-pane", "-p", "-t", self.name], capture_output=True, text=True).stdout
@@ -71,27 +72,40 @@ class Screen:
         raise AssertionError(f"{'still saw' if absent else 'never saw'} {needle!r} on screen:\n{self.text()}")
 
     def selected(self):
-        for line in self.lines():
-            if line.startswith("▶"):
-                return line[1:].split()[1]
-        return None
+        line = self.selected_line()
+        return line.split()[1] if line and len(line.split()) > 1 else None
+
+    def selected_line(self):
+        return next((line[1:] for line in self.lines() if line.startswith("▶")), "")
+
+    def select_line(self, needle, tries=40):
+        """Arrow down from the top until the selected row contains `needle`."""
+        self.select("gamma-33")
+        for _ in range(tries):
+            if needle in self.selected_line():
+                return
+            before = self.selected_line()
+            self.step("Down")
+            if self.selected_line() == before:
+                break
+        raise AssertionError(f"no row with {needle!r}; selected: {self.selected_line()!r}")
 
     def step(self, key):
         """Press one arrow and wait until the screen shows the selection has moved (or can't move)."""
-        before = self.selected()
+        before = self.selected_line()
         self.press(key, pause=0.05)
-        end = time.time() + 1.5
-        while time.time() < end and self.selected() == before:
+        end = time.time() + 1.0
+        while time.time() < end and self.selected_line() == before:
             time.sleep(0.05)
 
     def select(self, name):
         for key in ("Up", "Down"):
-            for _ in range(8):
+            for _ in range(60):
                 if self.selected() == name:
                     return
-                before = self.selected()
+                before = self.selected_line()
                 self.step(key)
-                if self.selected() == before:
+                if self.selected_line() == before:
                     break  # reached the end in this direction
         if self.selected() != name:
             raise AssertionError(f"couldn't select {name}; selected is {self.selected()}")
@@ -131,8 +145,11 @@ class Wide(unittest.TestCase):
 
     def test_01_layout(self):
         text = self.s.text()
-        for heading in ("Blocked on you (1)", "Waiting on you (1)", "Working (1)", "Activity, all sessions", "Comms"):
+        for heading in ("Blocked on you (1)", "Waiting on you (1)", "Working (1)", "Parked (1)", "Background (1)",
+                        "Activity, all sessions", "Comms"):
             self.assertIn(heading, text)
+        self.s.wait_for("unsaved work in 1 repo")
+        self.s.wait_for("⚠ 1 uncommitted")
         self.assertIn("quota  Claude 5h 12% · week 40%", text)
         for line in self.s.lines():
             self.assertLessEqual(len(line), 160)
@@ -147,7 +164,9 @@ class Wide(unittest.TestCase):
         s.step("Down")
         self.assertEqual(s.selected(), "alpha-11")
         s.step("Down")
-        self.assertEqual(s.selected(), "alpha-11")  # the last row; parked and background are folded away
+        self.assertIn("API client", s.selected_line())  # into alpha's workflow agents and subagents
+        s.step("Up")
+        self.assertEqual(s.selected(), "alpha-11")
         s.step("Up")
         self.assertEqual(s.selected(), "beta-22")
         s.step("k")
@@ -202,11 +221,12 @@ class Wide(unittest.TestCase):
 
     def test_07_parked_and_background(self):
         s = self.s
-        self.assertIn("Background (1): bg deadbeef", s.text())
-        s.press("p")
-        s.wait_for("── Background (1)")
+        s.wait_for("── Parked (1)")  # sessions that are open but idle are listed by default
+        self.assertIn("delta-44", s.text())
         s.press("p")
         s.wait_for("Background (1): bg deadbeef")
+        s.press("p")
+        s.wait_for("── Background (1)")
 
     def test_08_swarm_cap(self):
         s = self.s
@@ -308,9 +328,9 @@ class Wide(unittest.TestCase):
     def test_16_held_arrow_keys(self):
         s = self.s
         s.select("gamma-33")
-        subprocess.run([TMUX, "send-keys", "-t", s.name] + ["Down"] * 20, check=True)  # a burst, like a held key
-        time.sleep(0.6)
-        self.assertEqual(s.selected(), "alpha-11")
+        subprocess.run([TMUX, "send-keys", "-t", s.name] + ["Down"] * 40, check=True)  # a burst, like a held key
+        time.sleep(0.8)
+        self.assertIn("bg deadbeef", s.selected_line())  # the last row
 
     def test_17_resize(self):
         s = self.s
@@ -328,6 +348,58 @@ class Wide(unittest.TestCase):
         s.step("Down")
         self.assertEqual(s.selected(), "beta-22")
 
+    def test_18_drill_into_a_subagent(self):
+        s = self.s
+        s.select_line("Write the tests")
+        s.press("Enter")
+        s.wait_for("Write the tests (in alpha-11)")
+        for needle in ("Write unit tests for app.py", "All 12 tests pass", "its steps, newest first",
+                       "its own helpers: Lint fixer"):
+            self.assertIn(needle, s.text())
+        s.press("Escape")
+        s.wait_for("Blocked on you")
+        s.press("m")
+        s.wait_for("select a session row to message it")
+
+    def test_19_stop_a_stray_agent_process(self):
+        s = self.s
+        s.select_line(f"pid {FX.stray}")
+        s.press("Enter")
+        s.wait_for("started by launchd")
+        s.press("Escape")
+        s.wait_for("Blocked on you")
+        s.press("x")
+        s.wait_for("press x again")
+        s.press("x")
+        s.wait_for(f"stopped pid {FX.stray}")
+        end = time.time() + 5
+        while time.time() < end:
+            try:
+                os.kill(FX.stray, 0)
+                time.sleep(0.1)
+            except ProcessLookupError:
+                break
+        self.assertRaises(ProcessLookupError, os.kill, FX.stray, 0)
+
+    def test_20_close_and_fork_keys(self):
+        s = self.s
+        s.select("beta-22")
+        s.press("C")
+        s.wait_for("press C again")
+        self.assertNotIn("/closecode", FX.pane("beta-22"))
+        s.press("C")
+        s.wait_for("sent to beta-22")
+        time.sleep(0.5)
+        self.assertIn("/closecode", FX.pane("beta-22"))
+        s.press("F", pause=0.2)
+        s.press("F")
+        s.wait_for("sent to beta-22")
+        time.sleep(0.5)
+        self.assertIn("/forkcode", FX.pane("beta-22"))
+        s.select("gamma-33")
+        s.press("C")
+        s.wait_for("blocked on a prompt")
+
     def test_98_commands_never_get_the_terminal_as_stdin(self):
         """The real `claude agents --json` reads a tty stdin and would swallow the keys meant for atc."""
         with open(os.path.join(FX.stub, "stdin.log")) as fh:
@@ -344,6 +416,53 @@ class Wide(unittest.TestCase):
         self.assertGreater(len(passes), 50)
         self.assertLess(max(refreshes), 0.3, sorted(refreshes)[-5:])
         self.assertLess(max(passes), 0.6, sorted(passes)[-5:])
+
+
+class Server(unittest.TestCase):
+    """A server over (fake) ssh: its rows can be selected, its stray process stopped, its sessions opened."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.log = os.path.join(FX.root, "ssh.log")
+        cls.ssh = os.path.join(FX.stub, "fake-ssh")
+        with open(cls.ssh, "w") as fh:
+            fh.write(f"""#!/bin/sh
+while [ "$1" = -o ] || [ "$1" = -t ]; do [ "$1" = -o ] && shift; shift; done
+host=$1; shift
+echo "ssh $host $*" >> {cls.log}
+if [ "$1" = kill ]; then exit 0; fi
+"$@" | {sys.executable} -c 'import json,sys; d=json.load(sys.stdin); d["machine"]="fakebox"; d["agents"]=[{{"pid": 4242, "tool": "codex", "etime": "5-00:00:00", "age": 432000, "stale": True, "parent": "openclaw", "tty": "", "command": "node codex exec stuck"}}]; print(json.dumps(d))'
+""")
+        os.chmod(cls.ssh, 0o755)
+        cls.s = Screen(160, 50, "--host", "fakebox", hosts=True, extra_env={"ATC_SSH": cls.ssh}, ready="── fakebox")
+
+    @classmethod
+    def tearDownClass(cls):
+        code, err = cls.s.quit()
+        assert code == "0" and not err.strip(), (code, err)
+
+    def test_select_and_stop_a_server_process(self):
+        s = self.s
+        s.select_line("pid 4242")
+        self.assertIn("stale?", s.selected_line())
+        s.press("Enter")
+        s.wait_for("on fakebox")
+        s.press("Escape")
+        s.wait_for("── fakebox")
+        s.press("x")
+        s.press("x")
+        s.wait_for("stopped pid 4242 on fakebox")
+        with open(self.log) as fh:
+            self.assertIn("ssh fakebox kill 4242", fh.read())
+
+    def test_enter_on_a_server_session_opens_ssh_there(self):
+        s = self.s
+        rows = [i for i, line in enumerate(s.lines()) if line.startswith("──") and "fakebox" in line]
+        self.assertTrue(rows)
+        s.select_line("pid 4242")  # the server section: its sessions are listed above its processes
+        s.step("Up")
+        s.press("Enter")
+        s.wait_for("ssh -t fakebox")
 
 
 class Narrow(unittest.TestCase):

@@ -191,7 +191,39 @@ class Model(unittest.TestCase):
         self.assertEqual(g["waiting"], ["beta-22"])
         self.assertEqual(g["working"], ["alpha-11"])
         self.assertEqual(g["background"], ["bg deadbeef"])
-        self.assertEqual(self.model["counts"]["live"], 4)
+        self.assertEqual(g["parked"], ["delta-44"])  # open but idle for 13h: still listed
+        self.assertEqual(self.model["counts"]["live"], 5)
+
+    def test_unsaved_work(self):
+        repos = self.m.Repos(background=False)
+        repos.watch([FX.work, os.path.join(FX.work, "alpha")])
+        state = repos.fetch()
+        self.assertEqual(len(state), 1)  # both folders are in the same repo
+        repo = repos.of(FX.work)
+        self.assertEqual((repo["dirty"], repo["unpushed"], repo["upstream"]), (1, 1, False))
+        self.assertEqual(self.m.unsaved_text(repo), "⚠ 1 uncommitted · 1 unpushed (no upstream)")
+
+    def test_row_keys_resolve(self):
+        alpha = self.views["alpha-11"]
+        self.assertEqual(self.m.resolve(self.fleet, self.model, alpha["sid"])[0], "session")
+        item = self.m.resolve(self.fleet, self.model, f"{alpha['sid']}::a111111111111111")
+        self.assertEqual(item[0], "helper")
+        self.assertEqual(item[2]["label"], "Write the tests")
+        stray = self.m.resolve(self.fleet, self.model, f"@local::p::{FX.stray}")
+        self.assertEqual((stray[0], stray[2]["tool"]), ("process", "codex"))
+        self.assertEqual(self.m.resolve(self.fleet, self.model, "nonsense")[0], None)
+
+    def test_drilling_into_a_helper(self):
+        alpha = self.views["alpha-11"]
+        item = self.m.resolve(self.fleet, self.model, f"{alpha['sid']}::a111111111111111")
+        text = "\n".join("".join(t for t, _s in line) for line in self.m.helper_lines(self.fleet, *item[1:], 0, 100))
+        for needle in ("Write the tests", "started by alpha-11", "Write unit tests for app.py", "report",
+                       "All 12 tests pass", "its own helpers: Lint fixer", "tests/test_app.py"):
+            self.assertIn(needle, text)
+        nested = self.m.resolve(self.fleet, self.model, f"{alpha['sid']}::a222222222222222")
+        text = "\n".join("".join(t for t, _s in line) for line in self.m.helper_lines(self.fleet, *nested[1:], 0, 100))
+        self.assertIn("started by Write the tests", text)
+        self.assertIn("haiku", text)
 
     def test_blocked_session_says_what_it_asks(self):
         self.assertIn("permission prompt", self.views["gamma-33"]["doing"])
@@ -300,6 +332,17 @@ class Levers(unittest.TestCase):
             self.m.app_running, self.m.osascript, self.m.shutil.which = real
         self.assertIn("Privacy & Security › Automation", message)
         self.assertNotIn("/dev/ttys999", terminals.cache)  # retried once you allow it
+
+    def test_stop_process(self):
+        victim = subprocess.Popen(["sleep", "60"])
+        try:
+            self.assertIn("dry run", self.m.stop_process(None, victim.pid, dry_run=True))
+            self.assertEqual(self.m.stop_process(None, victim.pid), f"stopped pid {victim.pid}")
+            self.assertEqual(victim.wait(timeout=5), -15)
+            self.assertIn("already gone", self.m.stop_process(None, victim.pid))
+        finally:
+            if victim.poll() is None:
+                victim.kill()
 
     def test_open_tab_without_a_terminal_says_what_to_run(self):
         self.assertEqual(self.m.open_tab("/tmp", "/opt/bin/route task --pool codex 'x'"),
