@@ -33,6 +33,7 @@ import json
 import locale
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -192,8 +193,10 @@ def within(path, root):
 
 
 def run(args, cwd=None, timeout=15):
+    """Run a command and capture it. It never gets the terminal as stdin: `claude agents --json` and friends would
+    read the keystrokes meant for atc's screen."""
     try:
-        res = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return None, "", str(exc)
     return res.returncode, res.stdout, res.stderr
@@ -641,6 +644,31 @@ def process_table():
     return table
 
 
+class Procs:
+    """The process table, refreshed in the background: `ps -A` takes ~1s on a busy Mac, too slow for the screen loop."""
+
+    def __init__(self, background=True):
+        self.snapshot = None  # (table, children, taken_at), replaced in one go
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def fetch(self):
+        table = process_table()
+        children = {}
+        for pid, proc in table.items():
+            children.setdefault(proc["ppid"], []).append(pid)
+        self.snapshot = (table, children, time.time())
+        return self.snapshot
+
+    def loop(self):
+        while True:
+            self.fetch()
+            time.sleep(PROC_EVERY)
+
+    def get(self):
+        return self.snapshot or self.fetch()  # only the very first refresh waits for ps
+
+
 def worker_processes(pid, table, children):
     """Agent CLIs (codex, kimi, claude -p ...) running under a session, skipping its MCP servers."""
     found, stack = [], list(children.get(pid, []))
@@ -766,6 +794,7 @@ def herdr_view(agent, now):
         "sid": f"herdr:{pane}", "kind": "herdr", "id": None, "name": name, "color": "c2",
         "cwd": str(agent.get("foreground_cwd") or agent.get("cwd") or ""), "pid": None, "tty": "", "version": None,
         "title": short_path(agent.get("cwd")), "status": status, "waiting_for": None, "since": None, "last": now,
+        "started": None,
         "group": Herdr.HERDR_GROUP.get(status, "other"), "state": f"herdr {status}", "said": "",
         "doing": f"in herdr pane {pane}", "alert": "", "alert_style": "warn", "teams": [], "helpers": [],
         "helpers_hidden": 0, "helpers_working": 0, "workers": [], "herdr": pane,
@@ -825,7 +854,8 @@ class Remote:
             self.error = str(exc)
             return
         start = time.time()
-        args = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", self.host, "python3", "-", "--json", "--no-hosts"]
+        ssh = shlex.split(os.environ.get("ATC_SSH") or "ssh")  # e.g. "ssh -J bastion"
+        args = ssh + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", self.host, "python3", "-", "--json", "--no-hosts"]
         try:
             res = subprocess.run(args, input=script, capture_output=True, timeout=45)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -855,10 +885,11 @@ class Remote:
 # ---------------------------------------------------------------- the fleet
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
+        self.proc_watch = procs or Procs(background=False)
         self.sessions = {}       # sid -> Session
         self.activity = []       # (ts, agent, tool, detail)
         self.addresses = {}      # messaging address -> session name
@@ -890,12 +921,7 @@ class Fleet:
 
     def refresh(self, now):
         registry = read_registry()
-        if now - self.procs_at > PROC_EVERY:
-            self.procs = process_table()
-            self.children = {}
-            for pid, proc in self.procs.items():
-                self.children.setdefault(proc["ppid"], []).append(pid)
-            self.procs_at = now
+        self.procs, self.children, self.procs_at = self.proc_watch.get()
         seen = set()
         for entry in self.entries(registry):
             sid = entry.get("sessionId")
@@ -1014,9 +1040,9 @@ class Fleet:
             groups[v["group"]].append(v)
         groups["blocked"].sort(key=lambda v: -(v["since"] or 0))
         groups["waiting"].sort(key=lambda v: v["since"] or 0)
-        groups["working"].sort(key=lambda v: -(v["last"] or 0))
+        groups["working"].sort(key=lambda v: (v["started"] or 0, v["name"]))  # stable: rows must not jump under the cursor
         groups["parked"].sort(key=lambda v: v["since"] or 0)
-        groups["background"].sort(key=lambda v: -(v["last"] or 0))
+        groups["background"].sort(key=lambda v: (v["started"] or 0, v["name"]))
         groups["other"].sort(key=lambda v: v["name"])
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
         return {
@@ -1164,6 +1190,7 @@ def session_view(s, now, fleet):
 
     return {
         "sid": s.sid, "kind": s.kind, "id": s.entry.get("id"), "name": s.name, "color": s.color, "cwd": s.cwd,
+        "started": parse_ts(s.entry.get("startedAt")) or parse_ts(s.registry.get("startedAt")),
         "pid": s.pid or None, "tty": s.tty, "version": s.registry.get("version"), "title": s.title,
         "status": status, "waiting_for": s.entry.get("waitingFor"), "since": since, "last": last, "group": group,
         "state": state, "doing": doing, "said": s.last_text, "alert": alert, "alert_style": alert_style,
@@ -1385,7 +1412,9 @@ def open_tab(cwd, command, dry_run=False):
     line = f"cd {shlex.quote(cwd)} && {command}"
     kind = terminal_kind()
     if dry_run or kind is None:
-        return ("dry run: " if dry_run else "no supported terminal; run this yourself: ") + line
+        words = command.split(" ", 1)
+        shown = " ".join([os.path.basename(words[0])] + words[1:])  # route, not /long/path/to/route
+        return f"{'dry run' if dry_run else 'run this yourself'}: {shown}   (in {short_path(cwd)})"
     if kind == "tmux":
         code, _out, err = run(["tmux", "new-window", "-c", cwd, command])
         return "opened a tmux window" if code == 0 else f"tmux failed: {first_line(err)}"
@@ -1461,9 +1490,12 @@ def col(text, width):
 
 
 def rule(title, width, extra=""):
+    """A section heading across the width; the note on the right is dropped when it doesn't fit."""
     head = f"── {title} "
     tail = f" {extra} ──" if extra else ""
-    return [(head, "head"), ("─" * max(0, width - len(head) - len(tail)), "head"), (tail, "dim")]
+    if len(head) + len(tail) + 2 > width:
+        tail = ""
+    return fit([(head, "head"), ("─" * max(0, width - len(head) - len(tail)), "head"), (tail, "dim")], width)
 
 
 def bar(done, total, width=10):
@@ -1546,7 +1578,7 @@ def fleet_lines(model, width, show_all):
     titles = {
         "blocked": ("Blocked on you", "a prompt or question is open"),
         "waiting": ("Waiting on you", "newest first"),
-        "working": ("Working", "most recent first"),
+        "working": ("Working", "oldest first"),
         "parked": ("Parked", "idle 12h+"),
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
@@ -1863,6 +1895,7 @@ HELP = [
 
 def render(fleet, model, ui, width, height=None):
     """The main screen. Returns (frame, selectable session ids)."""
+    ui["width"] = width
     frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
     rows = fleet_lines(model, width, ui["show_all"] or height is None)
     selectable = [sid for _l, sid in rows if sid]
@@ -1884,6 +1917,9 @@ def render(fleet, model, ui, width, height=None):
     ui["top_scroll"] = top = min(top, max(0, len(rows) - top_h))
     shown = rows[top: top + top_h]
     for line, sid in shown:
+        if line and line[0][1] == "head":  # a section heading: full width, no selection gutter
+            frame.append(fit(line, width))
+            continue
         line = fit(line, width - 2)
         if sid and sid == ui["selected"]:
             frame.append([("▶ ", "sel")] + [(t, s + "+sel") for t, s in pad(line, width - 2)])
@@ -2074,14 +2110,17 @@ class App:
         elif key in (curses.KEY_PPAGE, "K"):
             self.ui["scroll"] = max(0, self.ui["scroll"] - 10)
         elif key == "\t":
-            order = ["activity", "session", "comms"]
+            order = ["activity", "session"] if self.ui.get("width", 0) >= 150 else ["activity", "session", "comms"]
+            if self.ui["panel"] not in order:
+                self.ui["panel"] = order[-1]
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             self.jump(v)
         elif key == "p":
             self.ui["show_all"] = not self.ui["show_all"]
         elif key in ("c", "h", "?"):
-            self.ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0)
+            self.ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0,
+                           view_mine=False)
         elif key in ("+", "="):
             self.say(self.quota.step(+1))
         elif key in ("-", "_"):
@@ -2106,7 +2145,7 @@ class App:
                 and not (key == "h" and ui["view"] != "tree") and not (key == "?" and ui["view"] != "help"):
             ui["view"] = None
         elif key in ("c", "h", "?"):
-            ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0)
+            ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0, view_mine=False)
         elif key == "s":
             ui["view_mine"] = not ui["view_mine"]
             ui["view_pick"] = ui["view_scroll"] = 0
@@ -2226,41 +2265,70 @@ class App:
         return True
 
 
+def draw(stdscr, app, model, styles):
+    app.ui["footer"] = app.footer(time.time())
+    height, width = stdscr.getmaxyx()
+    frame, app.selectable = render(app.fleet, model, app.ui, width, height)
+    if app.selectable and app.ui["selected"] not in app.selectable:
+        app.ui["selected"] = app.selectable[0]
+        frame, app.selectable = render(app.fleet, model, app.ui, width, height)
+    if app.ui["view"]:
+        frame = render_view(app.fleet, model, app.ui, width, height)
+    stdscr.erase()
+    for y, line in enumerate(frame[:height]):
+        x = 0
+        for text, style in line:
+            if text and x < width:
+                try:
+                    stdscr.addstr(y, x, text[: width - x], style_of(styles, style))
+                except curses.error:
+                    pass  # writing the bottom-right cell raises; the text still lands
+            x += len(text)
+    stdscr.refresh()
+
+
 def tui(stdscr, app):
+    """Data refreshes once a second; keys redraw at once from the data we have.
+
+    Input is waited for with select() and read without blocking, and the window size is checked on every pass:
+    curses' own key timeout stops being honoured after the terminal grows, which froze the screen."""
     curses.curs_set(0)
-    stdscr.timeout(int(TICK_SECONDS * 1000))
+    stdscr.nodelay(True)
     styles = init_styles()
+    model, refreshed = None, 0.0
+    debug = open(os.environ["ATC_DEBUG_LOG"], "a", buffering=1) if os.environ.get("ATC_DEBUG_LOG") else None
     while True:
         now = time.time()
-        app.fleet.refresh(now)
-        model = app.fleet.model(now, app.quota, app.remotes)
-        app.ui["footer"] = app.footer(now)
-        height, width = stdscr.getmaxyx()
-        frame, app.selectable = render(app.fleet, model, app.ui, width, height)
-        if app.selectable and app.ui["selected"] not in app.selectable:
-            app.ui["selected"] = app.selectable[0]
-            frame, app.selectable = render(app.fleet, model, app.ui, width, height)
-        if app.ui["view"]:
-            frame = render_view(app.fleet, model, app.ui, width, height)
-        stdscr.erase()
-        for y, line in enumerate(frame[:height]):
-            x = 0
-            for text, style in line:
-                if text and x < width:
-                    try:
-                        stdscr.addstr(y, x, text[: width - x], style_of(styles, style))
-                    except curses.error:
-                        pass  # writing the bottom-right cell raises; the text still lands
-                x += len(text)
-        stdscr.refresh()
+        if model is None or now - refreshed >= TICK_SECONDS:
+            app.fleet.refresh(now)
+            model = app.fleet.model(now, app.quota, app.remotes)
+            refreshed = now
+            if debug:
+                debug.write(f"{now:.2f} refresh {time.time() - now:.3f}s\n")
         try:
-            key = stdscr.get_wch()
-        except curses.error:
-            continue  # timeout: redraw
-        if key == curses.KEY_RESIZE:
-            continue
-        if not app.handle(key, model):
-            return
+            size = os.get_terminal_size(sys.__stdout__.fileno())  # the tty itself, not $COLUMNS/$LINES
+        except (OSError, ValueError, AttributeError):
+            size = None
+        if size and size.lines and size.columns and (size.lines, size.columns) != stdscr.getmaxyx():
+            curses.resizeterm(size.lines, size.columns)
+            stdscr.clear()
+        draw(stdscr, app, model, styles)
+        wait = min(0.25, max(0.0, TICK_SECONDS - (time.time() - refreshed)))
+        try:
+            select.select([sys.stdin], [], [], wait)
+        except (OSError, ValueError):
+            time.sleep(wait)
+        keys = []
+        while True:  # everything already typed (a held arrow key) before drawing again
+            try:
+                keys.append(stdscr.get_wch())
+            except curses.error:
+                break
+        if debug:
+            debug.write(f"{time.time():.2f} loop {time.time() - now:.3f}s keys={keys!r}\n")
+        for key in keys:
+            if key != curses.KEY_RESIZE and not app.handle(key, model):
+                return
 
 
 def main():
@@ -2299,7 +2367,7 @@ def main():
 
     feed = Feed(claude_cmd if shutil.which(claude_cmd[0]) else None, background=not one_shot)
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), args.dry_run, background=not one_shot)
-    fleet = Fleet(only, feed, herdr)
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot))
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]

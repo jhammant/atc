@@ -100,6 +100,22 @@ Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR
 - [Herdr](https://herdr.dev): agents in Herdr panes, steered through Herdr. `atc` only talks to a Herdr
   server that is already running and never starts one, because starting it resumes every saved agent.
 
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v    # needs tmux
+```
+
+The suite builds a fake Claude Code home (sessions blocked on a prompt, waiting, working with nested
+subagents and a two-phase workflow, a background session, letters between sessions) and runs dummy
+`claude` processes in a hidden tmux session. Unit tests cover the parsers and the model. Screen tests run
+`atc` in tmux, press every key, read the screen back as drawn, and check steering in the dummy sessions' own
+terminals: a message arrives, a blocked session receives nothing, Esc lands on interrupt. They also fail if
+the screen loop ever stalls, or if any command `atc` runs is handed the terminal as its input.
+
+If keys ever seem ignored, `ATC_DEBUG_LOG=/tmp/atc.log atc` logs every refresh and every pass of the screen
+loop with how long it took and which keys arrived.
+
 ## How it works
 
 Everything is read locally (or over your own ssh); nothing is sent anywhere else.
