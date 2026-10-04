@@ -36,6 +36,10 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 - **Waiting on you**: sessions that finished their turn, with the first line of what they said
 - **Working**: what each busy session is doing now, its workflow phases and progress, its subagents, and any
   agent processes it started (`codex`, `kimi`, `claude -p` …)
+- **Parked / background / other**: sessions open but idle for 12h+, `claude --bg` sessions, and sessions with
+  only a shell running. Listed by default, so nothing open is invisible; `p` folds them away
+- **Unsaved work**: each session's repo, checked in the background: uncommitted files, and commits that are on no
+  remote yet, so a session isn't closed (or a laptop wiped) with work that only exists on disk
 - **Other agents**: agent CLIs running outside any session, with what started them and a `stale?` flag after a day
 - **Your servers**: the same view for every machine in `~/.config/atc/hosts`, over ssh
 - **Herdr agents**: when [Herdr](https://herdr.dev) is running, the agents in its panes (Codex, opencode, pi …)
@@ -52,12 +56,15 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 | Key | Does |
 |---|---|
 | `enter` | Jump to the session's terminal tab (iTerm2, Terminal.app, tmux, Herdr). A background session opens attached in a new tab |
+| `enter` on a subagent | Drill in: who started it, its task, every step it took, its report, its own helpers |
+| `enter` on a process or server row | Its command, uptime and what started it; on a server's session, an ssh shell there in a new tab |
 | `m` | Type a message into the selected session, as if you typed it there. A busy session queues it |
 | `M` | The same message to every session in the selected session's project folder |
-| `x` `x` | Interrupt the session (Esc). On a background session: `claude stop` |
+| `x` `x` | Interrupt the session (Esc). A background session: `claude stop`. An agent process, here or on a server: stop it (SIGTERM, over ssh) |
+| `C` `C` / `F` `F` | Type `/closecode` or `/forkcode` into the session: wrap it up, or split work off |
 | `+` `-` `0` | Raise, lower or reset the swarm cap (`quotamax override`, pinned for 2h by default) |
 | `n` | New task: `route --plan-only` says where it should run (Claude, Codex, Kimi …); `enter` dispatches it in a new tab |
-| `c` `h` `tab` `p` `?` `q` | Comms, hierarchy, bottom panel, list parked sessions, help, quit |
+| `c` `h` `tab` `p` `?` `q` | Comms, hierarchy, bottom panel, fold parked sessions away, help, quit |
 
 **Steering never types into a session that is blocked on a prompt.** A permission prompt's default answer is
 "Yes", so a message ending in Enter would approve whatever it was asking. `atc` re-reads the session's state
@@ -89,11 +96,19 @@ atc --dry-run        # levers say what they would do instead of doing it
 
 List ssh targets in `~/.config/atc/hosts`, one per line. `atc` runs itself on each over ssh
 (`ssh host python3 - --json < atc.py`), so there is nothing to install there; the host needs Python 3.9+ and
-key-based ssh. Two names for one machine are shown once. Remote rows are read-only for now.
+key-based ssh. Two names for one machine are shown once. Server rows can be selected: open a process to see
+what started it and stop it with `x x`, or press `enter` on a server's session for an ssh shell there.
+
+### Where new sessions open
+
+New sessions (`n`, attaching a background session, server shells) open in the terminal `atc` runs in. Set
+`ATC_TERMINAL` to choose: `iterm`, `terminal`, `tmux` (a window in your current tmux), or `tmux-bg`: windows in
+a detached `atc` tmux session you can attach to from anywhere, including over ssh from a phone.
 
 ### Optional tools
 
-Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`.
+Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`, and `ATC_SSH`
+(e.g. `ssh -J bastion`).
 
 - [quotamax](https://github.com/jhammant/quotamax): quota for every provider, and the swarm cap
 - `route`: picks where a new task should run
