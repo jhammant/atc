@@ -288,6 +288,19 @@ class Levers(unittest.TestCase):
         self.assertEqual(plan["chosen"], "codex")
         self.assertIn("route task --plan-only write tests", FX.calls())
 
+    def test_a_macos_refusal_is_reported_as_one(self):
+        terminals = self.m.Terminals()
+        real = (self.m.app_running, self.m.osascript, self.m.shutil.which)
+        try:
+            self.m.app_running = lambda name: name == "iTerm2"
+            self.m.osascript = lambda script: (False, "execution error: Not authorized to send Apple events to iTerm2. (-1743)")
+            self.m.shutil.which = lambda name: None  # no tmux
+            message = terminals.act("/dev/ttys999", "focus")
+        finally:
+            self.m.app_running, self.m.osascript, self.m.shutil.which = real
+        self.assertIn("Privacy & Security › Automation", message)
+        self.assertNotIn("/dev/ttys999", terminals.cache)  # retried once you allow it
+
     def test_open_tab_without_a_terminal_says_what_to_run(self):
         self.assertEqual(self.m.open_tab("/tmp", "/opt/bin/route task --pool codex 'x'"),
                          "run this yourself: route task --pool codex 'x'   (in /tmp)")
@@ -383,6 +396,10 @@ class CommandLine(unittest.TestCase):
         bad = subprocess.run([sys.executable, fixture.ATC, "--jump", "nope"], env=FX.env(), capture_output=True,
                              text=True, timeout=60)
         self.assertEqual(bad.returncode, 1)
+        unreachable = FX.env(PATH="/usr/bin:/bin")  # no tmux on PATH: the pane can't be found, and it says so
+        failed = subprocess.run([sys.executable, fixture.ATC, "--jump", target["sid"]], env=unreachable,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(failed.returncode, 1, failed.stdout)
 
     def test_remote_host(self):
         fake_ssh = os.path.join(FX.stub, "fake-ssh")

@@ -1339,6 +1339,7 @@ class Terminals:
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
         self.cache = {}  # tty -> (kind, target, at)
+        self.blocked = None  # why macOS refused, when it did
 
     def locate(self, tty):
         now = time.time()
@@ -1360,6 +1361,10 @@ class Terminals:
                     if ok and result == "found":
                         kind = app
                         break
+                    if not ok and ("-1743" in result or "Not authorized" in result or "-1744" in result):
+                        self.blocked = (f"macOS hasn't let this app control {name}: allow it in System Settings › "
+                                        f"Privacy & Security › Automation")
+                        return None, None  # don't cache a refusal: it goes away once allowed
         self.cache[tty] = (kind, target, now)
         return kind, target
 
@@ -1367,9 +1372,10 @@ class Terminals:
         """action: focus | type | interrupt. Returns a sentence saying what happened."""
         if not tty:
             return "that session has no terminal"
+        self.blocked = None
         kind, target = self.locate(tty)
         if kind is None:
-            return f"couldn't find the terminal tab on {tty} (supported: tmux, iTerm2, Terminal.app)"
+            return self.blocked or f"couldn't find the terminal tab on {tty} (supported: tmux, iTerm2, Terminal.app)"
         if self.dry_run:
             return f"dry run: would {action} the {kind} tab on {tty}" + (f": {text}" if text else "")
         if kind == "tmux":
@@ -2393,7 +2399,8 @@ def main():
             app = App(fleet, quota, Terminals(args.dry_run), route_cmd, claude_cmd, args.dry_run)
             app.jump(target)
             print(app.flash[0])
-            return
+            done = app.flash[0].startswith(("focus: done", "opened", "dry run", "run this yourself"))
+            sys.exit(0 if done else 1)  # a launcher (Roost) shows only failures
         if args.json:
             json.dump(dict(model, quota=quota.data), sys.stdout, indent=2, default=str)
             print()
