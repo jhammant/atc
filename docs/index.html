@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>atc: air traffic control for your coding agents</title>
+<meta name="description" content="One terminal screen for every Claude Code session, subagent, workflow and agent process on your Mac and your servers, with the levers to steer them. Works with Orbital through Taxi.">
+<meta property="og:title" content="atc: air traffic control for your coding agents">
+<meta property="og:description" content="See every coding agent you're running, who's waiting for you, and what the swarm under each session is doing. Then steer them.">
+<meta property="og:image" content="https://jhammant.github.io/atc/atc-main.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --console: #1e1e2e;     /* matches the screenshots */
+    --console-deep: #181825;
+    --rail: #313244;
+    --ink-light: #cdd6f4;
+    --ink-dim: #9399b2;
+    --paper: #efe6cf;       /* flight strip buff */
+    --paper-ink: #2a2733;
+    --hold: #f38ba8;        /* blocked: holding */
+    --wait: #f9e2af;        /* waiting on you */
+    --route: #a6e3a1;       /* working: en route */
+    --stand: #7f849c;       /* parked */
+    --link: #89dceb;
+    --display: "Barlow Condensed", "Arial Narrow", sans-serif;
+    --body: "Barlow", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--console); color: var(--ink-light); font: 400 18px/1.6 var(--body); }
+  a { color: var(--link); text-underline-offset: 3px; }
+  a:focus-visible, .button:focus-visible { outline: 3px solid var(--wait); outline-offset: 3px; border-radius: 4px; }
+  code, pre, kbd { font-family: var(--mono); }
+  img, video { max-width: 100%; height: auto; display: block; }
+  p code, .caption code { font-size: 0.86em; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+  .prose { max-width: 68ch; }
+
+  /* masthead */
+  .mast { display: flex; justify-content: space-between; align-items: baseline; padding: 28px 0 0; }
+  .wordmark { font: 700 34px/1 var(--display); letter-spacing: 0.02em; color: var(--ink-light); text-decoration: none; }
+  .mast nav a { font: 500 17px var(--body); margin-left: 22px; }
+
+  /* hero: copy on the left, the strip rack on the right */
+  .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); gap: 56px; align-items: center; padding: 64px 0 72px; }
+  h1 { font: 700 clamp(46px, 6.4vw, 78px)/0.95 var(--display); margin: 0 0 22px; letter-spacing: -0.01em; }
+  .lede { font-size: 20px; color: var(--ink-light); margin: 0 0 28px; max-width: 34em; }
+  .install { background: var(--console-deep); border: 1px solid var(--rail); border-radius: 8px; padding: 14px 18px; font: 500 15px/1.7 var(--mono); color: var(--ink-light); overflow-x: auto; white-space: pre; margin: 0 0 24px; }
+  .install .c { color: var(--ink-dim); }
+  .button { display: inline-block; background: var(--paper); color: var(--paper-ink); font: 600 18px var(--body); padding: 12px 22px; border-radius: 6px; text-decoration: none; }
+  .button + .quiet { margin-left: 18px; font-size: 17px; }
+
+  /* the flight strip rack */
+  .rack { background: var(--console-deep); border: 1px solid var(--rail); border-radius: 10px; padding: 18px 16px 10px; }
+  .rack-head { display: flex; justify-content: space-between; font: 500 14px var(--mono); color: var(--ink-dim); padding: 0 6px 12px; }
+  .strip { display: grid; grid-template-columns: 10px 1.4fr 0.75fr 1.85fr; align-items: stretch; background: var(--paper); color: var(--paper-ink);
+           border-radius: 3px; margin: 0 0 9px; min-height: 58px; box-shadow: 0 2px 0 rgba(0,0,0,0.35); font-family: var(--mono); overflow: hidden; }
+  .strip > div { padding: 7px 10px; border-left: 1px solid rgba(42,39,51,0.18); display: flex; flex-direction: column; justify-content: center; }
+  .strip .edge { padding: 0; border: 0; }
+  .strip .call { font: 600 17px/1.15 var(--mono); letter-spacing: 0.01em; }
+  .strip .sub { font-size: 12.5px; color: #5d5868; line-height: 1.3; }
+  .strip .state { font: 600 13px/1.2 var(--mono); }
+  .strip .doing { font-size: 13.5px; line-height: 1.35; }
+  .hold .edge { background: var(--hold); } .wait .edge { background: var(--wait); }
+  .route .edge { background: var(--route); } .stand .edge { background: var(--stand); }
+  .hold .state { color: #b4234d; } .wait .state { color: #8a6412; } .route .state { color: #2f7a35; } .stand .state { color: #5d5868; }
+  .strip.helper { margin-left: 26px; min-height: 44px; }
+  .strip.helper .call { font-size: 14.5px; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .strip { animation: slot 520ms cubic-bezier(.2,.7,.2,1) both; }
+    .strip:nth-child(2) { animation-delay: 80ms; } .strip:nth-child(3) { animation-delay: 160ms; }
+    .strip:nth-child(4) { animation-delay: 240ms; } .strip:nth-child(5) { animation-delay: 320ms; }
+    .strip:nth-child(6) { animation-delay: 400ms; } .strip:nth-child(7) { animation-delay: 480ms; }
+    @keyframes slot { from { transform: translateX(46px); opacity: 0; } to { transform: none; opacity: 1; } }
+  }
+
+  /* sections */
+  section { padding: 64px 0; border-top: 1px solid var(--rail); }
+  h2 { font: 600 clamp(32px, 4vw, 44px)/1.05 var(--display); margin: 0 0 18px; }
+  h3 { font: 600 24px/1.2 var(--display); margin: 28px 0 8px; letter-spacing: 0.01em; }
+  p { margin: 0 0 16px; }
+
+  .frame { border: 1px solid var(--rail); border-radius: 10px; overflow: hidden; background: var(--console-deep); margin: 26px 0 10px; }
+  .caption { color: var(--ink-dim); font-size: 15px; }
+
+  .found { list-style: none; padding: 0; margin: 22px 0; font-family: var(--mono); font-size: 16px; }
+  .found li { padding: 8px 0 8px 18px; border-left: 3px solid var(--rail); margin-bottom: 6px; }
+  .found li.bad { border-left-color: var(--hold); }
+
+  .shows { display: grid; grid-template-columns: 12em minmax(0, 1fr); gap: 10px 28px; margin: 24px 0; }
+  .shows dt { font: 600 20px/1.35 var(--display); color: var(--ink-light); }
+  .shows dd { margin: 0; color: var(--ink-light); }
+
+  .keys { width: 100%; border-collapse: collapse; margin: 18px 0 24px; }
+  .keys td { padding: 10px 12px 10px 0; vertical-align: top; border-bottom: 1px solid var(--rail); }
+  .keys td:first-child { white-space: nowrap; width: 9.5em; }
+  kbd { display: inline-block; min-width: 1.8em; text-align: center; padding: 1px 7px; margin-right: 3px; border: 1px solid #585b70;
+        border-bottom-width: 3px; border-radius: 5px; background: var(--console-deep); font-size: 14px; color: var(--ink-light); }
+  .guard { background: var(--console-deep); border-left: 4px solid var(--hold); padding: 16px 20px; border-radius: 0 8px 8px 0; max-width: 68ch; }
+
+  .orbital { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: start; }
+  pre.code { background: var(--console-deep); border: 1px solid var(--rail); border-radius: 8px; padding: 16px 18px; font-size: 14.5px; line-height: 1.6;
+             overflow-x: auto; margin: 14px 0 20px; color: var(--ink-light); }
+  .code .k { color: #cba6f7; } .code .t { color: #89b4fa; } .code .c { color: var(--ink-dim); } .code .s { color: var(--route); }
+
+  footer { border-top: 1px solid var(--rail); padding: 32px 0 48px; color: var(--ink-dim); font-size: 15px; }
+
+  @media (max-width: 880px) {
+    .hero, .orbital { grid-template-columns: minmax(0, 1fr); gap: 36px; }
+    .hero { padding-top: 40px; }
+    .shows { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+    .shows dd { margin-bottom: 14px; }
+  }
+  @media (max-width: 520px) {
+    body { font-size: 17px; }
+    .wrap { padding: 0 16px; }
+    .mast nav a:not(:last-child) { display: none; }
+    .strip { grid-template-columns: 8px 1fr 1.6fr; }
+    .strip .state-col { display: none; }
+    .strip.helper { margin-left: 14px; }
+    .keys td:first-child { width: auto; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="mast">
+    <a class="wordmark" href="#">atc</a>
+    <nav><a href="#orbital">Works with Orbital</a><a href="#install">Install</a><a href="https://github.com/jhammant/atc">GitHub</a></nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <h1>Air traffic control for your coding agents</h1>
+      <p class="lede">One terminal screen for every Claude Code session, subagent, workflow and agent process on your Mac and
+        your servers. See who's waiting for you and what each swarm is doing, then steer them from the same screen.</p>
+      <pre class="install"><span class="c"># one Python file, no dependencies</span>
+git clone https://github.com/jhammant/atc ~/dev/atc
+ln -s ~/dev/atc/atc.py ~/.local/bin/atc
+atc</pre>
+      <a class="button" href="https://github.com/jhammant/atc">Get atc on GitHub</a><a class="quiet" href="#orbital">How it works with Orbital</a>
+    </div>
+
+    <div class="rack" role="img" aria-label="Sessions shown as flight strips: payments-api is holding on a permission prompt, docs-site is waiting for a decision, web-app is running a release workflow with two helpers, and a Codex process on a build server has been running for five days.">
+      <div class="rack-head"><span>your sessions, right now</span><span>18:20</span></div>
+      <div class="strip hold"><div class="edge"></div><div><span class="call">PAYMENTS-API</span><span class="sub">~/dev/payments-api</span></div><div class="state-col"><span class="state">HOLDING</span><span class="sub">4 min</span></div><div><span class="doing">Permission prompt: run the database migration</span></div></div>
+      <div class="strip wait"><div class="edge"></div><div><span class="call">DOCS-SITE</span><span class="sub">~/dev/docs-site</span></div><div class="state-col"><span class="state">WAITING</span><span class="sub">9 min</span></div><div><span class="doing">"The changelog is drafted; two entries need a decision from you."</span></div></div>
+      <div class="strip route"><div class="edge"></div><div><span class="call">WEB-APP</span><span class="sub">release-train</span></div><div class="state-col"><span class="state">EN ROUTE</span><span class="sub">Build ✓ Verify ▸</span></div><div><span class="doing">Running the end-to-end suite</span></div></div>
+      <div class="strip route helper"><div class="edge"></div><div><span class="call">Smoke tester</span></div><div class="state-col"><span class="state">EN ROUTE</span></div><div><span class="doing">Hitting the staging health check</span></div></div>
+      <div class="strip route helper"><div class="edge"></div><div><span class="call">Visual diff</span></div><div class="state-col"><span class="state">EN ROUTE</span></div><div><span class="doing">Comparing screenshots against 4.1</span></div></div>
+      <div class="strip stand"><div class="edge"></div><div><span class="call">CODEX</span><span class="sub">on buildbox</span></div><div class="state-col"><span class="state">STALE?</span><span class="sub">5 days</span></div><div><span class="doing">Still running under agent-gateway, never cleaned up</span></div></div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <div class="prose">
+      <h2>You lose track fast</h2>
+      <p>Run a few Claude Code sessions at once, each fanning out subagents and workflows, add a Codex job and an agent on
+        a server, and the picture goes. The first time atc ran on its author's Mac it found:</p>
+    </div>
+    <ul class="found">
+      <li>23 Claude Code sessions</li>
+      <li>285 helper processes behind them</li>
+      <li class="bad">a Codex worker that had been running on a home server for five days</li>
+      <li class="bad">a repo with 24 commits that had never been pushed</li>
+    </ul>
+    <div class="frame"><video src="atc-demo.mp4" poster="atc-main.png" width="1640" height="960" autoplay muted loop playsinline
+      aria-label="atc running: blocked, waiting and working sessions; arrowing into a subagent, opening it, then the hierarchy and comms views"></video></div>
+    <p class="caption">Demo data. Arrow into a subagent, open it, then the hierarchy and comms views.</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>What it shows</h2>
+    <dl class="shows">
+      <dt>Blocked on you</dt><dd>Sessions sitting on a permission prompt or a question, and exactly what they're asking.</dd>
+      <dt>Waiting on you</dt><dd>Sessions that finished their turn, with the first line of what they said.</dd>
+      <dt>Working</dt><dd>What each busy session is doing now, its workflow phases, its subagents (open any of them to see its task, steps and report) and any agent processes it started.</dd>
+      <dt>The hierarchy</dt><dd>Session, workflow, phase, agent, nested agent, worker process, and who is talking to whom.</dd>
+      <dt>Comms</dt><dd>Every message in full: between sessions, the task a session gave each helper, and the helper's report.</dd>
+      <dt>Your servers</dt><dd>The same view for every machine you list, over ssh, with nothing to install there.</dd>
+      <dt>Unsaved work</dt><dd>Uncommitted files and commits that are on no remote yet, in every session's repo.</dd>
+      <dt>Quota</dt><dd>Claude, Codex, Kimi and DeepSeek, and the swarm cap your sessions check before they fan out.</dd>
+    </dl>
+    <div class="frame"><img src="atc-tree.png" alt="The hierarchy view: sessions with their workflows, phases, agents and nested agents, and a server's agent processes grouped by what started them" width="1640" height="960" loading="lazy"></div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>And it steers</h2>
+    <table class="keys">
+      <tr><td><kbd>enter</kbd></td><td>Jump to the session's terminal tab (iTerm2, Terminal, tmux or Herdr). On a subagent or a process, open it.</td></tr>
+      <tr><td><kbd>m</kbd> <kbd>M</kbd></td><td>Type a message into a session, or into every session in a project, as if you typed it there.</td></tr>
+      <tr><td><kbd>x</kbd> <kbd>x</kbd></td><td>Interrupt a session, or stop a stray agent process, here or on a server.</td></tr>
+      <tr><td><kbd>+</kbd> <kbd>-</kbd></td><td>Raise or lower the swarm cap your sessions respect.</td></tr>
+      <tr><td><kbd>n</kbd></td><td>Start a new task and let a router pick where it runs: Claude, Codex, Kimi or a local model.</td></tr>
+    </table>
+    <p class="guard">atc never types into a session that is sitting on a permission prompt. The prompt's default answer is
+      "Yes", so a message ending in Enter would approve whatever it was asking. It checks the session's state right before
+      typing and skips it.</p>
+  </div>
+</section>
+
+<section id="orbital">
+  <div class="wrap orbital">
+    <div>
+      <h2>Works with Orbital, powered by Taxi</h2>
+      <p><code>atc --serve</code> puts your sessions, subagents, agent processes, messages and quota on HTTP, and a
+        <a href="https://taxilang.org">Taxi</a> schema in the repo describes them. Point
+        <a href="https://orbitalhq.com">Orbital</a> at it and your agents become one more data source it can query, join
+        and act on.</p>
+      <p>The schema only says that a subagent carries a <code>SessionId</code> and that a session can be fetched by one.
+        Ask for every subagent with its session's name and Orbital works out the route itself. Sessions carry their repo
+        too, so the same trick joins agents to tickets, pull requests or the product a customer uses.</p>
+      <p>It writes as well as reads: a write operation lets Orbital message a session, behind the same guard as the
+        terminal.</p>
+      <h3>Register it</h3>
+      <p>Add the repo to Orbital's <code>workspace.conf</code>; Orbital polls it, so schema changes arrive on their own.</p>
+<pre class="code">git {
+   repositories=[
+      { name=atc, uri=<span class="s">"https://github.com/jhammant/atc.git"</span>,
+        branch=main, path=<span class="s">"/taxi"</span> }
+   ]
+}</pre>
+    </div>
+    <div>
+      <div class="frame"><img src="atc-taxi.png" alt="The atc Taxi schema, a query for every subagent with its session's name, the answer, and the hop Orbital found: listSubagents, SessionId, getSession, SessionName" width="3200" height="1520" loading="lazy"></div>
+<pre class="code"><span class="c">// sessions waiting on a person</span>
+<span class="k">find</span> { atc.<span class="t">AgentSession</span>[].filter(
+   (atc.<span class="t">SessionState</span>) -&gt; atc.<span class="t">SessionState</span> == <span class="s">"blocked"</span>) }
+
+<span class="c">// steer one</span>
+<span class="k">given</span> { message: atc.<span class="t">SessionMessage</span> = {
+   sessionId: <span class="s">"…"</span>, text: <span class="s">"status please"</span> } }
+<span class="k">call</span> atc.<span class="t">AtcApi</span>::messageSession</pre>
+      <p class="caption">Reads are open only on your own machine; writes are off unless you start it with
+        <code>--serve-writes</code>, and then need a token.</p>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="prose">
+      <h2>Install</h2>
+      <p>Python 3.9 or later, standard library only. macOS or Linux.</p>
+    </div>
+<pre class="code">git clone https://github.com/jhammant/atc ~/dev/atc
+ln -s ~/dev/atc/atc.py ~/.local/bin/atc
+atc                <span class="c"># the live view</span>
+atc --here         <span class="c"># only the sessions in this folder: one project's swarm</span>
+atc --serve        <span class="c"># for Orbital and anything else that speaks JSON</span></pre>
+    <div class="prose">
+      <p>It uses <a href="https://github.com/jhammant/quotamax">quotamax</a> for quota and the swarm cap, a router for new
+        tasks, and <a href="https://herdr.dev">Herdr</a> panes when it finds them. All optional. The README has every key,
+        flag and setting.</p>
+      <a class="button" href="https://github.com/jhammant/atc">Read the README on GitHub</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">atc is open source under the MIT licence. Built by <a href="https://github.com/jhammant">Jon Hammant</a>.</div>
+</footer>
+</body>
+</html>
