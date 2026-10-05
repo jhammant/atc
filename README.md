@@ -3,25 +3,9 @@
 **Air traffic control for your coding agents.** One terminal screen for every Claude Code session, subagent,
 workflow and agent process on your Mac and your servers, with the levers to steer them.
 
-```text
- atc  18:39:04  14 sessions · 1 blocked · 2 waiting · 4 working · helpers 6/9 · buildbox 1 sessions 3 agents (1 stale)
-quota  Claude 5h 10% · week 61%   Codex weekly 19%   Kimi 5h 1% · weekly 12%   DeepSeek $11.42   │ swarm cap ≤4 comfortable (auto)
-── Blocked on you (1) ───────────────────────────────────────────────────────── a prompt or question is open ──
-▶ ! payments-api       needs you 12s   permission prompt: Bash  Run the database migration
-── Waiting on you (2) ──────────────────────────────────────────────────────────────────────── newest first ──
-  ◆ docs-site          waiting 9m      “The changelog is drafted; two entries need a decision from you:”
-  ◆ mobile-app         waiting 41m     “Build 12 is on TestFlight.”
-── Working (4) ─────────────────────────────────────────────────────────────────────────── most recent first ──
-  ● web-app            busy 1m         Bash  Run the end-to-end suite
-       ⎿ release-train  ✓ Build  ▸ Verify   ████████░░ 4/5 done
-           ✓ API client                 5m  done
-           ● Smoke tester               3s  Bash  Hit the staging health check
-  ● data-pipeline      busy 12m        Edit  src/loaders/events.py
-       ⎿ ● Backfill October partitions   49s  Read src/loaders/backfill.py
-       ⎿ ⚙ pid 4121 up 3m  codex exec "write tests for the parser"
-── buildbox ──────────────────────────────────────────────────────────────────────────── 0.6s ssh · 2s ago ──
-  ⚙ codex              up 5d         stale? under openclaw  pid 960599
-```
+![atc: blocked, waiting and working sessions, a release workflow with its subagents, a server with a stale agent](docs/atc-demo.gif)
+
+<sub>Demo data. Arrow into a subagent, drill in, then the hierarchy and comms views.</sub>
 
 ## Why
 
@@ -45,6 +29,8 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 - **Herdr agents**: when [Herdr](https://herdr.dev) is running, the agents in its panes (Codex, opencode, pi …)
 - **Hierarchy** (`h`): session › workflow › phase › agent › nested agent › worker process, who talks to whom,
   and each server's agents grouped by what started them
+
+  ![The hierarchy view](docs/atc-tree.png)
 - **Comms** (`c`): every message, in full: session to session (✉), the task a session gave each helper (→),
   and the helper's report back (←)
 - **Activity**: one merged log of every tool call across every session and helper
@@ -117,6 +103,8 @@ Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR
   server that is already running and never starts one, because starting it resumes every saved agent.
 
 ## As a Taxi data source and sink (Orbital)
+
+![The atc Taxi schema, a query, and the hop Orbital found on its own](docs/atc-taxi.png)
 
 `atc --serve` puts the fleet on HTTP as JSON, and [`taxi/`](taxi/) describes it in
 [Taxi](https://taxilang.org), so [Orbital](https://orbitalhq.com) can query your agents next to everything
