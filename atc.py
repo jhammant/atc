@@ -888,6 +888,48 @@ def unique_hosts(views):
     return out
 
 
+def feed_and_run(args, data, timeout):
+    """Run args with `data` on stdin, writing and reading in threads, with a hard timeout.
+
+    subprocess.run(input=...) can deadlock when the child writes before it reads and the pipe buffers are
+    small (macOS hands out 512-byte pipe buffers under pressure), and its timeout never fires while a write
+    blocks. Returns (exit code or None, stdout bytes, stderr bytes or an error string)."""
+    try:
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        return None, b"", str(exc)
+    got = {"out": b"", "err": b""}
+
+    def read(name, stream):
+        got[name] = stream.read()
+
+    def write():
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass  # the far end stopped reading, or never did
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    threads = [threading.Thread(target=read, args=("out", proc.stdout), daemon=True),
+               threading.Thread(target=read, args=("err", proc.stderr), daemon=True),
+               threading.Thread(target=write, daemon=True)]
+    for t in threads:
+        t.start()
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return None, b"", f"no answer within {timeout}s"
+    for t in threads[:2]:
+        t.join(timeout=5)
+    return code, got["out"], got["err"]
+
+
 class Remote:
     """atc on another machine, run over ssh from this very file: nothing has to be installed there."""
 
@@ -910,14 +952,13 @@ class Remote:
         start = time.time()
         ssh = shlex.split(os.environ.get("ATC_SSH") or "ssh")  # e.g. "ssh -J bastion"
         args = ssh + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6", self.host, "python3", "-", "--json", "--no-hosts"]
-        try:
-            res = subprocess.run(args, input=script, capture_output=True, timeout=45)
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.error = first_line(str(exc)) or "ssh failed"
+        code, out, err = feed_and_run(args, script, timeout=45)
+        if code is None:
+            self.error = err or "ssh failed"
             return
-        data = json_in(res.stdout.decode("utf-8", "replace"))
+        data = json_in(out.decode("utf-8", "replace"))
         if data is None:
-            self.error = first_line(res.stderr.decode("utf-8", "replace")) or f"ssh exited {res.returncode}"
+            self.error = first_line(err.decode("utf-8", "replace") if isinstance(err, bytes) else err) or f"ssh exited {code}"
             return
         self.data, self.error, self.ok_at, self.latency = data, None, time.time(), time.time() - start
 

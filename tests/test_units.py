@@ -459,6 +459,21 @@ class CommandLine(unittest.TestCase):
         down = json.loads(self.atc("--json", "--host", "nowhere.invalid", ATC_SSH="false").stdout)
         self.assertFalse(down["hosts"][0]["ok"])
 
+    def test_remote_that_never_reads_its_input(self):
+        """A host that answers without reading the script must not deadlock atc (it did, on 5 Oct)."""
+        big = os.path.join(FX.stub, "big-answer.json")
+        with open(big, "w") as fh:
+            json.dump({"machine": "quietbox", "counts": {}, "groups": {}, "agents": [],
+                       "padding": "x" * 200_000}, fh)
+        rude = os.path.join(FX.stub, "rude-ssh")
+        with open(rude, "w") as fh:
+            fh.write(f"#!/bin/sh\ncat {big}\n")
+        os.chmod(rude, 0o755)
+        start = time.time()
+        data = json.loads(self.atc("--json", "--host", "quietbox", ATC_SSH=rude).stdout)
+        self.assertLess(time.time() - start, 30)
+        self.assertTrue(data["hosts"][0]["ok"], data["hosts"][0])
+
 
 if __name__ == "__main__":
     unittest.main()
