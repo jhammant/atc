@@ -3,6 +3,8 @@
 **Air traffic control for your coding agents.** One terminal screen for every Claude Code session, subagent,
 workflow and agent process on your Mac and your servers, with the levers to steer them.
 
+The intro page: [jhammant.github.io/atc](https://jhammant.github.io/atc/)
+
 ![atc: blocked, waiting and working sessions, a release workflow with its subagents, a server with a stale agent](docs/atc-demo.gif)
 
 <sub>Demo data. Arrow into a subagent, drill in, then the hierarchy and comms views.</sub>
