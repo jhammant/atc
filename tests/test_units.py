@@ -149,19 +149,19 @@ class Helpers(unittest.TestCase):
             os.remove(path)
 
     def test_unique_hosts(self):
-        views = [{"host": "nas", "machine": "endor"}, {"host": "endor", "machine": "endor.local"},
-                 {"host": "devbox", "machine": "devbox"}, {"host": "me", "machine": __import__("socket").gethostname()}]
+        views = [{"host": "storage", "machine": "buildbox"}, {"host": "buildbox", "machine": "buildbox.local"},
+                 {"host": "ci-runner", "machine": "ci-runner"}, {"host": "me", "machine": __import__("socket").gethostname()}]
         out = self.m.unique_hosts(views)
-        self.assertEqual([v["host"] for v in out], ["nas", "devbox"])
-        self.assertEqual(out[0]["aliases"], ["endor"])
+        self.assertEqual([v["host"] for v in out], ["storage", "ci-runner"])
+        self.assertEqual(out[0]["aliases"], ["buildbox"])
 
     def test_configured_hosts(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as fh:
-            fh.write("# comment\nendor\n\ndevbox  # build box\nendor\n")
+            fh.write("# comment\nbuildbox\n\nci-runner  # build box\nbuildbox\n")
         self.m.HOSTS_FILE = fh.name
         try:
-            os.environ["ATC_HOSTS"] = "extra, endor"
-            self.assertEqual(self.m.configured_hosts(["cli"]), ["cli", "extra", "endor", "devbox"])
+            os.environ["ATC_HOSTS"] = "extra, buildbox"
+            self.assertEqual(self.m.configured_hosts(["cli"]), ["cli", "extra", "buildbox", "ci-runner"])
         finally:
             os.environ.pop("ATC_HOSTS", None)
             os.remove(fh.name)
