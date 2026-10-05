@@ -1,0 +1,143 @@
+// atc as a Taxi data source and sink: the coding agents on a machine (Claude Code sessions, their subagents,
+// agent processes, the messages between sessions, quota) and two levers (message a session, change the swarm
+// cap). Served by `atc --serve` (see the README). Field names match the JSON it returns.
+namespace atc {
+
+   // ---- who and where -------------------------------------------------------
+   type SessionId inherits String          // Claude Code's session id; the key for getSession
+   type SessionName inherits String        // what atc shows: a custom name, or Claude Code's derived one
+   type SessionTitle inherits String       // Claude Code's AI title, or the custom title
+   type SessionKind inherits String        // interactive | background | herdr
+   type SessionState inherits String       // blocked | waiting | working | parked | background | other
+   type SessionStatus inherits String      // Claude Code's own: busy | idle | waiting | shell
+   type WorkingFolder inherits String      // the session's working directory
+   // The git top level of that folder. The join key for anything else that knows about repos
+   // (BugTrack projects, GitHub, deals tied to a product): declare your repo type as inheriting RepoRoot,
+   // or this as inheriting yours, and Orbital will hop between them.
+   type RepoRoot inherits String
+   type HostName inherits String           // "local", or the ssh name of a server atc reads
+
+   // ---- what is happening ---------------------------------------------------
+   type CurrentActivity inherits String    // e.g. "Bash  Run the test suite", or the last words when idle
+   type LastWords inherits String          // first line of what the session last said
+   type StateSeconds inherits Int          // how long it has been in this state
+   type UncommittedFiles inherits Int
+   type UnpushedCommits inherits Int
+   type HelpersWorking inherits Int
+   type WorkflowPhase inherits String       // the workflow phase a subagent ran in
+   type ModelName inherits String           // haiku, sonnet … when a subagent ran on a different model
+   type StartedBy inherits String           // what started an agent process (its parent's name)
+   type ClaudeSessionPercent inherits Int   // Claude's 5-hour window, % used
+   type ClaudeWeeklyPercent inherits Int
+   type Headroom inherits String            // abundant | comfortable | constrained | critical
+   type SwarmCap inherits Int               // parallel agents sessions may run
+
+   model AgentSession {
+      id : SessionId
+      name : SessionName
+      title : SessionTitle?
+      kind : SessionKind
+      state : SessionState
+      status : SessionStatus
+      folder : WorkingFolder
+      repoRoot : RepoRoot?
+      doing : CurrentActivity
+      lastWords : LastWords?
+      stateSeconds : StateSeconds?
+      uncommittedFiles : UncommittedFiles?
+      unpushedCommits : UnpushedCommits?
+      helpersWorking : HelpersWorking
+      host : HostName
+   }
+
+   // A subagent or workflow agent, under the session that started it.
+   model Subagent {
+      sessionId : SessionId
+      label : SubagentLabel inherits String
+      phase : WorkflowPhase?
+      modelName : ModelName?
+      working : IsWorking inherits Boolean
+      finished : IsFinished inherits Boolean
+      doing : CurrentActivity
+   }
+
+   // An agent CLI running outside any session (codex, kimi, claude -p …), here or on a server.
+   model AgentProcess {
+      host : HostName
+      pid : ProcessId inherits Int
+      tool : AgentTool inherits String
+      startedBy : StartedBy?
+      upSeconds : UpSeconds inherits Int
+      stale : IsStale inherits Boolean     // running for over a day
+      command : CommandLine inherits String
+   }
+
+   // A message one session sent another (bodies stay on the machine; this is the summary).
+   model SessionLetter {
+      fromSession : FromSession inherits String
+      toSession : ToSession inherits String
+      summary : LetterSummary inherits String
+      sentAt : SentAt inherits String      // ISO 8601
+   }
+
+   model QuotaReading {
+      claudeSessionPercent : ClaudeSessionPercent?
+      claudeWeeklyPercent : ClaudeWeeklyPercent?
+      headroom : Headroom?
+      swarmCap : SwarmCap?
+      swarmCapPinned : SwarmCapPinned inherits Boolean
+   }
+
+   // ---- writes: one model in, one model out ------------------------------------
+   model SessionMessage {
+      sessionId : SessionId
+      text : MessageText inherits String
+   }
+
+   model MessageResult {
+      sessionId : SessionId
+      delivered : Delivered inherits Boolean   // false when the session is blocked on a prompt, and why
+      detail : ResultDetail inherits String
+   }
+
+   model SwarmCapChange {
+      direction : CapDirection inherits String // up | down | auto
+   }
+
+   model SwarmCapResult {
+      detail : ResultDetail
+   }
+
+   // host.docker.internal: Orbital in Docker reaching `atc --serve` on the host (127.0.0.1:7070).
+   // Running Orbital outside Docker? Change it to http://localhost:7070.
+   @HttpService(baseUrl = "http://host.docker.internal:7070")
+   service AtcApi {
+      @HttpOperation(method = "GET", url = "/api/taxi/sessions")
+      operation listSessions() : AgentSession[]
+
+      // The discovered hop: given a SessionId anywhere (a Subagent, a message result), Orbital can reach the
+      // whole session.
+      @HttpOperation(method = "GET", url = "/api/taxi/sessions/{id}")
+      operation getSession( @PathVariable("id") id : SessionId ) : AgentSession
+
+      @HttpOperation(method = "GET", url = "/api/taxi/subagents")
+      operation listSubagents() : Subagent[]
+
+      @HttpOperation(method = "GET", url = "/api/taxi/processes")
+      operation listProcesses() : AgentProcess[]
+
+      @HttpOperation(method = "GET", url = "/api/taxi/letters")
+      operation listLetters() : SessionLetter[]
+
+      @HttpOperation(method = "GET", url = "/api/taxi/quota")
+      operation getQuota() : QuotaReading
+
+      // Types the text into the session, as if you typed it there. Refused (delivered: false) while the
+      // session is blocked on a permission prompt or question: Enter would answer it.
+      @HttpOperation(method = "POST", url = "/api/taxi/messages")
+      write operation messageSession( @RequestBody message : SessionMessage ) : MessageResult
+
+      @HttpOperation(method = "POST", url = "/api/taxi/swarm-cap")
+      write operation changeSwarmCap( @RequestBody change : SwarmCapChange ) : SwarmCapResult
+   }
+}

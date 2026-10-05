@@ -5,11 +5,15 @@ Run from the repo root:  python3 -m unittest discover -s tests -v
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixture  # noqa: E402
@@ -398,6 +402,131 @@ class Levers(unittest.TestCase):
         self.assertNotIn("w2:p1 status", calls)
         self.assertIn("herdr agent focus w3:p1", calls)
         self.assertIn("herdr agent send-keys w3:p1 esc", calls)
+
+
+class Serve(unittest.TestCase):
+    """atc --serve: the JSON Orbital reads, the writes it may make, and the schema matching both."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_atc(FX.env())
+        m = cls.m
+        feed = m.Feed([os.path.join(FX.stub, "claude")], background=False)
+        feed.fetch()
+        repos = m.Repos(background=False)
+        cls.fleet = m.Fleet(None, feed, m.Herdr(None, background=False), repos=repos)
+        cls.fleet.refresh(time.time())
+        repos.watch(s.cwd for s in cls.fleet.sessions.values())
+        repos.fetch()
+        quota = m.Quota([os.path.join(FX.stub, "quotamax")], background=False)
+        quota.fetch()
+        cls.token = "test-token-not-secret"
+        cls.service = m.Service(cls.fleet, quota, [], m.Terminals(), writes=True, token=cls.token, background=False)
+        cls.service.refresh()
+        cls.server = m.make_server(cls.service, "127.0.0.1:0")
+        cls.url = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def call(self, path, body=None, token=None):
+        req = urllib.request.Request(self.url + path, data=None if body is None else json.dumps(body).encode(),
+                                     method="GET" if body is None else "POST")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                raw = r.read().decode()
+                return r.status, (json.loads(raw) if raw.startswith(("{", "[")) else raw)
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode() or "{}")
+
+    def test_sessions(self):
+        status, rows = self.call("/api/taxi/sessions")
+        self.assertEqual(status, 200)
+        by = {r["name"]: r for r in rows}
+        self.assertEqual(by["gamma-33"]["state"], "blocked")
+        self.assertEqual(by["alpha-11"]["repoRoot"], FX.work)
+        self.assertEqual((by["alpha-11"]["uncommittedFiles"], by["alpha-11"]["unpushedCommits"]), (1, 1))
+        status, one = self.call(f"/api/taxi/sessions/{FX.sid('beta-22')}")
+        self.assertEqual((status, one["name"]), (200, "beta-22"))
+        self.assertEqual(self.call("/api/taxi/sessions/nope")[0], 404)
+
+    def test_subagents_processes_letters_quota(self):
+        subs = self.call("/api/taxi/subagents")[1]
+        tests = next(s for s in subs if s["label"] == "Write the tests")
+        self.assertEqual(tests["sessionId"], FX.sid("alpha-11"))
+        self.assertTrue(tests["finished"])
+        procs = self.call("/api/taxi/processes")[1]
+        stray = next(p for p in procs if p["pid"] == FX.stray)
+        self.assertEqual((stray["tool"], stray["host"], stray["startedBy"]), ("codex", "local", "launchd"))
+        letters = self.call("/api/taxi/letters")[1]
+        self.assertEqual([(x["fromSession"], x["toSession"]) for x in letters], [("alpha-11", "beta-22")])
+        quota = self.call("/api/taxi/quota")[1]
+        self.assertEqual((quota["headroom"], quota["swarmCap"], quota["claudeWeeklyPercent"]), ("comfortable", 4, 40))
+
+    def test_schema_is_served(self):
+        status, text = self.call("/api/taxi/schema")
+        self.assertEqual(status, 200)
+        self.assertIn("namespace atc", text)
+
+    def test_schema_and_json_agree(self):
+        """Every field each model declares is a key in what atc serves, and nothing more."""
+        with open(self.m.TAXI_SCHEMA) as fh:
+            schema = fh.read()
+        def fields(model):
+            body = re.search(r"model " + model + r" \{(.*?)\n   \}", schema, re.S).group(1)
+            return {line.split(":")[0].strip() for line in body.splitlines() if re.match(r"\s+\w+ :", line)}
+        served = {"AgentSession": self.call("/api/taxi/sessions")[1][0],
+                  "Subagent": self.call("/api/taxi/subagents")[1][0],
+                  "AgentProcess": self.call("/api/taxi/processes")[1][0],
+                  "SessionLetter": self.call("/api/taxi/letters")[1][0],
+                  "QuotaReading": self.call("/api/taxi/quota")[1]}
+        for model, sample in served.items():
+            self.assertEqual(fields(model), set(sample), model)
+
+    def test_writes_need_the_token(self):
+        body = {"sessionId": FX.sid("beta-22"), "text": "no token"}
+        self.assertEqual(self.call("/api/taxi/messages", body)[0], 401)
+        self.assertEqual(self.call("/api/taxi/messages", body, token="wrong")[0], 401)
+        self.assertNotIn("no token", FX.pane("beta-22"))
+
+    def test_message_a_session_and_the_blocked_guard(self):
+        status, res = self.call("/api/taxi/messages", {"sessionId": FX.sid("beta-22"), "text": "hello from orbital"},
+                                token=self.token)
+        self.assertEqual(status, 200)
+        self.assertTrue(res["delivered"], res)
+        time.sleep(0.5)
+        self.assertIn("hello from orbital", FX.pane("beta-22"))
+        status, res = self.call("/api/taxi/messages", {"sessionId": FX.sid("gamma-33"), "text": "must not arrive"},
+                                token=self.token)
+        self.assertFalse(res["delivered"])
+        self.assertIn("blocked", res["detail"])
+        time.sleep(0.5)
+        self.assertNotIn("must not arrive", FX.pane("gamma-33"))
+
+    def test_swarm_cap(self):
+        FX.clear_calls()
+        status, res = self.call("/api/taxi/swarm-cap", {"direction": "up"}, token=self.token)
+        self.assertEqual(status, 200)
+        self.assertIn("abundant", res["detail"])
+        self.call("/api/taxi/swarm-cap", {"direction": "auto"}, token=self.token)
+        self.assertIn("quotamax override abundant 2", FX.calls())
+        self.assertEqual(self.call("/api/taxi/swarm-cap", {"direction": "sideways"}, token=self.token)[0], 400)
+
+    def test_writes_off_by_default(self):
+        service = self.m.Service(self.fleet, None, [], self.m.Terminals(), writes=False, background=False)
+        self.assertEqual(service.post("/api/taxi/messages", {"sessionId": "x", "text": "y"})[0], 403)
+
+    def test_off_this_machine_reads_need_the_token(self):
+        server = self.m.make_server(self.service, "0.0.0.0:0")
+        try:
+            self.assertFalse(server.open_reads)
+        finally:
+            server.server_close()
 
 
 class CommandLine(unittest.TestCase):

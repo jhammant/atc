@@ -45,7 +45,11 @@ class Screen:
                    f"2> {shlex.quote(self.err)}; echo $? > {shlex.quote(self.code)}; sleep 30")
         subprocess.run([TMUX, "new-session", "-d", "-s", self.name, "-x", str(width), "-y", str(height), command],
                        check=True)
-        self.wait_for(ready)
+        try:
+            self.wait_for(ready)
+        except AssertionError:  # don't leave a session running when a test can't start
+            subprocess.run([TMUX, "kill-session", "-t", self.name], capture_output=True)
+            raise
 
     def text(self):
         return subprocess.run([TMUX, "capture-pane", "-p", "-t", self.name], capture_output=True, text=True).stdout

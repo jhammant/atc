@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import curses
+import hmac
+import secrets
 import glob
 import json
 import locale
@@ -44,7 +46,8 @@ import textwrap
 import threading
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CLAUDE_HOME = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 SESSIONS_DIR = os.path.join(CLAUDE_HOME, "sessions")
@@ -1550,6 +1553,246 @@ end tell"""
     return f"opened a new {kind} tab" if ok else f"couldn't open a tab: {result}"
 
 
+def deliver(fleet, terminals, v, text):
+    """Type text into one live session, unless it is blocked on a prompt (Enter would answer it).
+    Returns (delivered, detail). The screen's m/M/C/F and the HTTP sink both come through here."""
+    if v.get("kind") not in ("interactive", "herdr"):
+        return False, "only live interactive sessions take messages (a background session: attach to it)"
+    status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
+    if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
+        return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
+    if v.get("herdr") and fleet.herdr:
+        result = fleet.herdr.act(v["herdr"], "type", text)
+    else:
+        result = terminals.act(v.get("tty"), "type", text)
+    return result.startswith(("type: done", "dry run")), result
+
+
+# ---------------------------------------------------------------- as an HTTP data source and sink (Taxi / Orbital)
+
+TAXI_SCHEMA = os.path.join(os.path.dirname(os.path.realpath(__file__)), "taxi", "src", "atc.taxi")
+SERVE_EVERY = 2.0
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z") if ts else None
+
+
+def taxi_sessions(model, roots):
+    """AgentSession[] (taxi/src/atc.taxi), local and from every server."""
+    out = []
+    for v in ordered_sessions(model, True):
+        repo = v.get("repo") or {}
+        out.append({
+            "id": v["sid"], "name": v["name"], "title": v.get("title") or None, "kind": v["kind"],
+            "state": v["group"], "status": v["status"], "folder": v["cwd"], "repoRoot": roots.get(v["cwd"]) or None,
+            "doing": v["doing"], "lastWords": v.get("said") or None,
+            "stateSeconds": int(v["since"]) if v.get("since") is not None else None,
+            "uncommittedFiles": repo.get("dirty"), "unpushedCommits": repo.get("unpushed"),
+            "helpersWorking": v.get("helpers_working", 0), "host": "local",
+        })
+    for h in model.get("hosts", []):
+        for key in ("blocked", "waiting", "working", "parked", "background", "other"):
+            for v in h.get("groups", {}).get(key, []):
+                out.append({
+                    "id": v.get("sid"), "name": v.get("name"), "title": v.get("title") or None,
+                    "kind": v.get("kind", "interactive"), "state": v.get("group", key), "status": v.get("status", "?"),
+                    "folder": v.get("cwd", ""), "repoRoot": None, "doing": v.get("doing", ""),
+                    "lastWords": v.get("said") or None, "stateSeconds": None, "uncommittedFiles": None,
+                    "unpushedCommits": None, "helpersWorking": v.get("helpers_working", 0), "host": h["host"],
+                })
+    return out
+
+
+def taxi_subagents(model):
+    out = []
+    for v in ordered_sessions(model, True):
+        for a in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]:
+            out.append({"sessionId": v["sid"], "label": a["label"], "phase": a.get("phase") or None,
+                        "modelName": a.get("model") or None, "working": a["working"], "finished": a["finished"],
+                        "doing": a["doing"]})
+    return out
+
+
+def taxi_processes(model):
+    def row(a, host):
+        return {"host": host, "pid": a["pid"], "tool": a["tool"], "startedBy": a.get("parent") or None,
+                "upSeconds": a.get("age", etime_seconds(a.get("etime", "0"))), "stale": bool(a.get("stale")),
+                "command": a["command"]}
+    return [row(a, "local") for a in model.get("agents", [])] + [
+        row(a, h["host"]) for h in model.get("hosts", []) for a in h.get("agents", [])]
+
+
+def taxi_letters(model):
+    return [{"fromSession": c["from"], "toSession": c["to"], "summary": c.get("summary") or "", "sentAt": iso(c.get("ts"))}
+            for c in model.get("comms", []) if c["kind"] == "letter"]
+
+
+def taxi_quota(quota):
+    data = (quota.data if quota else None) or {}
+    level = quota.level() if quota and quota.data else None
+    return {
+        "claudeSessionPercent": (data.get("session") or {}).get("percentUsed"),
+        "claudeWeeklyPercent": (data.get("weekly") or {}).get("effectivePercent", (data.get("weekly") or {}).get("percentUsed")),
+        "headroom": level, "swarmCap": CAP_SIZE.get(level), "swarmCapPinned": bool((data.get("override") or {}).get("level")),
+    }
+
+
+def is_loopback(host):
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def serve_token(create):
+    """ATC_SERVE_TOKEN, or ~/.config/atc/serve-token (made on first use, 0600). The token is never printed."""
+    token = os.environ.get("ATC_SERVE_TOKEN")
+    if token or not create:
+        return token
+    path = os.path.expanduser("~/.config/atc/serve-token")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        token = secrets.token_urlsafe(32)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(token + "\n")
+        return token
+
+
+class Service:
+    """What `atc --serve` serves: the same fleet the screen shows, refreshed in the background."""
+
+    def __init__(self, fleet, quota, remotes, terminals, writes=False, token=None, background=True):
+        self.fleet, self.quota, self.remotes, self.terminals = fleet, quota, remotes, terminals
+        self.writes, self.token = writes, token
+        self.model, self.at, self.error = None, 0.0, None
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def refresh(self):
+        now = time.time()
+        self.fleet.refresh(now)
+        self.model, self.at = self.fleet.model(now, self.quota, self.remotes), now
+
+    def loop(self):
+        while True:
+            try:
+                self.refresh()
+                self.error = None
+            except Exception as exc:  # keep serving the last good model
+                self.error = str(exc)
+            time.sleep(SERVE_EVERY)
+
+    def roots(self):
+        return dict(self.fleet.repos.roots) if self.fleet.repos is not None else {}
+
+    def get(self, path):
+        """(status, body) for a GET."""
+        model = self.model
+        if path == "/api/health":
+            return 200, {"ok": model is not None, "refreshedAt": iso(self.at), "error": self.error}
+        if model is None:
+            return 503, {"detail": "atc is still reading sessions; try again in a moment"}
+        if path == "/api/taxi/sessions":
+            return 200, taxi_sessions(model, self.roots())
+        if path.startswith("/api/taxi/sessions/"):
+            sid = path.rsplit("/", 1)[1]
+            found = next((x for x in taxi_sessions(model, self.roots()) if x["id"] == sid), None)
+            return (200, found) if found else (404, {"detail": f"no session {sid}"})
+        if path == "/api/taxi/subagents":
+            return 200, taxi_subagents(model)
+        if path == "/api/taxi/processes":
+            return 200, taxi_processes(model)
+        if path == "/api/taxi/letters":
+            return 200, taxi_letters(model)
+        if path == "/api/taxi/quota":
+            return 200, taxi_quota(self.quota)
+        return 404, {"detail": "not found"}
+
+    def post(self, path, body):
+        """(status, body) for a POST (a write)."""
+        if not self.writes:
+            return 403, {"detail": "writes are off: start atc with --serve-writes"}
+        if path == "/api/taxi/messages":
+            sid, text = str(body.get("sessionId") or ""), str(body.get("text") or "")
+            if not sid or not text.strip():
+                return 400, {"detail": "sessionId and text are required"}
+            v = next((x for x in ordered_sessions(self.model or {"groups": {}}, True) if x["sid"] == sid), None) \
+                if self.model else None
+            if v is None:
+                return 404, {"sessionId": sid, "delivered": False, "detail": f"no live session {sid}"}
+            delivered, detail = deliver(self.fleet, self.terminals, v, text)
+            return 200, {"sessionId": sid, "delivered": delivered, "detail": detail}
+        if path == "/api/taxi/swarm-cap":
+            direction = str(body.get("direction") or "")
+            if direction not in ("up", "down", "auto"):
+                return 400, {"detail": "direction must be up, down or auto"}
+            detail = self.quota.clear() if direction == "auto" else self.quota.step(+1 if direction == "up" else -1)
+            return 200, {"detail": detail}
+        return 404, {"detail": "not found"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "atc"
+
+    def authorised(self):
+        token = self.server.service.token
+        if not token:
+            return False
+        sent = self.headers.get("Authorization", "")
+        return hmac.compare_digest(sent.encode(), f"Bearer {token}".encode())
+
+    def reply(self, status, body, ctype="application/json"):
+        data = body.encode() if isinstance(body, str) else json.dumps(body, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if not self.server.open_reads and not self.authorised():
+            return self.reply(401, {"detail": "a bearer token is needed off this machine"})
+        if path == "/api/taxi/schema":
+            try:
+                with open(TAXI_SCHEMA, encoding="utf-8") as fh:
+                    return self.reply(200, fh.read(), "text/plain; charset=utf-8")
+            except OSError:
+                return self.reply(404, {"detail": "taxi/src/atc.taxi is not next to atc.py"})
+        self.reply(*self.server.service.get(path))
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0].rstrip("/")
+        if not self.server.service.writes:
+            return self.reply(*self.server.service.post(path, {}))
+        if not self.authorised():
+            return self.reply(401, {"detail": "writes need Authorization: Bearer <token> (ATC_SERVE_TOKEN or "
+                                              "~/.config/atc/serve-token)"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+        except ValueError:
+            return self.reply(400, {"detail": "body must be JSON"})
+        self.reply(*self.server.service.post(path, body if isinstance(body, dict) else {}))
+
+    def log_message(self, fmt, *args):
+        if os.environ.get("ATC_DEBUG_LOG"):
+            with open(os.environ["ATC_DEBUG_LOG"], "a") as fh:
+                fh.write(f"{time.time():.2f} http {fmt % args}\n")
+
+
+def make_server(service, address):
+    host, _, port = address.rpartition(":")
+    host = host or "127.0.0.1"
+    server = ThreadingHTTPServer((host, int(port)), Handler)
+    server.daemon_threads = True
+    server.service = service
+    server.open_reads = is_loopback(host)  # off this machine, reads need the token too
+    return server
+
+
 # ---------------------------------------------------------------- rendering
 # A frame is a list of lines; a line is a list of (text, style) segments. Curses and --once share it.
 
@@ -2529,16 +2772,13 @@ class App:
     def submit_message(self, text):
         sent, skipped = [], []
         for v in self.targets:
-            status = self.fleet.feed.status_now(v["sid"]) if self.fleet.feed and self.fleet.feed.cmd else v["status"]
-            if (status or v["status"]) in ("waiting", "blocked") or v["group"] == "blocked":
+            delivered, detail = deliver(self.fleet, self.terminals, v, text)
+            if delivered:
+                sent.append(v["name"])
+            elif detail.startswith("blocked"):
                 skipped.append(v["name"])  # typing would answer its permission prompt or question
-                continue
-            if v.get("herdr") and self.fleet.herdr:
-                result = self.fleet.herdr.act(v["herdr"], "type", text)
             else:
-                result = self.terminals.act(v["tty"], "type", text)
-            (sent if result.startswith(("type: done", "dry run")) else skipped).append(
-                v["name"] if result.startswith(("type: done", "dry run")) else f"{v['name']} ({result})")
+                skipped.append(f"{v['name']} ({detail})")
         message = f"sent to {', '.join(sent)}" if sent else "sent to nobody"
         if skipped:
             message += f"; skipped {', '.join(skipped)} (blocked on a prompt: answer it there)"
@@ -2667,6 +2907,10 @@ def main():
     parser.add_argument("--host", action="append", default=[], metavar="SSH_TARGET",
                         help=f"also show this machine over ssh (repeatable; or list them in {short_path(HOSTS_FILE)})")
     parser.add_argument("--no-hosts", action="store_true", help="this machine only")
+    parser.add_argument("--serve", nargs="?", const="127.0.0.1:7070", metavar="[HOST:]PORT",
+                        help="serve the fleet as JSON for Orbital/Taxi (default 127.0.0.1:7070); see taxi/")
+    parser.add_argument("--serve-writes", action="store_true",
+                        help="with --serve: allow the write endpoints (message a session, swarm cap), token required")
     args = parser.parse_args()
 
     only = os.path.abspath(os.path.expanduser(args.only)) if args.only else (os.getcwd() if args.here else None)
@@ -2730,6 +2974,23 @@ def main():
             frame, _ = render(fleet, model, {"selected": None, "show_all": True}, width)
         for line in frame:
             print("".join(text for text, _style in fit(line, width)).rstrip())
+        return
+
+    if args.serve:
+        address = args.serve if ":" in args.serve else f"127.0.0.1:{args.serve}"
+        host = address.rpartition(":")[0] or "127.0.0.1"
+        token = serve_token(create=args.serve_writes or not is_loopback(host))
+        service = Service(fleet, quota, remotes, Terminals(args.dry_run), writes=args.serve_writes, token=token)
+        server = make_server(service, address)
+        reads = "open on this machine" if server.open_reads else "token required"
+        writes = "on, token required" if args.serve_writes else "off (--serve-writes)"
+        print(f"atc: serving http://{address}  reads: {reads} · writes: {writes} · schema: /api/taxi/schema", flush=True)
+        if token and not os.environ.get("ATC_SERVE_TOKEN"):
+            print("atc: token in ~/.config/atc/serve-token (send it as Authorization: Bearer <token>)", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
         return
 
     locale.setlocale(locale.LC_ALL, "")
