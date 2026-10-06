@@ -1473,8 +1473,10 @@ def session_view(s, now, fleet):
         group, state = "other", f"{status} {age}"
         doing = f"“{s.last_text}”" if s.last_text else ""
 
+    display = s.custom_title or s.ai_title or s.name if s.kind != "background" else s.name
     return {
-        "sid": s.sid, "kind": s.kind, "id": s.entry.get("id"), "name": s.name, "color": s.color, "cwd": s.cwd,
+        "sid": s.sid, "kind": s.kind, "id": s.entry.get("id"), "name": s.name, "display_name": display,
+        "color": s.color, "cwd": s.cwd,
         "started": parse_ts(s.entry.get("startedAt")) or parse_ts(s.registry.get("startedAt")),
         "pid": s.pid or None, "tty": s.tty, "version": s.registry.get("version"), "title": s.title,
         "status": status, "waiting_for": s.entry.get("waitingFor"), "since": since, "last": last, "group": group,
@@ -2063,12 +2065,14 @@ def session_lines(v, name_w, now):
     """The session's own row (tagged with its id, so it can be selected) and its helper rows."""
     dot, dot_style = GROUP_LOOK[v["group"]]
     state_style = {"blocked": "err", "waiting": "warn", "working": "busy", "background": "c3"}.get(v["group"], "dim")
-    row = [(dot + " ", dot_style), (col(v["name"], name_w) + " ", v["color"]), (col(v["state"], 13) + " ", state_style)]
+    display = v.get("display_name") or v["name"]
+    row = [(dot + " ", dot_style), (col(display, name_w) + " ", v["color"]), (col(v["state"], 13) + " ", state_style)]
     if v["alert"]:
         row.append(("! " + clean(v["alert"]) + "   ", v["alert_style"]))
     row.append((clean(v["doing"]), "plain" if v["group"] in ("working", "waiting", "blocked") else "dim"))
-    if v["title"] and v["kind"] != "background":
-        row.append(("   " + clean(v["title"]), "dim"))
+    # Show the derived name dimly if it differs from the display name
+    if display != v["name"]:
+        row.append(("   " + clean(v["name"]), "dim"))
     elif v["title"]:
         row.append(("   " + clean(v["title"]), "dim"))
     repo = v.get("repo")
@@ -2125,7 +2129,7 @@ def fleet_lines(model, width, show_all):
     """Every session row, grouped. Returns [(line, sid or None)]."""
     now, groups = model["now"], model["groups"]
     everyone = [v for g in groups.values() for v in g]
-    name_w = min(18, max([len(clean(v["name"])) for v in everyone] + [8]))
+    name_w = min(18, max([len(clean(v.get("display_name") or v["name"])) for v in everyone] + [8]))
     out = []
     titles = {
         "blocked": ("Blocked on you", "a prompt or question is open"),
@@ -2613,7 +2617,7 @@ def draw_tree(nodes, prefix=""):
 
 # ---------------------------------------------------------------- the screen
 
-KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · "
+KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · N rename · "
         "R restore · E exit · S save · D done · c comms · h tree · n task · +/- cap · tab · p · ? help · q quit")
 
 HELP = [
@@ -2629,6 +2633,7 @@ HELP = [
     "E E        exit an idle session (/exit); refuses if the repo has unsaved work",
     "S S        save and close a session (/closecode): STATE.md, commit, push, close",
     "D D        hide a closed session from the list (reversible)",
+    "N N        rename the selected session (/rename); names are also SendMessage addresses",
     "c          comms: every message: session to session (✉), task to a helper (→), report back (←)",
     "h          the hierarchy: session > workflow > phase > agent > nested agent, worker processes",
     "           in comms and the tree, s switches between all sessions and the selected one",
@@ -2826,6 +2831,9 @@ class App:
         if self.mode == "task":
             return [(" new task in ", "title"), (f" {short_path(self.task['cwd'])}: ", "warn"), (self.buffer + "_", "plain"),
                     ("   enter: plan it with route · esc: cancel", "dim")]
+        if self.mode == "rename":
+            return [(" rename ", "title"), (f" {self.targets[0]['name']}: ", "warn"), (self.buffer + "_", "plain"),
+                    ("   enter: send /rename · esc: cancel · names are also SendMessage addresses", "dim")]
         if self.mode == "message":
             who = self.targets[0]["name"] if len(self.targets) == 1 else f"{len(self.targets)} sessions"
             return [(" message ", "title"), (f" {who}: ", "warn"), (self.buffer + "_", "plain"),
@@ -2852,6 +2860,8 @@ class App:
             return self.edit(key, self.submit_task)
         if self.mode == "message":
             return self.edit(key, self.submit_message)
+        if self.mode == "rename":
+            return self.edit(key, self.submit_rename)
         if self.mode == "plan":
             return self.handle_plan_key(key)
         if self.ui["view"]:
@@ -2929,6 +2939,8 @@ class App:
             self.exit_session(v)
         elif key == "S":
             self.save_close_session(v)
+        elif key == "N":
+            self.start_rename(v)
         return True
 
     def confirm(self, key, what):
@@ -3087,6 +3099,46 @@ class App:
         if self.confirm(f"E:{v['sid']}", f"exit {v['name']} (/exit)"):
             self.targets = [v]
             self.submit_message("/exit")
+
+    def start_rename(self, v):
+        """N N: open the rename input, pre-filled with a suggestion."""
+        if v is None or v["kind"] not in ("interactive", "herdr"):
+            return self.say("select a live session to rename it")
+        if v["group"] == "blocked":
+            return self.say(f"{v['name']} is blocked: answer it first")
+        if v["status"] == "busy":
+            return self.say(f"{v['name']} is busy: wait for it to finish")
+        if not self.confirm(f"N:{v['sid']}", f"rename {v['name']}"):
+            return
+        # Suggest a name from the title or AI title
+        suggestion = v.get("title") or v.get("display_name") or v["name"]
+        suggestion = re.sub(r"[^a-z0-9]+", "-", suggestion.lower()).strip("-")[:40]
+        self.targets = [v]
+        self.buffer = suggestion
+        self.mode = "rename"
+
+    def submit_rename(self, text):
+        """Send /rename <name> to the session."""
+        name = re.sub(r"[^a-z0-9-]", "", text.lower().replace(" ", "-")).strip("-")[:40]
+        if not name:
+            return self.say("name must be lowercase-hyphen (a-z, 0-9, -)")
+        v = self.targets[0]
+        delivered, detail = deliver(self.fleet, self.terminals, v, f"/rename {name}")
+        if delivered:
+            # Also rename the terminal tab
+            self.rename_terminal(v, name)
+            self.say(f"sent /rename {name} to {v['name']}")
+        else:
+            self.say(f"couldn't rename: {detail}")
+
+    def rename_terminal(self, v, name):
+        """Set the terminal tab/window title to match the session name."""
+        if self.dry_run or not v.get("tty"):
+            return
+        kind, target = self.terminals.locate(v["tty"])
+        if kind == "tmux" and target:
+            window = target.rsplit(".", 1)[0]
+            run(["tmux", "rename-window", "-t", window, name])
 
     def save_close_session(self, v):
         """S S: type /closecode into an idle session."""

@@ -261,6 +261,7 @@ class Fixture:
         write_jsonl(os.path.join(self.transcript_dir("beta-22"), f"{b['sid']}.jsonl"), [
             user(1200, "Draft the changelog"),
             {"type": "ai-title", "aiTitle": "Changelog"},
+            {"type": "custom-title", "customTitle": "changelog-drafter"},
             {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(690),
              "content": f'<cross-session-message from="uds:/tmp/cc-socks-test/{a["pid"]}.sock" from-name="alpha-11">'
                         "Please review the API before we ship</cross-session-message>"},

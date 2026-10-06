@@ -105,13 +105,13 @@ class Screen:
     def select(self, name):
         for key in ("Up", "Down"):
             for _ in range(60):
-                if self.selected() == name:
+                if self.selected() == name or name in self.selected_line():
                     return
                 before = self.selected_line()
                 self.step(key)
                 if self.selected_line() == before:
                     break  # reached the end in this direction
-        if self.selected() != name:
+        if self.selected() != name and name not in self.selected_line():
             raise AssertionError(f"couldn't select {name}; selected is {self.selected()}")
 
     def footer(self):
@@ -164,21 +164,21 @@ class Wide(unittest.TestCase):
         s = self.s
         s.select("gamma-33")
         s.step("Down")
-        self.assertEqual(s.selected(), "beta-22")
+        self.assertIn("beta-22", s.selected_line())  # beta-22 shows as changelog-drafter but line has beta-22 dim
         s.step("Down")
-        self.assertEqual(s.selected(), "alpha-11")
+        self.assertIn("alpha-11", s.selected_line())
         s.step("Down")
         self.assertIn("API client", s.selected_line())  # into alpha's workflow agents and subagents
         s.step("Up")
-        self.assertEqual(s.selected(), "alpha-11")
+        self.assertIn("alpha-11", s.selected_line())
         s.step("Up")
-        self.assertEqual(s.selected(), "beta-22")
+        self.assertIn("beta-22", s.selected_line())
         s.step("k")
-        self.assertEqual(s.selected(), "gamma-33")
+        self.assertIn("gamma-33", s.selected_line())
         s.step("j")
         row = next(i for i, line in enumerate(s.lines()) if line.startswith("▶"))
         time.sleep(3)  # several refreshes later: same session, same row
-        self.assertEqual(s.selected(), "beta-22")
+        self.assertIn("beta-22", s.selected_line())
         self.assertEqual(next(i for i, line in enumerate(s.lines()) if line.startswith("▶")), row)
 
     def test_03_tab_switches_the_left_panel(self):
@@ -350,7 +350,7 @@ class Wide(unittest.TestCase):
             self.assertNotEqual(s.lines()[0].split()[1], clock, f"frozen after resizing to {width}x{height}")
         s.select("gamma-33")
         s.step("Down")
-        self.assertEqual(s.selected(), "beta-22")
+        self.assertIn("beta-22", s.selected_line())
 
     def test_18_drill_into_a_subagent(self):
         s = self.s
@@ -420,6 +420,24 @@ class Wide(unittest.TestCase):
         s.wait_for("press D again")
         s.press("D")
         s.wait_for("hidden api-client")
+
+    def test_23_display_name_shown(self):
+        """Sessions with titles show the title as the primary name."""
+        s = self.s
+        # beta-22 has custom title "changelog-drafter"
+        self.assertIn("changelog-drafter", s.text())
+        # alpha-11 has AI title "Alpha feature work" shown as display name
+        self.assertIn("Alpha feature", s.text())
+
+    def test_24_rename_key(self):
+        """N N opens the rename input."""
+        s = self.s
+        s.select_line("changelog-drafter")
+        s.press("N")
+        s.wait_for("press N again")
+        s.press("N")
+        s.wait_for("rename  beta-22:")
+        s.press("Escape")
 
     def test_22_exit_refuses_unsaved(self):
         """E E on a session with unsaved work must refuse and suggest S S."""

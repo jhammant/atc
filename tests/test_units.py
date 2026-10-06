@@ -245,6 +245,17 @@ class Model(unittest.TestCase):
         self.assertIn("Run the test suite", a["doing"])
         self.assertEqual(a["tty"], f"/dev/{os.path.basename(FX.sessions['alpha-11']['tty'])}")
 
+    def test_display_name_prefers_custom_title(self):
+        """display_name: custom title > AI title > derived name."""
+        b = self.views["beta-22"]
+        self.assertEqual(b["display_name"], "changelog-drafter")  # custom title
+        self.assertEqual(b["name"], "beta-22")  # derived name unchanged
+        a = self.views["alpha-11"]
+        self.assertEqual(a["display_name"], "Alpha feature work")  # AI title, no custom
+        self.assertEqual(a["name"], "alpha-11")
+        d = self.views["delta-44"]
+        self.assertEqual(d["display_name"], "Old notes")  # AI title
+
     def test_helpers_and_workflow(self):
         a = self.views["alpha-11"]
         labels = {h["label"]: h for h in a["helpers"]}
