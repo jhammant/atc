@@ -79,6 +79,10 @@ WORKER_NAMES = {"codex", "kimi", "claude", "aider", "gemini", "opencode", "goose
 STALE_AGENT_SECONDS = 24 * 3600  # an agent process running longer than this is probably stuck or forgotten
 REMOTE_EVERY = 15.0
 HOSTS_FILE = os.path.expanduser("~/.config/atc/hosts")
+CLOSED_CONFIG = os.path.expanduser("~/.config/atc/closed.json")
+CLOSED_DAYS = 14
+CLOSED_SCAN_EVERY = 30.0
+CLOSED_TAIL_BYTES = 50_000
 LAUNCHERS = {"node", "python", "python3", "sh", "bash", "zsh", "env", "bun", "deno", "uv", "npx"}
 PATH_NOISE = {"index.js", "cli.js", "main.js", "main.py", "dist", "bin", "lib", "src", "build", ".bin", "node_modules"}
 
@@ -194,6 +198,31 @@ def etime_seconds(etime):
 
 def within(path, root):
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def path_from_slug(slug):
+    """Heuristic reverse of re.sub(r'[^A-Za-z0-9]', '-', path): turn a project-dir name back into a cwd.
+
+    Greedy longest-match: at each step, try the longest hyphenated join that is an existing directory,
+    so 'atc-test-xyz' is matched as one directory name rather than three."""
+    if not slug.startswith("-"):
+        return slug
+    parts = slug[1:].split("-")
+    path = "/"
+    i = 0
+    while i < len(parts):
+        found = False
+        for j in range(min(i + 20, len(parts)), i, -1):
+            joined = "-".join(parts[i:j])
+            if os.path.isdir(os.path.join(path, joined)):
+                path = os.path.join(path, joined)
+                i = j
+                found = True
+                break
+        if not found:
+            path = os.path.join(path, parts[i])
+            i += 1
+    return path
 
 
 def run(args, cwd=None, timeout=15):
@@ -701,6 +730,153 @@ class Repos:
         return self.state.get(self.roots.get(folder) or "", None)
 
 
+class ClosedSessions:
+    """Transcripts that changed in the last 14 days but whose session isn't live: closed but resumable."""
+
+    def __init__(self, repos=None, background=True):
+        self.sessions = {}   # sid -> view dict
+        self.hidden = {}     # sid -> {"at": timestamp, "reason": str}
+        self.show_hidden = False
+        self.repos = repos
+        self._load_config()
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def _load_config(self):
+        try:
+            with open(CLOSED_CONFIG, encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.hidden = data.get("hidden", {}) if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            pass
+
+    def _save_config(self):
+        os.makedirs(os.path.dirname(CLOSED_CONFIG), exist_ok=True)
+        data = {"hidden": self.hidden}
+        with open(CLOSED_CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+
+    def hide(self, sid, reason="done"):
+        self.hidden[sid] = {"at": time.time(), "reason": reason}
+        self._save_config()
+
+    def unhide(self, sid):
+        self.hidden.pop(sid, None)
+        self._save_config()
+
+    def scan(self, live_sids):
+        cutoff = time.time() - CLOSED_DAYS * 86400
+        found = {}
+        for proj_dir in glob.glob(os.path.join(PROJECTS_DIR, "*")):
+            if not os.path.isdir(proj_dir):
+                continue
+            for path in glob.glob(os.path.join(proj_dir, "*.jsonl")):
+                basename = os.path.basename(path)
+                sid = basename[:-6]
+                if sid in live_sids:
+                    continue
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                if st.st_mtime < cutoff:
+                    continue
+                existing = self.sessions.get(sid)
+                if existing and existing.get("_mtime") == st.st_mtime:
+                    found[sid] = existing
+                    continue
+                found[sid] = self._read_tail(path, sid, proj_dir, st.st_mtime)
+        self.sessions = found
+        if self.repos:
+            self.repos.watch(list(self.repos.folders) + [s["cwd"] for s in found.values() if s.get("cwd")])
+
+    def _read_tail(self, path, sid, proj_dir, mtime):
+        cwd = path_from_slug(os.path.basename(proj_dir))
+        info = {"sid": sid, "cwd": cwd, "_mtime": mtime, "_path": path, "title": "", "last_words": "",
+                "last_ts": None, "closed_at": mtime, "next_step": ""}
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                fh.seek(max(0, size - CLOSED_TAIL_BYTES))
+                data = fh.read()
+        except OSError:
+            return info
+        custom_title = ai_title = last_text = ""
+        last_ts = None
+        for raw in data.split(b"\n"):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            ts = parse_ts(rec.get("timestamp"))
+            if ts and (last_ts is None or ts > last_ts):
+                last_ts = ts
+            kind = rec.get("type")
+            if kind == "ai-title" and rec.get("aiTitle"):
+                ai_title = squash(rec["aiTitle"])
+            elif kind == "custom-title":
+                ct = rec.get("customTitle") or rec.get("title")
+                if isinstance(ct, str) and ct.strip():
+                    custom_title = squash(ct)
+            elif kind == "assistant":
+                content = (rec.get("message") or {}).get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text", "").strip():
+                            last_text = first_line(block["text"])
+        info["title"] = custom_title or ai_title
+        info["last_words"] = last_text
+        info["last_ts"] = last_ts
+        # Read STATE.md next steps if the repo has one
+        state_md = os.path.join(cwd, "STATE.md") if os.path.isdir(cwd) else ""
+        if state_md and os.path.isfile(state_md):
+            info["next_step"] = self._first_next_step(state_md)
+        return info
+
+    @staticmethod
+    def _first_next_step(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read(4096)
+        except OSError:
+            return ""
+        in_section = False
+        for line in text.splitlines():
+            if re.match(r"#+\s*[Nn]ext\s+[Ss]teps?", line):
+                in_section = True
+                continue
+            if in_section and line.strip().startswith(("- ", "* ", "1.")):
+                return line.strip().lstrip("-*1. ").strip()
+            if in_section and line.startswith("#"):
+                break
+        return ""
+
+    def visible(self):
+        """Closed sessions to show, excluding hidden unless show_hidden is on."""
+        out = []
+        for sid, info in self.sessions.items():
+            is_hidden = sid in self.hidden
+            if is_hidden and not self.show_hidden:
+                continue
+            view = dict(info, hidden=is_hidden)
+            if is_hidden:
+                h = self.hidden[sid]
+                view["hidden_reason"] = h.get("reason", "")
+                view["hidden_at"] = h.get("at")
+            if self.repos:
+                view["repo"] = self.repos.of(info.get("cwd", ""))
+            out.append(view)
+        out.sort(key=lambda v: v.get("closed_at") or 0, reverse=True)
+        return out
+
+    def loop(self):
+        while True:
+            # live_sids will be set by the fleet before each scan
+            time.sleep(CLOSED_SCAN_EVERY)
+
+
 class Procs:
     """The process table, refreshed in the background: `ps -A` takes ~1s on a busy Mac, too slow for the screen loop."""
 
@@ -983,12 +1159,13 @@ class Remote:
 # ---------------------------------------------------------------- the fleet
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
         self.proc_watch = procs or Procs(background=False)
         self.repos = repos
+        self.closed = closed
         self.sessions = {}       # sid -> Session
         self.activity = []       # (ts, agent, tool, detail)
         self.addresses = {}      # messaging address -> session name
@@ -1056,6 +1233,8 @@ class Fleet:
         self.agents = loose_agents(self.procs, {s.pid for s in self.sessions.values() if s.pid}) if not self.only else []
         if self.repos is not None:
             self.repos.watch(s.cwd for s in self.sessions.values())
+        if self.closed is not None:
+            self.closed.scan(set(self.sessions))
         order = sorted(self.sessions.values(), key=lambda s: parse_ts(s.entry.get("startedAt")) or 0)
         for i, session in enumerate(order):
             session.color = SESSION_COLORS[i % len(SESSION_COLORS)]
@@ -1170,6 +1349,7 @@ class Fleet:
             "quota": quota,
             "machine": socket.gethostname(),
             "hosts": unique_hosts([r.view(now) for r in remotes]),
+            "closed": self.closed.visible() if self.closed else [],
         }
 
 
@@ -1976,6 +2156,11 @@ def fleet_lines(model, width, show_all):
         out.append(([("No live Claude Code sessions found.", "dim")], None))
     for h in model.get("hosts", []):
         out += host_lines(h, width, name_w)
+    closed = model.get("closed", [])
+    if closed:
+        out.append((rule(f"Closed (resumable) ({len(closed)})", width, "R restore · D done · E exit · S save"), None))
+        for c in closed:
+            out.append((closed_row(c, name_w, now), f"closed::{c['sid']}"))
     return out
 
 
@@ -1987,6 +2172,24 @@ def agent_row(a, name_w):
     if a.get("parent"):
         line.append((f"under {a['parent']}  ", "plain"))
     return line + [(f"pid {a['pid']}  ", "dim"), (clean(a["command"]), "dim")]
+
+
+def closed_row(c, name_w, now):
+    """A closed-but-resumable session row."""
+    title = c.get("title") or c["sid"][:8]
+    age = human_age(now - c["closed_at"]) if c.get("closed_at") else "-"
+    line = [("○ ", "dim"), (col(title, name_w) + " ", "c4"), (col(f"closed {age}", 13) + " ", "dim")]
+    if c.get("last_words"):
+        line.append((clean(c["last_words"]), "dim"))
+    if c.get("next_step"):
+        line.append(("  next: " + clean(c["next_step"]), "warn"))
+    repo = c.get("repo")
+    if repo and (repo.get("dirty") or repo.get("unpushed")):
+        line.append(("  " + unsaved_text(repo), "warn"))
+    if c.get("hidden"):
+        line.append(("  [hidden]", "dim"))
+    line.append(("  " + short_path(c.get("cwd", "")), "dim"))
+    return line
 
 
 def host_lines(h, width, name_w):
@@ -2044,9 +2247,13 @@ def comm_lines(items, limit):
 
 def resolve(fleet, model, key):
     """What a selected row is: ("session", v) | ("helper", v, row, helper) | ("process", host, agent) |
-    ("remote", host, v) | (None,)."""
+    ("remote", host, v) | ("closed", c) | (None,)."""
     if not key:
         return (None,)
+    if key.startswith("closed::"):
+        sid = key[8:]
+        c = next((x for x in model.get("closed", []) if x["sid"] == sid), None)
+        return ("closed", c) if c else (None,)
     if key.startswith("@"):
         parts = key[1:].split("::", 2)
         if len(parts) != 3:
@@ -2085,6 +2292,8 @@ def selection_name(item):
         return f"{item[2]['tool']} pid {item[2]['pid']}" + (f" on {item[1]['host']}" if item[1] else "")
     if kind == "remote":
         return f"{item[2].get('name')} on {item[1]['host']}"
+    if kind == "closed":
+        return item[1].get("title") or item[1]["sid"][:8]
     return "-"
 
 
@@ -2093,6 +2302,8 @@ def selection_lines(fleet, model, item, limit, width):
     kind = item[0]
     if kind == "session":
         return detail_lines(fleet, item[1], limit)
+    if kind == "closed":
+        return closed_detail_lines(item[1], limit, width)
     if kind == "helper":
         return helper_lines(fleet, item[1], item[2], item[3], limit, width)
     if kind == "process":
@@ -2188,6 +2399,32 @@ def detail_lines(fleet, v, limit):
     mine = [item for item in fleet.activity if item[1] is session or getattr(item[1], "owner", None) is session]
     lines.append(rule("its activity", 40))
     return lines + activity_lines(mine, max(1, limit - len(lines)))
+
+
+def closed_detail_lines(c, limit, width):
+    """Detail panel for a closed (resumable) session."""
+    if not c:
+        return [[("Select a closed session.", "dim")]]
+    title = c.get("title") or c["sid"][:8]
+    closed_ago = human_age(time.time() - c["closed_at"]) if c.get("closed_at") else "?"
+    lines = [
+        [(clean(title) + "  ", "c4"), (short_path(c.get("cwd", "")), "plain")],
+        [("closed ", "dim"), (f"{closed_ago} ago", "plain"), ("   session ", "dim"), (c["sid"][:12], "dim")],
+    ]
+    if c.get("last_words"):
+        lines.append([("said   ", "dim"), (clean(c["last_words"]), "plain")])
+    if c.get("next_step"):
+        lines.append([("next   ", "dim"), (clean(c["next_step"]), "warn")])
+    repo = c.get("repo")
+    if repo and (repo.get("dirty") or repo.get("unpushed")):
+        lines.append([("git    ", "dim"), (unsaved_text(repo), "warn")])
+    elif repo:
+        lines.append([("git    ", "dim"), ("everything committed and pushed", "ok")])
+    if c.get("hidden"):
+        lines.append([("hidden ", "dim"), (f"by you, {human_age(time.time() - c['hidden_at'])} ago" if c.get("hidden_at")
+                       else "yes", "plain"), (f"  reason: {c.get('hidden_reason', '-')}", "dim")])
+    lines.append([("R R restore · E E exit · S S save and close · D D hide", "dim")])
+    return lines[:limit] if limit else lines
 
 
 def header_line(model):
@@ -2376,8 +2613,8 @@ def draw_tree(nodes, prefix=""):
 
 # ---------------------------------------------------------------- the screen
 
-KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · c comms · "
-        "h tree · n task · +/- cap · tab · p · ? help · q quit")
+KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · "
+        "R restore · E exit · S save · D done · c comms · h tree · n task · +/- cap · tab · p · ? help · q quit")
 
 HELP = [
     "enter      jump to the session's terminal tab; a background session opens attached in a new tab",
@@ -2388,6 +2625,10 @@ HELP = [
     "enter      on a subagent, a process or a server row: open it (its task, steps, report, command)",
     "C C / F F  type /closecode or /forkcode into the selected session (wrap it up, or split work off)",
     "           Steering never types into a session that is blocked on a prompt: that would answer it.",
+    "R R        restore a closed session: opens `claude --resume <id>` in a new tab",
+    "E E        exit an idle session (/exit); refuses if the repo has unsaved work",
+    "S S        save and close a session (/closecode): STATE.md, commit, push, close",
+    "D D        hide a closed session from the list (reversible)",
     "c          comms: every message: session to session (✉), task to a helper (→), report back (←)",
     "h          the hierarchy: session > workflow > phase > agent > nested agent, worker processes",
     "           in comms and the tree, s switches between all sessions and the selected one",
@@ -2635,7 +2876,7 @@ class App:
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] in ("helper", "process"):
+            if item[0] in ("helper", "process", "closed"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.open_remote(item[1], item[2])
@@ -2672,6 +2913,22 @@ class App:
                 self.say("a subagent stops with its session: select the session row, x x interrupts it")
             else:
                 self.interrupt(v)
+        elif key == "R":
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] == "closed":
+                self.restore_closed(item[1])
+            else:
+                self.say("R restores a closed session: select one in the Closed section")
+        elif key == "D":
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] == "closed":
+                self.hide_closed(item[1])
+            else:
+                self.say("D hides a closed session: select one in the Closed section")
+        elif key == "E":
+            self.exit_session(v)
+        elif key == "S":
+            self.save_close_session(v)
         return True
 
     def confirm(self, key, what):
@@ -2798,6 +3055,48 @@ class App:
         if v.get("herdr") and self.fleet.herdr:
             return self.say(self.fleet.herdr.act(v["herdr"], "interrupt"))
         self.say(self.terminals.act(v["tty"], "interrupt"))
+
+    def restore_closed(self, c):
+        """R R: open a closed session with `claude --resume <sid>` in a new tab."""
+        if not self.confirm(f"R:{c['sid']}", f"restore {c.get('title') or c['sid'][:8]}"):
+            return
+        claude = " ".join(shlex.quote(p) for p in self.claude_cmd)
+        cwd = c.get("cwd") or HOME
+        command = f"{claude} --resume {shlex.quote(c['sid'])}"
+        self.say(open_tab(cwd, command, self.dry_run))
+
+    def hide_closed(self, c):
+        """D D: hide a closed session from the list."""
+        if not self.confirm(f"D:{c['sid']}", f"hide {c.get('title') or c['sid'][:8]}"):
+            return
+        if self.fleet.closed:
+            self.fleet.closed.hide(c["sid"], "done")
+            self.say(f"hidden {c.get('title') or c['sid'][:8]}")
+
+    def exit_session(self, v):
+        """E E: type /exit into an idle session."""
+        if v is None or v["kind"] not in ("interactive", "herdr"):
+            return self.say("select a live session to exit it")
+        if v["group"] == "blocked":
+            return self.say(f"{v['name']} is blocked on a prompt: answer it first")
+        if v["status"] == "busy":
+            return self.say(f"{v['name']} is busy: wait for it to finish or use x x to interrupt first")
+        repo = v.get("repo")
+        if repo and (repo.get("dirty") or repo.get("unpushed")):
+            return self.say(f"{v['name']} has unsaved work ({unsaved_text(repo)}): use S S to save and close instead")
+        if self.confirm(f"E:{v['sid']}", f"exit {v['name']} (/exit)"):
+            self.targets = [v]
+            self.submit_message("/exit")
+
+    def save_close_session(self, v):
+        """S S: type /closecode into an idle session."""
+        if v is None or v["kind"] not in ("interactive", "herdr"):
+            return self.say("select a live session to save and close it")
+        if v["group"] == "blocked":
+            return self.say(f"{v['name']} is blocked: answer it first")
+        if self.confirm(f"S:{v['sid']}", f"save and close {v['name']} (/closecode)"):
+            self.targets = [v]
+            self.submit_message("/closecode")
 
     def submit_task(self, text):
         self.task["text"] = text
@@ -2932,7 +3231,8 @@ def main():
     feed = Feed(claude_cmd if shutil.which(claude_cmd[0]) else None, background=not one_shot)
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), args.dry_run, background=not one_shot)
     repos = Repos(background=not one_shot)
-    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos)
+    closed = ClosedSessions(repos=repos, background=False) if not only else None
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]

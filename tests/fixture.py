@@ -148,6 +148,7 @@ class Fixture:
         self.write_transcripts()
         self.write_agents_json()
         self.make_repo()
+        self.write_closed_transcript()
         codex = os.path.join(sleeper_dir, "codex")  # an agent process outside every session...
         os.symlink(shutil.which("sleep"), codex)
         out = subprocess.run(["/bin/sh", "-c", f"{codex} 3600 >/dev/null 2>&1 </dev/null & echo $!"],
@@ -276,6 +277,25 @@ class Fixture:
             {"type": "ai-title", "aiTitle": "Cleanup"},
             assistant(30, tool("g1", "Bash", command="rm -rf build", description="Delete the build folder")),
         ])
+
+    def write_closed_transcript(self):
+        """A transcript for a session that is NOT live: a closed session atc should find."""
+        closed_cwd = os.path.join(self.work, "closed-proj")
+        os.makedirs(closed_cwd, exist_ok=True)
+        slug_name = re.sub(r"[^A-Za-z0-9]", "-", closed_cwd)
+        closed_dir = os.path.join(self.claude_home, "projects", slug_name)
+        closed_sid = "cccccccc-0000-4000-8000-000000000001"
+        write_jsonl(os.path.join(closed_dir, f"{closed_sid}.jsonl"), [
+            user(7200, "Build the API client for the new service"),
+            {"type": "ai-title", "aiTitle": "API client build"},
+            {"type": "custom-title", "customTitle": "api-client"},
+            assistant(3600, text("Done. The API client is ready and all tests pass."), stop="end_turn"),
+        ])
+        # Write a STATE.md with next steps
+        with open(os.path.join(closed_cwd, "STATE.md"), "w") as fh:
+            fh.write("# State\n## Next Steps\n- Deploy to staging\n- Run integration tests\n")
+        self.closed_cwd = closed_cwd
+        self.closed_sid = closed_sid
 
     # -- use
 

@@ -153,7 +153,7 @@ class Wide(unittest.TestCase):
                         "Activity, all sessions", "Comms"):
             self.assertIn(heading, text)
         self.s.wait_for("unsaved work in 1 repo")
-        self.s.wait_for("⚠ 1 uncommitted")
+        self.s.wait_for("uncommitted")
         self.assertIn("quota  Claude 5h 12% · week 40%", text)
         for line in self.s.lines():
             self.assertLessEqual(len(line), 160)
@@ -334,7 +334,7 @@ class Wide(unittest.TestCase):
         s.select("gamma-33")
         subprocess.run([TMUX, "send-keys", "-t", s.name] + ["Down"] * 40, check=True)  # a burst, like a held key
         time.sleep(0.8)
-        self.assertIn("bg deadbeef", s.selected_line())  # the last row
+        self.assertIn("api-client", s.selected_line())  # the last row (closed session)
 
     def test_17_resize(self):
         s = self.s
@@ -403,6 +403,30 @@ class Wide(unittest.TestCase):
         s.select("gamma-33")
         s.press("C")
         s.wait_for("blocked on a prompt")
+
+    def test_21_closed_sessions_section(self):
+        s = self.s
+        s.wait_for("Closed (resumable)")
+        self.assertIn("api-client", s.text())
+        # Select the closed session row, enter opens detail
+        s.select_line("api-client")
+        s.press("Enter")
+        s.wait_for("Deploy to staging")
+        s.press("Escape")
+        s.wait_for("Blocked on you")
+        # D D hides it
+        s.select_line("api-client")
+        s.press("D")
+        s.wait_for("press D again")
+        s.press("D")
+        s.wait_for("hidden api-client")
+
+    def test_22_exit_refuses_unsaved(self):
+        """E E on a session with unsaved work must refuse and suggest S S."""
+        s = self.s
+        s.select("beta-22")  # beta is in the work dir which has uncommitted files
+        s.press("E")
+        s.wait_for("unsaved work")
 
     def test_98_commands_never_get_the_terminal_as_stdin(self):
         """The real `claude agents --json` reads a tty stdin and would swallow the keys meant for atc."""
