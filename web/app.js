@@ -1,7 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const groups = ["blocked", "waiting", "working", "parked", "background", "other"];
-const labels = {needs: "Needs you", fleet: "Fleet", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
+const labels = {needs: "Needs you", later: "Later", fleet: "Fleet", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
   blocked: "Blocked on a prompt", waiting: "Waiting for you", working: "Working", parked: "Parked", background: "Background", other: "Other"};
 let model = null, signedIn = false, busy = false, refreshing = null, generation = 0;
 let view = "needs", selected = null;
@@ -140,6 +140,7 @@ function sessionCard(s, host, stale = false) {
   card.append(node("p", s.group === "waiting" ? s.said || s.doing : s.doing, "words"));
   if (s.group === "blocked") card.append(node("p", "Answer this prompt in that session.", "notice"));
   if (s.alert) card.append(node("p", s.alert, "notice"));
+  if (s.wakes_at) card.append(node("p", `Wakes at ${when(s.wakes_at)}`, "notice"));
   helpers(s, card);
   return card;
 }
@@ -181,7 +182,11 @@ function fleetView() {
 }
 function needsView() {
   const fragment = document.createDocumentFragment();
+  let laterHeading = false;
   for (const item of model.needs || []) {
+    if (item.kind === "later" && !laterHeading) {
+      fragment.append(node("h2", "Later · due within an hour")); laterHeading = true;
+    }
     const card = node("article", null, "session " + (groups.includes(item.kind) ? item.kind : "other"));
     const head = node("header"), title = node(item.sid ? "a" : "strong", item.title);
     if (item.sid) title.href = sessionURL(item, item.host);
@@ -199,10 +204,38 @@ function needsView() {
     fragment.append(card);
   }
   if (!(model.needs || []).length) fragment.append(node("p", "Nobody needs you. The queue is empty."));
+  const upcoming = (model.later || []).filter((item) => item.in !== null && item.in > 3600 && item.in <= 86400);
+  if (upcoming.length) {
+    fragment.append(node("h2", "Later · next 24 hours"), laterView(upcoming, false));
+  }
+  for (const error of model.later_errors || []) fragment.append(node("p", error, "notice"));
   for (const machine of model.hosts || []) {
     if (!machine.ok) {
       const error = String(machine.error || "Not answering").trim().replace(/[.!]+$/, "");
       fragment.append(node("p", `${machine.host}: ${error}. Last seen: ${age(machine.age)}.`, "notice"));
+    }
+  }
+  return fragment;
+}
+function laterView(items = model.later || [], errors = true) {
+  const fragment = document.createDocumentFragment();
+  for (const item of items) {
+    const card = node("article", null, "session other");
+    const title = node(item.sid ? "a" : "strong", item.title);
+    if (item.sid) title.href = sessionURL(item, item.host);
+    const relative = item.in === null || item.in === undefined ? "Undated" :
+      item.in <= 0 ? `${age(-item.in).replace(/ ago$/, "")} overdue` : `in ${age(item.in).replace(/ ago$/, "")}`;
+    card.append(title, node("p", `${item.host || model.machine || "Hub"} · ${item.source || ""}`, "meta"),
+      node("p", item.when === null ? "Undated" : `${when(item.when)} · ${relative}`, "state"),
+      node("p", item.detail, "words"));
+    if (item.stale) card.append(node("p", "Last seen; this machine isn't answering.", "notice"));
+    fragment.append(card);
+  }
+  if (!items.length) fragment.append(node("p", "Nothing scheduled for later."));
+  if (errors) {
+    for (const error of model.later_errors || []) fragment.append(node("p", error, "notice"));
+    for (const machine of model.hosts || []) {
+      for (const error of machine.later_errors || []) fragment.append(node("p", `${machine.host}: ${error}`, "notice"));
     }
   }
   return fragment;
@@ -230,6 +263,7 @@ function drawModel() {
   if (view === "session" || view === "account") return;
   const content = $("content"), frag = document.createDocumentFragment();
   if (view === "needs") frag.append(needsView());
+  if (view === "later") frag.append(laterView());
   if (view === "fleet") frag.append(fleetView());
   if (view === "comms") {
     const filter = $("filter").value.toLocaleLowerCase();
@@ -272,6 +306,7 @@ function drawSession(s) {
   frag.append(facts);
   if (s.group === "blocked") frag.append(node("p", "Answer this prompt in that session. atc cannot type an answer here.", "notice"));
   if (s.alert) frag.append(node("p", s.alert, "notice"));
+  if (s.wakes_at) frag.append(node("p", `Wakes at ${when(s.wakes_at)}`, "notice"));
   frag.append(node("h2", "Last words"), node("pre", s.last_words || "No words yet."));
   helpers(s, frag);
   frag.append(node("h2", "Recent steps"));
@@ -300,7 +335,7 @@ async function drawAccount() {
 function navigate() {
   status("");
   const [name, query] = location.hash.slice(1).split("?");
-  view = ["needs", "fleet", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
+  view = ["needs", "later", "fleet", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
   const args = new URLSearchParams(query || "");
   const next = view === "session" ? {session: args.get("sid") || "", host: args.get("host") || "local"} : null;
   if (JSON.stringify(next) !== JSON.stringify(selected)) { $("message").value = ""; $("new-name").value = ""; }

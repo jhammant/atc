@@ -194,7 +194,11 @@ class Needs(unittest.TestCase, HTTP):
     def test_fleet_http_and_hub_merge_without_loops_or_duplicate_sessions(self):
         self.service = self.service_for()
         self.service.model["machine"] = "laptop"
-        self.service.model["needs"].append(self.m.need_item("later", "Wake tomorrow", hint="Open the reminder."))
+        due = time.time() + 1200
+        self.service.model["later"].append(dict(title="Wake soon", when=due, source="reminders", kind="reminder",
+                                                 detail="", host=None, sid=None))
+        self.service.model["needs"].append(dict(self.m.need_item("later", "Wake soon", hint="Open the reminder."),
+                                                when=due, source="reminders"))
         self.service.model["needs"].append(self.m.need_item("approval", "Confirm a lever", hint="Review in atc."))
         self.service.model["needs"].append(self.m.need_item("approval", "Nested host", host="server2"))
         self.url = self.start(self.service)

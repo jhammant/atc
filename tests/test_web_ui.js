@@ -30,7 +30,8 @@ function page(fetch, credentials = {}) {
     navigator: {credentials}, atob, btoa,
     window: {addEventListener() {}, isSecureContext: true, PublicKeyCredential: function () {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
   vm.runInContext(source, context);
-  return {get, document, tick: () => tick(), settled: () => vm.runInContext("refreshing", context)};
+  return {get, document, tick: () => tick(), settled: () => vm.runInContext("refreshing", context),
+    navigate(hash) { context.location.hash = hash; vm.runInContext("navigate()", context); }};
 }
 function response(status, body) {
   return {ok: status === 200, status, json: async () => body};
@@ -217,4 +218,55 @@ test("cancelled passkey and failed approval request never send a decision or ret
     assert.equal(calls.filter((url) => url.endsWith("/options")).length, 1);
     assert.match(p.get("result").textContent, /cancelled|expired|Connection lost/);
   }
+});
+
+test("Later has a next-day preview, an ordered full view and text-only plug-in data", async () => {
+  const data = model(), now = 1800000000;
+  data.later = [
+    {title: "Overdue", when: now - 60, in: -60, source: "cards", kind: "study", host: null, sid: null},
+    {title: "Wake soon", when: now + 600, in: 600, source: "alpha", kind: "wakeup", host: null, sid: "alpha-11"},
+    {title: "<script>check</script>", when: now + 7200, in: 7200, source: "<b>cards</b>", kind: "study", host: "laptop", sid: null, detail: "<img src=x>", stale: true},
+    {title: "Tomorrow", when: now + 90000, in: 90000, source: "notes", kind: "reminder", host: null, sid: null},
+    {title: "Undated note", when: null, in: null, source: "notes", kind: "reminder", host: null, sid: null},
+  ];
+  data.needs = data.later.slice(0, 2).map((item) => ({...item, kind: "later", hint: "Check the source."}));
+  data.counts.needs = 2;
+  data.later_errors = ["Later plug-in bad failed or returned invalid data; skipped."];
+  const p = page(async () => response(200, data));
+  await p.settled();
+
+  let nodes = descendants(p.get("content"));
+  assert.deepEqual(nodes.filter((n) => n.tag === "strong" || n.tag === "a").map((n) => n.textContent),
+    ["Overdue", "Wake soon", "<script>check</script>"]);
+  assert.ok(nodes.some((n) => n.textContent === "Later · due within an hour"));
+  assert.ok(nodes.some((n) => n.textContent === "Later · next 24 hours"));
+  assert.equal(nodes.find((n) => n.textContent === "Wake soon").href, "#session?sid=alpha-11&host=local");
+  assert.equal(p.get("needs-count").textContent, 2);
+
+  p.navigate("#later");
+  await p.settled();
+  nodes = descendants(p.get("content"));
+  assert.equal(p.get("view-title").textContent, "Later");
+  assert.deepEqual(nodes.filter((n) => n.tag === "strong" || n.tag === "a").map((n) => n.textContent), data.later.map((n) => n.title));
+  assert.ok(nodes.some((n) => /1m overdue/.test(n.textContent)));
+  assert.ok(nodes.some((n) => n.textContent === "Undated"));
+  assert.ok(nodes.some((n) => n.textContent === "laptop · <b>cards</b>"));
+  assert.ok(nodes.some((n) => n.textContent === "<img src=x>"));
+  assert.ok(nodes.some((n) => n.textContent === "Last seen; this machine isn't answering."));
+  assert.equal(nodes.filter((n) => n.textContent === data.later_errors[0]).length, 1);
+  assert.equal(nodes.some((n) => ["script", "img", "b"].includes(n.tag)), false);
+});
+
+test("Later's empty view keeps remote plug-in failures visible", async () => {
+  const data = model();
+  data.later = [];
+  data.hosts = [{host: "laptop", ok: true, later_errors: ["Later plug-in cards failed; skipped."]}];
+  const p = page(async () => response(200, data));
+  await p.settled();
+  p.navigate("#later");
+  await p.settled();
+
+  const nodes = descendants(p.get("content"));
+  assert.ok(nodes.some((n) => n.textContent === "Nothing scheduled for later."));
+  assert.ok(nodes.some((n) => n.textContent === "laptop: Later plug-in cards failed; skipped."));
 });

@@ -381,7 +381,7 @@ class Fixture:
         env.update({
             "CLAUDE_CONFIG_DIR": self.claude_home, "ATC_CLAUDE": os.path.join(self.stub, "claude"),
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
-            "ATC_AMAIL": "", "ATC_APPROVAL_WAIT": "0",
+            "ATC_AMAIL": "", "ATC_APPROVAL_WAIT": "0", "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
             "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
@@ -452,6 +452,28 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
 
     def stop(self):
         shutil.rmtree(self.root, ignore_errors=True)
+
+
+class LaterFixture(AmailFixture):
+    """Pending, superseded, fired and stopped schedules, with no real agent processes."""
+
+    def __init__(self):
+        super().__init__()
+        records = {
+            "alpha-11": [assistant(10, tool("wake", "ScheduleWakeup", delaySeconds=730, reason="Check the build",
+                                           prompt="Review the result", noop=False)),
+                         assistant(9, tool("cron", "CronCreate", cron="7 9 * * *", recurring=True,
+                                          prompt="Review daily report")), result(8, "cron", '{"id":"daily"}')],
+            "beta-22": [assistant(20, tool("old", "ScheduleWakeup", delaySeconds=120, reason="Old wake")),
+                        assistant(10, tool("new", "ScheduleWakeup", delaySeconds=7210, reason="New wake"))],
+            "gamma-33": [assistant(20, tool("fired", "ScheduleWakeup", delaySeconds=10, reason="Fired wake")),
+                         assistant(5, text("I woke up"), stop="end_turn")],
+            "delta-44": [assistant(20, tool("stopped", "ScheduleWakeup", delaySeconds=7200, reason="Stopped wake")),
+                         assistant(10, tool("stop", "ScheduleWakeup", stop=True))],
+        }
+        for name, rows in records.items():
+            session = self.sessions[name]
+            write_jsonl(os.path.join(self.claude_home, "projects", slug(session["cwd"]), session["sid"] + ".jsonl"), rows)
 
 
 class SwarmFixture:
@@ -565,7 +587,7 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
         return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,
                 "ROUTE_STATE_DIR": self.state, "ATC_SWARM_HOURS": "6", "PATH": self.stub + os.pathsep + os.environ["PATH"],
                 "ATC_CLAUDE": os.path.join(self.stub, "claude"), "ATC_QUOTAMAX": "", "ATC_HERDR": "", "ATC_HOSTS": "",
-                "ATC_AMAIL": "",
+                "ATC_AMAIL": "", "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
                 "ATC_TERMINAL": "none", **extra}
 
     def stop(self):

@@ -137,12 +137,13 @@ class Stdio(unittest.TestCase):
             self.assertGreaterEqual(result["ttlMs"], 0)
             self.assertIn(result["cacheScope"], ("public", "private"))
         tools = {t["name"]: t for t in listed["tools"]}
-        self.assertEqual(len(tools), 18)
+        self.assertEqual(len(tools), 19)
         for name, t in tools.items():
             self.assertEqual(t["inputSchema"]["type"], "object", name)
             lever = "dry_run" in t["inputSchema"]["properties"]
             self.assertEqual(t["annotations"]["readOnlyHint"], not lever, name)
         self.assertIn("atc_needs_me", tools)
+        self.assertTrue(tools["atc_later"]["annotations"]["readOnlyHint"])
         self.assertTrue(tools["atc_interrupt"]["annotations"]["destructiveHint"])
 
     def test_handshake_revision(self):
@@ -156,7 +157,7 @@ class Stdio(unittest.TestCase):
             c.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             tools = c.request("tools/list", modern=False)["result"]
             self.assertNotIn("resultType", tools)
-            self.assertEqual(len(tools["tools"]), 18)
+            self.assertEqual(len(tools["tools"]), 19)
             c.send({"jsonrpc": "2.0", "id": 99, "method": "initialize", "params": {"protocolVersion": "2024-01-01"}})
             self.assertEqual(c.recv()["result"]["protocolVersion"], "2025-11-25")
         finally:
@@ -516,7 +517,7 @@ class Http(unittest.TestCase):
 
     def test_read_tools(self):
         status, reply = self.post(self.rpc("tools/list"))
-        self.assertEqual((status, len(reply["result"]["tools"])), (200, 18))
+        self.assertEqual((status, len(reply["result"]["tools"])), (200, 19))
         status, reply = self.post(self.rpc("tools/call", {"name": "atc_needs_me", "arguments": {}}))
         self.assertEqual(status, 200)
         self.assertIn("gamma-33", text(reply["result"]))
@@ -546,7 +547,7 @@ class Http(unittest.TestCase):
         status, init = self.post(self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}}, False))
         self.assertEqual((status, init["result"]["protocolVersion"]), (200, "2025-06-18"))
         status, tools = self.post(self.rpc("tools/list", modern=False), headers={"MCP-Protocol-Version": "2025-06-18"})
-        self.assertEqual((status, len(tools["result"]["tools"])), (200, 18))
+        self.assertEqual((status, len(tools["result"]["tools"])), (200, 19))
         status, lever = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {
             "session": "beta-22", "text": "legacy http"}}, False))
         self.assertEqual(status, 200)
