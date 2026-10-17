@@ -583,6 +583,9 @@ class Http(unittest.TestCase):
         home_view.data["machine"] = home_view.host = "home-box"  # it is this machine here; in use it is another
         standin = self.service(writes=True, only="/nowhere/at/all", prefer=home_url, remotes=[home_view])
         standin_url = self.start(standin)
+        standin.refresh()  # its own loop checks the preferred atc, with or without MCP traffic
+        self.assertTrue(standin.prefer_ok)
+        self.assertNotIn("hasn't answered", standin.cockpit.notice())
         needs = self.rpc("tools/call", {"name": "atc_needs_me", "arguments": {}})
         awake = text(self.post(needs, url=standin_url)[1]["result"])
         self.assertIn("gamma-33", awake)  # passed through to the home atc, which sees the sessions

@@ -2823,6 +2823,8 @@ class Service:
         now = time.time()
         self.fleet.refresh(now)
         self.model, self.at = self.fleet.model(now, self.quota, self.remotes), now
+        if self.prefer:  # know whether the preferred atc answers even when no MCP call passes through
+            self.prefer_up()
 
     def loop(self):
         while True:
