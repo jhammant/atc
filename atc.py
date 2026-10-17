@@ -3253,6 +3253,9 @@ def main():
     parser.add_argument("--width", type=int, help="frame width for --once")
     parser.add_argument("--dry-run", action="store_true", help="levers say what they would do instead of doing it")
     parser.add_argument("--jump", metavar="SESSION_ID", help="focus that session's terminal tab (attach a background one)")
+    parser.add_argument("--tty", metavar="TTY",
+                        help="with --jump: the tty the caller last saw the session on; focused straight away, "
+                             "without a full scan (falls back to one if the tab has gone)")
     parser.add_argument("--cap", choices=["up", "down", "auto"], help="raise, lower or reset the swarm cap")
     parser.add_argument("--open", action="store_true", help="open the live view in a new terminal tab")
     parser.add_argument("--host", action="append", default=[], metavar="SSH_TARGET",
@@ -3280,10 +3283,18 @@ def main():
         print({"up": lambda: quota.step(+1), "down": lambda: quota.step(-1), "auto": quota.clear}[args.cap]())
         return
 
+    if args.jump and args.tty:
+        # A launcher (Roost) already knows the tty from its last poll: focusing it takes one osascript
+        # instead of the ~10 s full scan below. Only a tab that has gone falls through to the scan.
+        said = Terminals(args.dry_run).act(args.tty, "focus")
+        if said.startswith(("focus: done", "dry run")):
+            print(said)
+            return
+
     feed = Feed(claude_cmd if shutil.which(claude_cmd[0]) else None, background=not one_shot)
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), args.dry_run, background=not one_shot)
     repos = Repos(background=not one_shot)
-    closed = ClosedSessions(repos=repos, background=False) if not only else None
+    closed = ClosedSessions(repos=repos, background=False) if not only and not args.jump else None
     fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
@@ -3295,13 +3306,14 @@ def main():
             w.start()
         feed.fetch()
         herdr.fetch()
-        if quota_cmd:
+        if quota_cmd and not args.jump:  # a jump needs where the session is, not quota, git state or closed ones
             quota.fetch()
         for w in workers:
             w.join()
         now = time.time()
         fleet.refresh(now)
-        repos.fetch()
+        if not args.jump:
+            repos.fetch()
         model = fleet.model(now, quota, remotes)
         if args.jump:
             target = next((v for v in ordered_sessions(model, True) if v["sid"] == args.jump), None)
