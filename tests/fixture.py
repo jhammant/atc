@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import unittest
 from datetime import datetime, timezone
 
 ATC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "atc.py")
@@ -115,6 +116,14 @@ class Fixture:
     # -- setup
 
     def start(self):
+        try:
+            probe = subprocess.run(["ps", "-p", str(os.getpid()), "-o", "pid="], capture_output=True, text=True)
+        except PermissionError as exc:
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise unittest.SkipTest(f"live-process fixture needs ps; sandbox denied it: {exc}") from exc
+        if probe.returncode and any(s in probe.stderr.lower() for s in ("operation not permitted", "permission denied")):
+            shutil.rmtree(self.root, ignore_errors=True)
+            raise unittest.SkipTest(f"live-process fixture needs ps: {probe.stderr.strip()}")
         os.makedirs(self.stub)
         for name, body in (("claude", STUB_CLAUDE), ("quotamax", STUB_QUOTAMAX), ("route", STUB_ROUTE)):
             path = os.path.join(self.stub, name)
@@ -307,6 +316,7 @@ class Fixture:
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
+            "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
         })
         env.update(extra)
         return env
@@ -339,4 +349,121 @@ class Fixture:
             except OSError:
                 pass
         subprocess.run([TMUX, "kill-session", "-t", self.tmux_session], capture_output=True)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class SwarmFixture:
+    """Route status files plus a fake Claude home and process table; no live agents or tmux needed."""
+
+    def __init__(self):
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="atc-swarms-"))
+        self.state = os.path.join(self.root, "route")
+        self.stub = os.path.join(self.root, "stub")
+        self.work = os.path.join(self.root, "work")
+        self.claude_home = os.path.join(self.root, "home", ".claude")
+        self.sid = "11111111-0000-4000-8000-000000000001"
+        self.now = int(time.time())
+        self.table = {
+            100: self.proc(1, "claude --resume " + self.sid),
+            110: self.proc(100, "/bin/zsh -c route swarm"),
+            120: self.proc(110, "/usr/bin/python3 /tools/route.py swarm"),
+            201: self.proc(120, "codex exec implement"),
+            202: self.proc(120, "kimi --print review"),
+            210: self.proc(201, "codex exec nested-worker"),
+            400: self.proc(1, "codex exec unrelated"),
+        }
+        for path in (self.stub, self.work, os.path.join(self.claude_home, "sessions")):
+            os.makedirs(path, exist_ok=True)
+        session = {"sessionId": self.sid, "pid": 100, "name": "owner-session", "cwd": self.work,
+                   "kind": "interactive", "status": "busy", "startedAt": self.at(1000)}
+        self.write_json(os.path.join(self.claude_home, "sessions", self.sid + ".json"), session)
+        self.write_json(os.path.join(self.stub, "agents.json"), [session])
+        write_jsonl(os.path.join(self.claude_home, "projects", slug(self.work), self.sid + ".jsonl"), [
+            user(600, "Run the release swarm"), assistant(10, tool("work", "Bash", command="route swarm release")),
+        ])
+        for name, body in (("claude", STUB_CLAUDE), ("ps", '''#!/usr/bin/env python3
+import os
+with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
+    print(fh.read(), end="")
+''')):
+            path = os.path.join(self.stub, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        self.write_processes()
+        live = self.status("live", "release")
+        live["units"] = [self.unit("alpha", "codex", "running", 201), self.unit("beta", "kimi", "running", 202),
+                         self.unit("gamma", "claude", "checking"), self.unit("later", "claude", "queued"),
+                         self.unit("complete", "claude", "accepted"), self.unit("broken", "kimi", "failed"),
+                         self.unit("lost", "codex", "running", 299)]
+        live["channel"]["messages"] = 2
+        live["held"] = [{"id": "needs-context", "reason": "veto:needs-context: missing task"}]
+        self.write_status(live)
+        self.write_status(self.status("recent", "finished", "done", finished_ago=3600))
+        self.write_status(self.status("stale", "abandoned", route_pid=999, started_ago=30 * 3600))
+        self.write_status(self.status("old", "expired", "done", finished_ago=8 * 3600))
+        write_jsonl(self.channel_path(), [
+            {"at": self.at(15), "from": "agent.alpha@a-mail.test", "from_unit": "alpha",
+             "text": "Implementation ready\nAll checks passed."},
+            {"at": self.at(5), "from": "stray.worker@a-mail.test", "from_unit": None,
+             "text": "Need the shared fixture"},
+        ])
+
+    @staticmethod
+    def proc(ppid, command):
+        return {"ppid": ppid, "command": command, "tty": "", "etime": "02:00"}
+
+    def at(self, ago):
+        return datetime.fromtimestamp(self.now - ago, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def write_json(path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+
+    def unit(self, ident="worker", arm="codex", state="running", pid=None):
+        finished = state in ("accepted", "failed")
+        return {"id": ident, "arm": arm, "state": state, "pid": pid, "address": f"agent.{ident}@a-mail.test",
+                "branch": f"swarm/release/{ident}", "worktree": os.path.join(self.work, "wt", ident),
+                "log": os.path.join(self.state, "swarms", "live", "logs", ident + ".log"),
+                "started_at": None if state == "queued" else self.at(90),
+                "finished_at": self.at(30) if finished else None, "agent_rc": 0 if finished else None,
+                "wall_clock_s": 60 if finished else None}
+
+    def status(self, ident, name, state="running", route_pid=120, finished_ago=60, started_ago=600):
+        return {"schema": "route-swarm-status/1", "swarm_id": ident, "name": name, "state": state,
+                "exit_code": None if state == "running" else 0, "host": "claude", "repo": self.work,
+                "route_pid": route_pid, "started_at": self.at(max(started_ago, finished_ago + 60)),
+                "updated_at": self.at(0), "finished_at": None if state == "running" else self.at(finished_ago),
+                "hub": "hub@a-mail.test", "group_id": None,
+                "channel": {"messages": 0, "log": self.channel_path(ident)}, "held": [],
+                "units": [self.unit(state="running" if state == "running" else "accepted")]}
+
+    def status_path(self, ident="live"):
+        return os.path.join(self.state, "swarms", ident, "status.json")
+
+    def channel_path(self, ident="live"):
+        return os.path.join(self.state, "swarms", ident, "channel.jsonl")
+
+    def write_status(self, data):
+        path = self.status_path(data["swarm_id"])
+        old_mtime = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+        self.write_json(path + ".tmp", data)
+        os.replace(path + ".tmp", path)
+        if os.stat(path).st_mtime_ns <= old_mtime:
+            os.utime(path, ns=(old_mtime + 1, old_mtime + 1))
+
+    def write_processes(self):
+        with open(os.path.join(self.stub, "processes.txt"), "w", encoding="utf-8") as fh:
+            for pid, proc in self.table.items():
+                fh.write(f"{pid} {proc['ppid']} ? {proc['etime']} {proc['command']}\n")
+
+    def env(self, **extra):
+        return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,
+                "ROUTE_STATE_DIR": self.state, "ATC_SWARM_HOURS": "6", "PATH": self.stub + os.pathsep + os.environ["PATH"],
+                "ATC_CLAUDE": os.path.join(self.stub, "claude"), "ATC_QUOTAMAX": "", "ATC_HERDR": "", "ATC_HOSTS": "",
+                "ATC_TERMINAL": "none", **extra}
+
+    def stop(self):
         shutil.rmtree(self.root, ignore_errors=True)
