@@ -432,7 +432,7 @@ class Http(unittest.TestCase):
         cls.read_url = cls.start(cls.service(writes=False))
 
     @classmethod
-    def service(cls, writes, only=None, prefer=None):
+    def service(cls, writes, only=None, prefer=None, remotes=()):
         m = cls.m
         feed = m.Feed([os.path.join(FX.stub, "claude")], background=False)
         feed.fetch()
@@ -440,7 +440,7 @@ class Http(unittest.TestCase):
         fleet.refresh(time.time())
         quota = m.Quota([os.path.join(FX.stub, "quotamax")], background=False)
         quota.fetch()
-        service = m.Service(fleet, quota, [], m.Terminals(), writes=writes, token=cls.token, background=False,
+        service = m.Service(fleet, quota, list(remotes), m.Terminals(), writes=writes, token=cls.token, background=False,
                             claude_cmd=[os.path.join(FX.stub, "claude")], route_cmd=[os.path.join(FX.stub, "route")],
                             prefer=prefer)
         service.refresh()
@@ -570,7 +570,12 @@ class Http(unittest.TestCase):
         home_server = self.m.make_server(home, "127.0.0.1:0")
         threading.Thread(target=home_server.serve_forever, daemon=True).start()
         home_url = f"http://127.0.0.1:{home_server.server_address[1]}"
-        standin_url = self.start(self.service(writes=True, only="/nowhere/at/all", prefer=home_url))
+        home_view = self.m.RemoteAtc(home_url, self.token, background=False)
+        home_view.fetch()  # while it is awake: what the stand-in will show once it sleeps
+        self.assertTrue(home_view.data and home_view.data["counts"]["blocked"] == 1, home_view.error)
+        home_view.data["machine"] = "home-box"  # it is this machine here; in use it is another one
+        standin = self.service(writes=True, only="/nowhere/at/all", prefer=home_url, remotes=[home_view])
+        standin_url = self.start(standin)
         needs = self.rpc("tools/call", {"name": "atc_needs_me", "arguments": {}})
         awake = text(self.post(needs, url=standin_url)[1]["result"])
         self.assertIn("gamma-33", awake)  # passed through to the home atc, which sees the sessions
@@ -583,9 +588,19 @@ class Http(unittest.TestCase):
         self.assertFalse(done[1]["result"]["isError"], done)
         home_server.shutdown()
         home_server.server_close()
+        home_view.fetch()
+        standin.refresh()
         asleep = text(self.post(needs, url=standin_url)[1]["result"])
         self.assertIn("hasn't answered", asleep)
-        self.assertIn("Nobody needs you", asleep)  # this stand-in's own (empty) fleet
+        self.assertIn("Nobody needs you", asleep)  # this stand-in's own (empty) fleet...
+        self.assertIn("127 isn't answering", asleep)  # ...and the sleeping machine, said so
+        fleet = text(self.post(self.rpc("tools/call", {"name": "atc_fleet", "arguments": {}}), url=standin_url)[1]["result"])
+        self.assertIn("as last seen", fleet)
+        self.assertIn("gamma-33", fleet)
+        steer = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {
+            "session": "beta-22@127", "text": "while it sleeps"}}), url=standin_url)[1]["result"]
+        self.assertTrue(steer["isError"])
+        self.assertIn("can't be steered until it is back", text(steer))
         time.sleep(0.5)
         self.assertIn("confirmed through the stand-in", FX.pane("beta-22"))
 

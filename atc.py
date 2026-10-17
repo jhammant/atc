@@ -1337,6 +1337,29 @@ class Remote:
         }
 
 
+class RemoteAtc(Remote):
+    """Another atc, read over HTTP (its /api/fleet, with the token) instead of ssh: how an always-on stand-in keeps
+    the preferred atc's machine as last seen without being able to log in there."""
+
+    def __init__(self, url, token, background=True):
+        self.url, self.token = url.rstrip("/"), token
+        super().__init__((urllib.parse.urlsplit(self.url).hostname or self.url).split(".")[0], background)
+
+    def fetch(self):
+        start = time.time()
+        req = urllib.request.Request(self.url + "/api/fleet", headers={"Authorization": f"Bearer {self.token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read())
+        except (OSError, ValueError) as exc:
+            self.error = f"its atc doesn't answer ({getattr(exc, 'reason', None) or exc})"
+            return
+        if not isinstance(data, dict):
+            self.error = "its atc sent something odd"
+            return
+        self.data, self.error, self.ok_at, self.latency = data, None, time.time(), time.time() - start
+
+
 # ---------------------------------------------------------------- the fleet
 
 class Fleet:
@@ -2208,6 +2231,8 @@ class Service:
             return 200, taxi_letters(model)
         if path == "/api/taxi/quota":
             return 200, taxi_quota(self.quota)
+        if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
+            return 200, {key: model.get(key) for key in ("machine", "counts", "groups", "agents")}
         return 404, {"detail": "not found"}
 
     def post(self, path, body):
@@ -2574,8 +2599,13 @@ def remote_tool(host, name, arguments):
     return not data.get("isError"), str(data.get("text") or "")
 
 
-def on_server(h, name, arguments, summary, call, confirm=True):
+def on_server(ck, h, name, arguments, summary, call, confirm=True):
     """A lever aimed at a server: asked about here, then run there with the session's id."""
+    view = next((x for x in ck.model().get("hosts", []) if x["host"] == h), None)
+    if view is not None and not view["ok"]:
+        seen = f"; last seen {human_age(view['age'])} ago" if view.get("age") is not None else ""
+        raise ToolError(f"{h} isn't answering ({clean(view.get('error') or 'no answer')}){seen}: its sessions can't be "
+                        "steered until it is back")
     return Lever(summary, lambda: remote_tool(h, name, dict(arguments, dry_run=call.dry_run)), confirm)
 
 
@@ -2846,7 +2876,7 @@ def tool_message(ck, a, call):
     live_only(h, v)
     summary = f"type into {session_ref(v, h)} in {short_path(v.get('cwd') or '')}: “{squash(text)[:300]}”"
     if h:
-        return on_server(h, "atc_message", {"session": v["sid"], "text": text}, summary, call)
+        return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call)
 
     def go():
         delivered, detail = deliver(ck.fleet, ck.terminals, v, text, call.dry_run)
@@ -2881,7 +2911,7 @@ def tool_broadcast(ck, a, call):
             raise ToolError(f"no live session in {folder} on {h['host']}")
         summary = (f"type into {len(peers)} session(s) in {folder} on {h['host']} "
                    f"({', '.join(session_ref(v) for v in peers)}): “{squash(text)[:300]}”")
-        return on_server(h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call)
+        return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call)
     folder = os.path.abspath(os.path.expanduser(folder))
     everyone = [v for v in ordered_sessions(model, True) if within(v.get("cwd") or "", folder)
                 and v["kind"] in ("interactive", "herdr")]
@@ -2914,7 +2944,7 @@ def tool_interrupt(ck, a, call):
     verb = "stop the background session" if v.get("kind") == "background" else "interrupt (Esc)"
     summary = f"{verb} {session_ref(v, h)}, {clean(v.get('state'))}: {clean(v.get('doing'))}"
     if h:
-        return on_server(h, "atc_interrupt", {"session": v["sid"]}, summary, call)
+        return on_server(ck, h, "atc_interrupt", {"session": v["sid"]}, summary, call)
     return Lever(summary, lambda: done(interrupt_session(ck.fleet, ck.terminals, ck.claude_cmd, v, call.dry_run),
                                        "interrupt: done", "stopped"))
 
@@ -2958,7 +2988,7 @@ def slash_lever(ck, a, call, tool, command, summary_verb, check=None, after=None
         check(h, v)
     summary = f"{summary_verb} {session_ref(v, h)} in {short_path(v.get('cwd') or '')}: types {command}"
     if h:
-        return on_server(h, tool, dict({k: a[k] for k in ("how", "name") if a.get(k)}, session=v["sid"]), summary, call)
+        return on_server(ck, h, tool, dict({k: a[k] for k in ("how", "name") if a.get(k)}, session=v["sid"]), summary, call)
 
     def go():
         delivered, detail = deliver(ck.fleet, ck.terminals, v, command, call.dry_run)
@@ -4833,6 +4863,8 @@ def main():
     if args.serve:
         address = args.serve if ":" in args.serve else f"127.0.0.1:{args.serve}"
         token = serve_token(create=True)  # /mcp always needs one, and so does any read off this machine
+        if args.serve_prefer:  # keep the preferred atc's machine on show, as last seen once it sleeps
+            remotes.append(RemoteAtc(args.serve_prefer, token))
         service = Service(fleet, quota, remotes, Terminals(args.dry_run), writes=args.serve_writes, token=token,
                           claude_cmd=claude_cmd, route_cmd=route_cmd, prefer=args.serve_prefer)
         server = make_server(service, address)
