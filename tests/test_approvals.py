@@ -23,13 +23,10 @@ class ApprovalCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="atc-approvals-")
         self.addCleanup(self.tmp.cleanup)
         env = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "ATC_PEER_TOKEN": "",
-                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": ""})
+                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": "", "ATC_APPROVAL_WAIT": "0"})
         env.start()
         self.addCleanup(env.stop)
         self.m = load_atc({})
-        self.wait = mock.patch.object(self.m, "APPROVAL_WAIT", 0)
-        self.wait.start()
-        self.addCleanup(self.wait.stop)
         self.store = self.m.Approvals()
         self.args = {"session": "beta-22", "text": "the private message"}
         self.ctx = {"modern": True, "caps": {}, "client": {"name": "test-client"}, "version": "2026-07-28"}
@@ -53,8 +50,9 @@ class ApprovalCase(unittest.TestCase):
             dict(name=name, arguments=self.args if args is None else args, **extra), ctx or self.ctx, caller)
 
     def pending(self, store=None):
-        return (store or self.store).create("atc_message", self.args, "Type the private message into beta",
-                                            "alpha-11", "test-client")
+        lever = self.m.tool_message(self.service.cockpit, self.args, self.m.Call("alpha-11", transport="http"))
+        return (store or self.store).create("atc_message", self.args, lever.summary,
+                                            "alpha-11", "test-client", lever.target)
 
     def refresh_needs(self, service=None):
         service = service or self.service
@@ -99,7 +97,7 @@ class StoreAndMCP(ApprovalCase):
             row = original(*args)
             ready.set()
             return row
-        with mock.patch.object(self.m, "APPROVAL_WAIT", 2), mock.patch.object(self.m, "APPROVAL_POLL", 0.01):
+        with mock.patch.dict(os.environ, {"ATC_APPROVAL_WAIT": "2"}), mock.patch.object(self.m, "APPROVAL_POLL", 0.01):
             with mock.patch.object(self.store, "create", side_effect=create):
                 with mock.patch.object(self.m, "deliver", return_value=(True, "sent")) as deliver:
                     with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -136,11 +134,11 @@ class StoreAndMCP(ApprovalCase):
 m = runpy.run_path(sys.argv[1])
 try:
     m['Approvals'](sys.argv[2]).consume(sys.argv[3], 'atc_message',
-        {'session': 'beta-22', 'text': 'the private message'}, 'alpha-11')
+        {'session': 'beta-22', 'text': 'the private message'}, 'alpha-11', sys.argv[4])
 except m['WebError']:
     sys.exit(1)
 """
-        procs = [subprocess.Popen([sys.executable, "-c", script, fixture.ATC, self.store.directory, row["id"]],
+        procs = [subprocess.Popen([sys.executable, "-c", script, fixture.ATC, self.store.directory, row["id"], row["summary"]],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(4)]
         for proc in procs:
             out, err = proc.communicate(timeout=10)
@@ -179,6 +177,106 @@ except m['WebError']:
                 self.assertEqual(self.store.get(row["id"])["state"], "approved")
             deliver.assert_not_called()
             interrupt.assert_not_called()
+
+    def test_new_task_approval_cannot_switch_default_folder_between_transports(self):
+        project = os.path.join(self.tmp.name, "project")
+        os.mkdir(project)
+        args = {"task": "write tests", "pool": "claude"}
+        stdio = self.m.McpServer(self.service.cockpit, "stdio")
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": project}):
+            self.call(args, server=stdio, name="atc_new_task")
+            row = self.store.access()[0]
+            self.store.decide(row["id"], "approve", "owner", "terminal")
+            with mock.patch.object(self.m, "open_tab", return_value="opened") as opened:
+                refused = self.call(dict(args, approval=row["id"]), name="atc_new_task")
+
+                self.assertTrue(refused["isError"])
+                self.assertIn("new approval", self.text(refused))
+                self.assertIn("without approval", self.text(refused))
+                self.assertEqual(self.store.get(row["id"])["state"], "approved")
+                opened.assert_not_called()
+                # The original resolved context can still use the matching grant, once.
+                accepted = self.call(dict(args, approval=row["id"]), server=stdio, name="atc_new_task")
+                self.assertFalse(accepted["isError"], accepted)
+                self.assertEqual(opened.call_args[0][0], project)
+                self.assertEqual(self.store.get(row["id"])["state"], "used")
+                self.assertTrue(self.call(dict(args, approval=row["id"]), server=stdio, name="atc_new_task")["isError"])
+                opened.assert_called_once()
+
+    def test_same_arguments_cannot_retarget_a_named_session_or_changed_folder(self):
+        args = dict(self.args, session="beta")
+        original = dict(self.service.model["groups"]["waiting"][0])
+        for change in ({"cwd": "/workspace/different"}, {"sid": "another-session"}):
+            with self.subTest(change=change):
+                self.service.model["groups"]["waiting"][0] = dict(original)
+                self.call(args)
+                row = self.store.access()[-1]
+                self.store.decide(row["id"], "approve", "owner", "terminal")
+                self.service.model["groups"]["waiting"][0].update(change)
+                with mock.patch.object(self.m, "deliver") as deliver:
+                    result = self.call(dict(args, approval=row["id"]))
+
+                    self.assertTrue(result["isError"])
+                    self.assertIn("resolved action", self.text(result))
+                    self.assertIn("new approval", self.text(result))
+                    deliver.assert_not_called()
+                self.assertEqual(self.store.get(row["id"])["state"], "approved")
+
+    def test_waiter_rebuilds_and_refuses_a_changed_default_folder(self):
+        project, other = (os.path.join(self.tmp.name, name) for name in ("project", "other"))
+        for folder in (project, other):
+            os.mkdir(folder)
+        server = self.m.McpServer(self.service.cockpit, "stdio")
+        args = {"task": "write tests", "pool": "claude"}
+        def approve_in_changed_context(row, _args):
+            os.environ["CLAUDE_PROJECT_DIR"] = other
+            self.store.decide(row["id"], "approve", "owner", "terminal")
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": project}):
+            with mock.patch.object(self.m, "notify_approval", side_effect=approve_in_changed_context):
+                with mock.patch.object(self.m, "open_tab") as opened:
+                    result = self.call(args, server=server, name="atc_new_task")
+
+                    self.assertTrue(result["isError"])
+                    self.assertIn("new approval", self.text(result))
+                    opened.assert_not_called()
+        self.assertEqual(self.store.access()[0]["state"], "approved")
+
+    def test_waiter_executes_the_rebuilt_lever_when_summary_still_matches(self):
+        original = self.service.model["groups"]["waiting"][0]
+        current = dict(original)
+        def approve(row, _args):
+            self.service.model["groups"]["waiting"][0] = current
+            self.store.decide(row["id"], "approve", "owner", "terminal")
+        with mock.patch.object(self.m, "notify_approval", side_effect=approve):
+            with mock.patch.object(self.m, "deliver", return_value=(True, "sent")) as deliver:
+                result = self.call()
+
+                self.assertFalse(result["isError"])
+                deliver.assert_called_once()
+                self.assertIs(deliver.call_args[0][2], current)
+                self.assertIsNot(deliver.call_args[0][2], original)
+        self.assertEqual(self.store.access()[0]["state"], "used")
+
+    def test_approval_wait_defaults_validates_and_honours_zero_and_fractional_seconds(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ATC_APPROVAL_WAIT", None)
+            self.assertEqual(self.m.approval_wait(), 45)
+        for value in ("-1", "nan", "inf", "-inf", "", "invalid"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"ATC_APPROVAL_WAIT": value}):
+                result = self.call()
+                self.assertTrue(result["isError"])
+                self.assertIn("ATC_APPROVAL_WAIT", self.text(result))
+                self.assertEqual(self.store.access(), [])
+        with mock.patch.object(self.m.time, "sleep", side_effect=AssertionError("zero must not sleep")):
+            self.assertFalse(self.call()["isError"])
+        with mock.patch.dict(os.environ, {"ATC_APPROVAL_WAIT": "0.03"}):
+            start = time.monotonic()
+            result = self.call()
+            elapsed = time.monotonic() - start
+        self.assertFalse(result["isError"])
+        self.assertGreaterEqual(elapsed, 0.03)
+        self.assertLess(elapsed, 2)
+        self.assertEqual(len(self.store.access()), 2)
 
     def test_failed_lever_still_spends_grant(self):
         row = self.pending()
@@ -353,6 +451,72 @@ except m['WebError']:
         app.handle("y", model)
         self.assertEqual(self.store.get(row["id"])["state"], "pending")
         self.assertIn("dry run", app.flash[0])
+
+    def test_approval_detail_is_wrapped_scrollable_and_confirms_the_target_first(self):
+        self.args["text"] = "An extended message that pushes the target beyond the first screen row. " * 8
+        row = self.pending()
+        model = self.service.fleet.model(time.time())
+        model["machine"] = "laptop"
+        app = self.m.App(self.service.fleet, None, None, None, ["claude"], False)
+        app.ui["selected"] = "approval::" + row["id"]
+        item = self.m.resolve(self.service.fleet, model, app.ui["selected"])
+        self.assertEqual(self.m.selection_name(item), "Approval " + row["id"])
+        lines = self.m.selection_lines(self.service.fleet, model, item, 0, 60)
+        action = " ".join(self.m.plain(line) for line in lines if line[0][1] == "plain")
+        self.assertEqual(action, "Action: " + self.m.clean(row["summary"]))
+        self.assertTrue(all(len(self.m.plain(line)) <= 60 for line in lines))
+
+        for key in ("\n", "f"):
+            app.handle(key, model)
+            self.assertEqual(app.ui["view"], "detail")
+            frames = []
+            while True:
+                before = app.ui["view_scroll"]
+                frame = self.m.render_view(self.service.fleet, model, app.ui, 60, 12)
+                frames.extend(self.m.plain(line) for line in frame)
+                if before > app.ui["view_scroll"]:
+                    break  # reached the last page; render_view clamps scroll
+                app.handle(self.m.curses.KEY_NPAGE, model)
+            visible = "\n".join(frames)
+            for label in ("Tool: atc_message", "Machine: laptop", "Caller: alpha-11", "Client: test-client",
+                          "Expires:", "Target: beta", "y y approves", "/workspace/example"):
+                self.assertIn(label, visible)
+            self.assertGreater(app.ui["view_scroll"], 0)
+            app.handle(self.m.curses.KEY_PPAGE, model)
+            self.assertEqual(app.ui["view_scroll"], 0)
+            app.handle(self.m.curses.KEY_DOWN, model)
+            self.assertEqual(app.ui["view_scroll"], 1)
+            app.handle(self.m.curses.KEY_UP, model)
+            self.assertEqual(app.ui["view_scroll"], 0)
+            app.handle("\x1b", model)
+            self.assertIsNone(app.ui["view"])
+        app.handle("f", model)
+        app.handle("y", model)
+        footer = self.m.plain(self.m.fit(app.footer(time.time()), 80))
+        self.assertIn("approve beta", footer)
+        self.assertNotIn("extended message", footer)
+        self.assertEqual(self.store.get(row["id"])["state"], "pending")
+        app.handle("y", model)
+        deadline = time.monotonic() + 2
+        while self.store.get(row["id"])["state"] == "pending" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.get(row["id"])["state"], "approved")
+
+    def test_approval_detail_denial_still_needs_two_presses(self):
+        row = self.pending()
+        model = self.service.fleet.model(time.time())
+        app = self.m.App(self.service.fleet, None, None, None, ["claude"], False)
+        app.ui["selected"] = "approval::" + row["id"]
+        app.handle("f", model)
+        app.handle("n", model)
+        self.assertIn("deny beta", app.flash[0])
+        self.assertEqual(self.store.get(row["id"])["state"], "pending")
+        app.handle("n", model)
+        deadline = time.monotonic() + 2
+        while self.store.get(row["id"])["state"] == "pending" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.store.get(row["id"])["state"], "denied")
+        self.assertEqual(app.mode, "normal")
 
     def test_needs_fleet_json_and_remote_metadata(self):
         row = self.pending()
@@ -547,7 +711,7 @@ class WebApprovals(ApprovalCase, HTTP):
     def test_http_waiter_runs_after_web_passkey_without_recall(self):
         headers = {"Authorization": "Bearer " + TOKEN, "Origin": None, "X-Atc-Caller": "alpha-11"}
         body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "atc_message", "arguments": self.args}}
-        with mock.patch.object(self.m, "APPROVAL_WAIT", 3), mock.patch.object(self.m, "APPROVAL_POLL", 0.01):
+        with mock.patch.dict(os.environ, {"ATC_APPROVAL_WAIT": "3"}), mock.patch.object(self.m, "APPROVAL_POLL", 0.01):
             with mock.patch.object(self.m, "deliver", return_value=(True, "sent")) as deliver:
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     waiting = pool.submit(self.request, "/mcp", body, headers=headers)

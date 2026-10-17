@@ -538,7 +538,12 @@ class Http(unittest.TestCase):
         self.assertEqual((status, len(tools["result"]["tools"])), (200, 18))
         status, lever = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {
             "session": "beta-22", "text": "legacy http"}}, False))
-        self.assertTrue(lever["result"]["isError"])
+        self.assertEqual(status, 200)
+        self.assertFalse(lever["result"]["isError"])
+        row = self.m.Approvals().access()[-1]
+        self.assertEqual((row["tool"], row["state"]), ("atc_message", "pending"))
+        self.assertIn("Waiting for approval " + row["id"], text(lever["result"]))
+        self.assertNotIn("legacy http", FX.pane("beta-22"))
 
     def test_levers_need_serve_writes(self):
         names = [t["name"] for t in self.post(self.rpc("tools/list"), url=self.read_url)[1]["result"]["tools"]]

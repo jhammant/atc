@@ -199,20 +199,25 @@ written `name@host`.
 
 When a steering call cannot ask you in-session (no MCP elicitation, a handshake-era HTTP client, or an
 unattended session), atc creates an approval on the machine handling the call. It waits up to 45 seconds:
-your approval runs the lever once, and denial refuses it. If you have not decided yet, the tool returns a
-non-error **Waiting for approval** result with an ID and expiry. The approval lasts ten minutes from creation.
+your approval runs the lever once, and denial refuses it. Set `ATC_APPROVAL_WAIT` to a finite, non-negative
+number of seconds to change the wait (default `45`; `0` returns immediately with the pending approval).
+If you have not decided yet, the tool returns a non-error **Waiting for approval** result with an ID and expiry.
+The approval lasts ten minutes from creation.
 After approving, retry the same tool with exactly the same arguments and caller, adding `approval: "<id>"`.
-Every lever documents this argument. A retry with a changed tool, arguments or caller, or a pending, denied,
-expired or already-used approval, is refused. Calls that can ask you in-session keep their existing prompts.
-Dry runs and refusals before a lever is ready do not create approvals.
+Every lever documents this argument. Before using a grant, atc rebuilds the lever and checks its resolved
+summary against the action the owner saw, as well as its tool, arguments and caller. A changed target or folder
+(including a different default folder on another transport) requires a new approval: call again without the
+`approval` argument. Pending, denied, expired or already-used grants are refused. Calls that can ask you
+in-session keep their existing prompts. Dry runs and refusals before a lever is ready do not create approvals.
 
 Grant or deny an approval in any of these places:
 
 - **Web UI, on a phone or laptop:** Needs you shows each approval's summary, caller, machine and expiry.
   **Approve with passkey** needs a fresh passkey assertion with user verification; signing in alone is
   insufficient. **Deny** needs your signed-in session.
-- **atc screen on the owning machine:** approvals appear first. Select one and press `y y` to approve or
-  `n n` to deny, using the usual two-press confirmation.
+- **atc screen on the owning machine:** approvals appear first. Press Enter or `f` on one to read its entire
+  summary, caller, target and expiry; arrows and Page Up/Down scroll the wrapped detail. Press `y y` to approve
+  or `n n` to deny, on the row or in the detail view. The first press names the target.
 - **A terminal on the owning machine:** `atc approvals` lists pending and approved grants;
   `atc approve <id>` and `atc deny <id>` decide pending ones. Both decisions require stdin to be a TTY.
 

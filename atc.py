@@ -1529,7 +1529,7 @@ def needs_queue(groups, hosts, items=()):
                                    since=item.get("since"), hint=item.get("hint", "")))
             if item["kind"] == "approval":
                 needs[-1].update({key: item.get(key) for key in
-                                  ("id", "tool", "args_digest", "summary", "caller", "client", "expires")})
+                                  ("id", "tool", "args_digest", "summary", "target", "caller", "client", "expires")})
     for item in needs:
         h = next((h for h in hosts if h["host"] == item["host"]), None)
         if h and not h["ok"]:
@@ -2443,6 +2443,16 @@ APPROVAL_WAIT = 45.0
 APPROVAL_POLL = 0.25
 
 
+def approval_wait():
+    try:
+        seconds = float(os.environ.get("ATC_APPROVAL_WAIT", str(APPROVAL_WAIT)))
+    except ValueError:
+        raise WebError("ATC_APPROVAL_WAIT must be a finite, non-negative number of seconds") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise WebError("ATC_APPROVAL_WAIT must be a finite, non-negative number of seconds")
+    return seconds
+
+
 class Approvals:
     """A machine's single-use grants. Every read/transition locks across threads and processes."""
 
@@ -2470,10 +2480,10 @@ class Approvals:
                 private_write(self.path, rows)
             return result
 
-    def create(self, tool, args, summary, caller, client):
+    def create(self, tool, args, summary, caller, client, target=None):
         now = time.time()
         row = {"id": secrets.token_urlsafe(12), "tool": tool, "args_digest": args_digest(tool, args),
-               "summary": summary, "caller": caller, "client": client, "created": now,
+               "summary": summary, "target": target or summary, "caller": caller, "client": client, "created": now,
                "expires": now + APPROVAL_TTL, "state": "pending", "decided_at": None,
                "decided_by": None, "via": None}
         self.access(lambda rows: rows.append(row))
@@ -2506,13 +2516,16 @@ class Approvals:
         audit(dict(row, transport="approval", outcome=row["state"]))
         return row
 
-    def consume(self, ident, tool, args, caller):
+    def consume(self, ident, tool, args, caller, summary):
         def change(rows):
             row = self.find(rows, ident)
             if row["tool"] != tool or row["args_digest"] != args_digest(tool, args) or row["caller"] != caller:
                 raise WebError("Approval does not match this tool, arguments and caller", 403)
             if row["state"] != "approved":
                 raise WebError("Approval is " + row["state"], 409)
+            if row["summary"] != summary:
+                raise WebError("Approval does not match the resolved action. Call again without approval "
+                               "to request a new approval.", 403)
             row["state"] = "used"  # claim before running, even if the lever subsequently fails
             return dict(row)
         row = self.access(change)
@@ -2528,6 +2541,7 @@ class Approvals:
             item = need_item("approval", "Approval " + row["id"], row["summary"],
                              hint="Approve with a passkey, y y on its atc screen, or atc approve " + row["id"])
             item.update({key: row[key] for key in ("id", "tool", "args_digest", "summary", "caller", "client", "expires")})
+            item["target"] = row.get("target") or row["summary"]
             items.append(item)
         return items
 
@@ -3422,8 +3436,9 @@ class Lever:
     """A lever ready to pull: what it will do, in words (the question you are asked), and the call that does it,
     returning (ok, what happened). Refusals happen before a Lever exists, so you are never asked about them."""
 
-    def __init__(self, summary, run, confirm=True):
+    def __init__(self, summary, run, confirm=True, target=None):
         self.summary, self.run, self.confirm = summary, run, confirm
+        self.target = target or summary
 
 
 class Call:
@@ -3607,7 +3622,7 @@ def remote_tool(host, name, arguments):
     return not data.get("isError"), str(data.get("text") or "")
 
 
-def on_server(ck, h, name, arguments, summary, call, confirm=True):
+def on_server(ck, h, name, arguments, summary, call, confirm=True, target=None):
     """A lever aimed at a server: asked about here, then run there with the session's id."""
     view = next((x for x in ck.model().get("hosts", []) if x["host"] == h), None)
     if view is not None and not view["ok"]:
@@ -3625,13 +3640,13 @@ def on_server(ck, h, name, arguments, summary, call, confirm=True):
             if not ok:
                 raise ToolError(preview)
             summary = f"On {h}: {preview}"
-        return Lever(summary, lambda: remote.tool(name, args, token, call.caller), confirm)
+        return Lever(summary, lambda: remote.tool(name, args, token, call.caller), confirm, target)
     if call.transport == "web" and call.dry_run:
         ok, preview = remote_tool(h, name, args)
         if not ok:
             raise ToolError(preview)
         summary += "\n" + preview
-    return Lever(summary, lambda: remote_tool(h, name, args), confirm)
+    return Lever(summary, lambda: remote_tool(h, name, args), confirm, target)
 
 
 def done(result, *prefixes):
@@ -3918,14 +3933,15 @@ def tool_message(ck, a, call):
     not_self(call, h, v)
     refuse_blocked(h, v)
     live_only(h, v)
-    summary = f"type “{squash(text)[:300]}” into {session_ref(v, h)}, in {short_path(v.get('cwd') or '')}"
+    target = f"{session_ref(v, h)}, in {short_path(v.get('cwd') or '')}"
+    summary = f"type “{squash(text)[:300]}” into {target}"
     if h:
-        return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call)
+        return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call, target=target)
 
     def go():
         delivered, detail = deliver(ck.fleet, ck.terminals, v, text, call.dry_run)
         return delivered, f"{'typed into' if delivered else 'not delivered to'} {session_ref(v)}: {detail}"
-    return Lever(summary, go)
+    return Lever(summary, go, target=target)
 
 
 @mcp_tool("atc_broadcast", "Message a folder", "Type the same message into every live session in a folder (or the "
@@ -3953,9 +3969,9 @@ def tool_broadcast(ck, a, call):
                  and v.get("kind") in ("interactive", "herdr") and v.get("sid") != call.caller]
         if not peers:
             raise ToolError(f"no live session in {folder} on {h['host']}")
-        summary = (f"type “{squash(text)[:300]}” into {len(peers)} session(s) in {folder} on {h['host']}: "
-                   f"{', '.join(session_ref(v) for v in peers)}")
-        return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call)
+        target = f"{len(peers)} session(s) in {folder} on {h['host']}: {', '.join(session_ref(v) for v in peers)}"
+        summary = f"type “{squash(text)[:300]}” into {target}"
+        return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call, target=target)
     folder = os.path.abspath(os.path.expanduser(folder))
     everyone = [v for v in ordered_sessions(model, True) if within(v.get("cwd") or "", folder)
                 and v["kind"] in ("interactive", "herdr")]
@@ -3963,8 +3979,9 @@ def tool_broadcast(ck, a, call):
     if not targets:
         raise ToolError(f"no live session in {short_path(folder)}" + (" besides the calling one" if everyone else ""))
     blocked = [v for v in targets if v["group"] == "blocked"]
-    summary = (f"type “{squash(text)[:300]}” into {len(targets) - len(blocked)} session(s) in {short_path(folder)}: "
-               f"{', '.join(session_ref(v) for v in targets if v not in blocked)}"
+    target = (f"{len(targets) - len(blocked)} session(s) in {short_path(folder)}: "
+              f"{', '.join(session_ref(v) for v in targets if v not in blocked)}")
+    summary = (f"type “{squash(text)[:300]}” into {target}"
                + (f"; skipping {', '.join(session_ref(v) for v in blocked)} (blocked on a prompt)" if blocked else ""))
     if len(blocked) == len(targets):
         raise ToolError("every session there is blocked on a prompt: " + ", ".join(session_ref(v) for v in blocked))
@@ -3976,7 +3993,7 @@ def tool_broadcast(ck, a, call):
             (sent if delivered else skipped).append(session_ref(v) + ("" if delivered else f" ({detail})"))
         said = ("dry run: " if call.dry_run else "") + (f"typed into {', '.join(sent)}" if sent else "typed into nobody")
         return bool(sent), said + (f"; skipped {'; '.join(skipped)}" if skipped else "")
-    return Lever(summary, go)
+    return Lever(summary, go, target=target)
 
 
 @mcp_tool("atc_interrupt", "Interrupt a session", "Interrupt a session (Esc, as if the user pressed it; at a prompt, "
@@ -4153,9 +4170,10 @@ def tool_new_task(ck, a, call):
                           f"pool: \"{plan.get('chosen')}\".")
         return Lever(f"plan “{task[:200]}” with route", plan_only, confirm=False)
     command = dispatch_command(ck.route_cmd or ["route"], ck.claude_cmd, {"chosen": pool}, task)
-    summary = f"start “{squash(task)[:300]}” on {pool} in {short_path(folder)}, in a new terminal tab"
+    target = f"{pool} in {short_path(folder)}"
+    summary = f"start “{squash(task)[:300]}” on {target}, in a new terminal tab"
     return Lever(summary, lambda: done(f"{pool}: " + open_tab(folder, command, call.dry_run), f"{pool}: opened",
-                                       f"{pool}: started", f"{pool}: dry run"))
+                                       f"{pool}: started", f"{pool}: dry run"), target=target)
 
 
 @mcp_tool("atc_jump", "Jump to a session", "Bring a session's terminal tab to the front (a background session opens "
@@ -4321,15 +4339,17 @@ class McpServer:
             return text_result(lever.summary)
         if has_approval:
             try:
-                self.cockpit.approvals.consume(approval, name, args, caller)
+                self.cockpit.approvals.consume(approval, name, args, caller, lever.summary)
             except (WebError, OSError, ValueError) as exc:
                 self.record(name, args, ctx, caller, "not confirmed", str(exc))
                 return text_result(str(exc), True)
         elif lever.confirm and not call.dry_run and self.policy == "confirm":
             try:
                 answer = self.confirmation(name, args, ctx, caller, lever, params)
-            except (WebError, OSError, ValueError) as exc:
+            except (WebError, OSError, ValueError, ToolError) as exc:
                 answer = "Approval unavailable: " + str(exc)
+            if isinstance(answer, Lever):
+                lever, answer = answer, True
             if isinstance(answer, dict):
                 outcome = "asked" if answer.get("resultType") == "input_required" else "waiting"
                 self.record(name, args, ctx, caller, outcome, lever.summary)
@@ -4345,7 +4365,7 @@ class McpServer:
         return text_result(self.cockpit.notice() + text, not ok)
 
     def confirmation(self, name, args, ctx, caller, lever, params):
-        """True when you said yes to this very call; an input_required result that asks you; or why it can't run."""
+        """Yes (or a rebuilt approved Lever), a question/waiting result, or why the call cannot run."""
         asks = ctx["caps"].get("elicitation")
         if (not self.attended or not isinstance(asks, dict) or (asks and "form" not in asks)
                 or (not ctx["modern"] and self.ask is None)):
@@ -4367,14 +4387,16 @@ class McpServer:
 
     def pending_approval(self, name, args, ctx, caller, lever):
         store = self.cockpit.approvals
-        row = store.create(name, args, lever.summary, caller, (ctx.get("client") or {}).get("name"))
-        deadline = time.monotonic() + APPROVAL_WAIT
+        deadline = time.monotonic() + approval_wait()
+        row = store.create(name, args, lever.summary, caller, (ctx.get("client") or {}).get("name"), lever.target)
         notify_approval(row, args)
         while True:
             row = store.get(row["id"])
             if row["state"] == "approved":
-                store.consume(row["id"], name, args, caller)
-                return True
+                call = Call(caller, bool(args.get("dry_run")), bool(args.get("allow_self")), self.transport)
+                current = TOOLS[name]["fn"](self.cockpit, args, call)
+                store.consume(row["id"], name, args, caller, current.summary)
+                return current
             if row["state"] != "pending":
                 return "Approval " + row["id"] + " is " + row["state"] + "; nothing was done."
             if time.monotonic() >= deadline:
@@ -4917,6 +4939,8 @@ def resolve(fleet, model, key):
 
 def selection_name(item):
     kind = item[0]
+    if kind == "approval":
+        return "Approval " + item[1]["id"]
     if kind == "swarm":
         return item[1]["name"] + ("/" + item[2]["id"] if item[2] else "")
     if kind == "session":
@@ -4935,6 +4959,19 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind == "approval":
+        row = item[1]
+        until = time.strftime("%H:%M:%S", time.localtime(row["expires"]))
+        details = [("Tool: " + row["tool"], "head"),
+                   ("Machine: " + (row["host"] or model["machine"]), "dim"),
+                   ("Caller: " + (row["caller"] or "unknown"), "dim"),
+                   ("Client: " + (row["client"] or "unknown"), "dim"),
+                   ("Expires: " + until, "warn"),
+                   ("Target: " + (row.get("target") or row["summary"]), "head"),
+                   ("Action: " + row["summary"], "plain"),
+                   ("y y approves · n n denies · esc closes", "warn")]
+        lines = [[(line, style)] for text, style in details for line in wrap(text, width)]
+        return lines[:limit] if limit else lines
     if kind == "swarm":
         return swarm_detail_lines(item[1], item[2], limit, width)
     if kind == "session":
@@ -5302,6 +5339,8 @@ HELP = [
     "           an agent process (here or on a server): SIGTERM, over ssh for a server",
     "enter      on a subagent, a process or a server row: open it (its task, steps, report, command)",
     "           on a route swarm or unit: read its units, logs, branches and worktree paths",
+    "enter / f  on an approval: read its whole action and target; arrows/PgUp/PgDn scroll",
+    "y y / n n  approve / deny the selected approval, on its row or in its detail view",
     "C C / F F  type /closecode or /forkcode into the selected session (wrap it up, or split work off)",
     "           Steering never types into a session that is blocked on a prompt: that would answer it.",
     "R R        restore a closed session: opens `claude --resume <id>` in a new tab",
@@ -5540,6 +5579,11 @@ class App:
             return self.edit(key, self.submit_rename)
         if self.mode == "plan":
             return self.handle_plan_key(key)
+        if key in ("y", "n") and self.ui["view"] in (None, "detail"):
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] == "approval":
+                self.confirm_approval(key, item[1])
+                return True
         if self.ui["view"]:
             return self.handle_view_key(key)
         if key in ("q", "Q"):
@@ -5562,7 +5606,7 @@ class App:
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] in ("helper", "process", "closed", "swarm"):
+            if item[0] in ("helper", "process", "closed", "swarm", "approval"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.open_remote(item[1], item[2])
@@ -5579,14 +5623,6 @@ class App:
             self.say(self.quota.step(-1))
         elif key == "0":
             self.say(self.quota.clear())
-        elif key in ("y", "n") and resolve(self.fleet, model, self.ui["selected"])[0] == "approval":
-            item = resolve(self.fleet, model, self.ui["selected"])[1]
-            decision = "approve" if key == "y" else "deny"
-            if self.confirm(key + ":" + item["id"], decision + " " + item["summary"]):
-                if self.dry_run:
-                    self.say("dry run: " + decision + " " + item["id"])
-                else:
-                    threading.Thread(target=self.decide_approval, args=(item["id"], decision), daemon=True).start()
         elif key == "n":
             self.task = {"cwd": v["cwd"] if v else os.getcwd(), "text": "", "plan": None, "error": None}
             self.buffer, self.mode = "", "task"
@@ -5626,6 +5662,15 @@ class App:
         elif key == "N":
             self.start_rename(v)
         return True
+
+    def confirm_approval(self, key, item):
+        decision = "approve" if key == "y" else "deny"
+        target = item.get("target") or item["summary"]
+        if self.confirm(key + ":" + item["id"], decision + " " + target):
+            if self.dry_run:
+                self.say("dry run: " + decision + " " + item["id"])
+            else:
+                threading.Thread(target=self.decide_approval, args=(item["id"], decision), daemon=True).start()
 
     def decide_approval(self, ident, decision):
         try:
