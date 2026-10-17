@@ -196,7 +196,7 @@ class Wide(unittest.TestCase):
         s = self.s
         s.press("c")
         s.wait_for("Comms: all sessions")
-        self.assertIn("alpha-11 → beta-22", s.text())
+        self.assertIn("✉@ alpha-11 → beta-22", s.text())
         first = s.text()
         s.press("Down")
         self.assertNotEqual(s.text(), first)  # another message picked, another body shown
@@ -211,7 +211,7 @@ class Wide(unittest.TestCase):
         s.wait_for("Hierarchy: all sessions")
         text = s.text()
         for needle in ("workflow release-train", "phase Build", "phase Verify", "Write the tests", "Lint fixer",
-                       "talks with beta-22 ×1"):
+                       "talks with beta-22 ×2"):
             self.assertIn(needle, text)
         s.press("PageDown", "PageUp")
         s.press("Escape")
