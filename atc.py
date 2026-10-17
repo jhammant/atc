@@ -33,6 +33,7 @@ import secrets
 import glob
 import json
 import locale
+import math
 import os
 import re
 import select
@@ -71,6 +72,7 @@ FLASH_SECONDS = 8.0
 CONFIRM_SECONDS = 3.0
 LOCATE_CACHE_SECONDS = 30.0
 ACTIVITY_KEEP = 1000
+SWARM_MESSAGES_KEEP = 200
 CAP_LEVELS = ["critical", "constrained", "comfortable", "abundant"]
 CAP_SIZE = {"critical": 1, "constrained": 2, "comfortable": 4, "abundant": 8}
 SESSION_COLORS = ["c0", "c1", "c2", "c3", "c4"]
@@ -326,6 +328,168 @@ class Tail:
             if isinstance(rec, dict):
                 out.append(rec)
         return out, restarted
+
+
+def route_state_dir():
+    return os.path.expanduser(os.environ.get("ROUTE_STATE_DIR") or
+                              os.path.join(os.environ.get("XDG_STATE_HOME") or "~/.local/state", "route"))
+
+
+def valid_swarm_status(data):
+    """Validate the fields we consume; newer producers may add fields without breaking the reader."""
+    def timestamp(value):
+        return value is None or (isinstance(value, str) and parse_ts(value) is not None)
+
+    def pid(value):
+        return value is None or (type(value) is int and value > 0)
+
+    if not isinstance(data, dict) or data.get("schema") != "route-swarm-status/1":
+        return False
+    if any(not isinstance(data.get(k), str) or not data[k] for k in ("swarm_id", "name")):
+        return False
+    if data.get("state") not in ("running", "done", "failed", "interrupted"):
+        return False
+    if not data.get("started_at") or not timestamp(data["started_at"]) or not pid(data.get("route_pid")):
+        return False
+    if not timestamp(data.get("finished_at")) or not timestamp(data.get("updated_at")):
+        return False
+    if data["state"] != "running" and not data.get("finished_at"):
+        return False
+    if data.get("exit_code") is not None and type(data["exit_code"]) is not int:
+        return False
+    if data.get("repo") is not None and not isinstance(data["repo"], str):
+        return False
+    if data.get("owner_socket") is not None and not isinstance(data["owner_socket"], str):
+        return False
+    channel, held, units = data.get("channel", {}), data.get("held", []), data.get("units")
+    if not isinstance(channel, dict) or type(channel.get("messages", 0)) is not int or channel.get("messages", 0) < 0:
+        return False
+    if not isinstance(held, list) or any(not isinstance(h, dict) or
+                                       any(not isinstance(h.get(k), str) for k in ("id", "reason")) for h in held):
+        return False
+    if not isinstance(units, list):
+        return False
+    seen = set()
+    for unit in units:
+        if not isinstance(unit, dict) or any(not isinstance(unit.get(k), str) or not unit[k] for k in ("id", "arm")):
+            return False
+        if unit["id"] in seen or unit.get("state") not in ("queued", "running", "checking", "accepted", "failed"):
+            return False
+        seen.add(unit["id"])
+        if not pid(unit.get("pid")) or any(not timestamp(unit.get(k)) for k in ("started_at", "finished_at")):
+            return False
+        if any(unit.get(k) is not None and not isinstance(unit[k], str) for k in ("address", "branch", "worktree", "log")):
+            return False
+        wall = unit.get("wall_clock_s")
+        if wall is not None and (type(wall) not in (int, float) or not math.isfinite(wall) or wall < 0):
+            return False
+    return True
+
+
+class Swarms:
+    """Read route's atomic status snapshots and incrementally tail each swarm's a-mail channel."""
+
+    def __init__(self):
+        self.root = os.path.join(route_state_dir(), "swarms")
+        try:
+            hours = float(os.environ.get("ATC_SWARM_HOURS", "6"))
+            self.window = hours * 3600 if math.isfinite(hours) and hours >= 0 else 6 * 3600
+        except ValueError:
+            self.window = 6 * 3600
+        self.files = {}  # status path -> cached snapshot, Tail and the last 200 channel messages
+        self.entries = []
+        self.unreadable = 0
+
+    def refresh(self, now, only=None):
+        paths = set(glob.glob(os.path.join(self.root, "*", "status.json")))
+        self.files = {path: entry for path, entry in self.files.items() if path in paths}
+        self.entries, self.unreadable = [], 0
+        for path in sorted(paths):
+            entry = self.files.setdefault(path, {"mtime": None, "status": None, "tail": None, "messages": [], "seen": 0})
+            try:
+                mtime = os.stat(path).st_mtime_ns
+                if mtime != entry["mtime"]:
+                    entry["mtime"], entry["status"] = mtime, None
+                    with open(path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    if valid_swarm_status(data):
+                        entry["status"] = data
+            except (OSError, ValueError, OverflowError):
+                entry["status"] = None
+            data = entry["status"]
+            if data is None:
+                self.unreadable += 1
+                continue
+            if data["state"] != "running" and now - parse_ts(data["finished_at"]) > self.window:
+                entry["tail"], entry["messages"], entry["seen"] = None, [], 0
+                continue
+            if only and not within(data.get("repo") or "", only):
+                continue
+            if entry["tail"] is None:
+                entry["tail"] = Tail(os.path.join(os.path.dirname(path), "channel.jsonl"), BACKLOG_BYTES)
+            records, restarted = entry["tail"].read_new()
+            if restarted:
+                entry["messages"], entry["seen"] = [], 0
+            for rec in records:
+                if not isinstance(rec.get("text"), str) or not isinstance(rec.get("from"), str):
+                    continue
+                if rec.get("from_unit") is not None and not isinstance(rec["from_unit"], str):
+                    continue
+                if rec.get("at") is not None and (not isinstance(rec["at"], str) or parse_ts(rec["at"]) is None):
+                    continue
+                entry["messages"].append(rec)
+                entry["seen"] += 1
+            del entry["messages"][:-SWARM_MESSAGES_KEEP]
+            self.entries.append(entry)
+
+
+def swarm_sender(message):
+    return message.get("from_unit") or "?" + message["from"].split("@", 1)[0]
+
+
+def route_process(proc):
+    """A reused PID is live only if it still belongs to Python running route/auto."""
+    tokens = (proc or {}).get("command", "").split()
+    return bool(tokens and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", os.path.basename(tokens[0]).lower()) and
+                any("route" in token or "auto" in token for token in tokens[1:]))
+
+
+def swarm_owner(pid, table, sessions, socket=None, addresses=None):
+    """The launching session: by its recorded messaging socket, else by walking route's parent chain."""
+    if socket and addresses and addresses.get("uds:" + socket):
+        return addresses["uds:" + socket]
+    by_pid = {s.pid: s.name for s in sessions.values() if s.pid}
+    seen = set()
+    while pid and pid not in seen:
+        if pid in by_pid:
+            return by_pid[pid]
+        seen.add(pid)
+        pid = table.get(pid, {}).get("ppid")
+    return None
+
+
+def swarm_view(entry, now, table, sessions, addresses=None):
+    data = entry["status"]
+    stale = data["state"] == "running" and not route_process(table.get(data.get("route_pid")))
+    started, finished = parse_ts(data["started_at"]), parse_ts(data.get("finished_at"))
+    units = []
+    for unit in data["units"]:
+        state, pid = unit["state"], unit.get("pid")
+        if state == "running" and pid not in table:
+            state = "stopped?"
+        start, finish = parse_ts(unit.get("started_at")), parse_ts(unit.get("finished_at"))
+        units.append({"id": unit["id"], "arm": unit["arm"], "state": state, "pid": pid,
+                      "age": max(0, (finish or now) - start) if start is not None else None,
+                      "wall": unit.get("wall_clock_s"), "address": unit.get("address"),
+                      "branch": unit.get("branch"), "log": unit.get("log"), "worktree": unit.get("worktree")})
+    last = entry["messages"][-1] if entry["messages"] else None
+    return {"id": data["swarm_id"], "name": data["name"], "state": "stopped?" if stale else data["state"],
+            "stale": stale, "owner": swarm_owner(data.get("route_pid"), table, sessions,
+                                                        data.get("owner_socket"), addresses),
+            "age": max(0, (finished or now) - started), "started": started, "finished": finished,
+            "exit_code": data.get("exit_code"), "messages": max(data.get("channel", {}).get("messages", 0), entry["seen"]),
+            "last_message": {"from": swarm_sender(last), "text": last["text"], "at": parse_ts(last.get("at"))} if last else None,
+            "units": units, "held": data.get("held", [])}
 
 
 class Agent:
@@ -902,15 +1066,22 @@ class Procs:
         return self.snapshot or self.fetch()  # only the very first refresh waits for ps
 
 
-def worker_processes(pid, table, children):
+def worker_processes(pid, table, children, swarm_pids=None):
     """Agent CLIs (codex, kimi, claude -p ...) running under a session, skipping its MCP servers."""
-    found, stack = [], list(children.get(pid, []))
+    found, stack, seen = [], list(children.get(pid, [])), {pid}
+    swarm_pids = swarm_pids or {}
     while stack:
         child = stack.pop()
+        if child in seen:
+            continue
+        seen.add(child)
         proc = table.get(child)
         if not proc:
             continue
         command = proc["command"]
+        if child in swarm_pids:
+            found.append({"pid": child, "etime": proc["etime"], "command": command, **swarm_pids[child]})
+            continue  # the swarm unit represents its whole worker subtree
         if "mcp" in command.lower():
             continue
         tokens = command.split()
@@ -921,28 +1092,29 @@ def worker_processes(pid, table, children):
     return found
 
 
-def loose_agents(table, session_pids):
+def loose_agents(table, session_pids, swarm_pids=None):
     """Agent CLIs running outside every session: route dispatches, codex or kimi in their own tab, claude -p."""
     out = []
+    owned_pids = session_pids | set(swarm_pids or {})
     for pid, proc in table.items():
         command = proc["command"]
         tokens = command.split()
         names = {os.path.basename(t) for t in tokens[:2]}
-        if not names & WORKER_NAMES or "mcp" in command.lower() or pid in session_pids:
+        if not names & WORKER_NAMES or "mcp" in command.lower() or pid in owned_pids:
             continue
         if "claude" in names and not ({"-p", "--print"} & set(tokens)):
             continue  # an interactive claude is a session (or about to be one), not a loose agent
         if " agents --json" in command:
             continue  # our own poll
         ancestor, hops = proc["ppid"], 0
-        while ancestor > 1 and ancestor not in session_pids and hops < 50:
+        while ancestor > 1 and ancestor not in owned_pids and hops < 50:
             parent = table.get(ancestor)
             if not parent:
                 break
             if {os.path.basename(t) for t in parent["command"].split()[:2]} & WORKER_NAMES:
                 break  # a child of another agent process: list the top one only
             ancestor, hops = parent["ppid"], hops + 1
-        if ancestor in session_pids or (ancestor > 1 and table.get(ancestor) and
+        if ancestor in owned_pids or (ancestor > 1 and table.get(ancestor) and
                                         {os.path.basename(t) for t in table[ancestor]["command"].split()[:2]} & WORKER_NAMES):
             continue
         tool = sorted(names & WORKER_NAMES)[0]
@@ -1159,13 +1331,15 @@ class Remote:
 # ---------------------------------------------------------------- the fleet
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
         self.proc_watch = procs or Procs(background=False)
         self.repos = repos
         self.closed = closed
+        self.swarms = swarms or Swarms()
+        self.swarm_pids = {}     # unit pid -> swarm id, unit id and display label
         self.sessions = {}       # sid -> Session
         self.activity = []       # (ts, agent, tool, detail)
         self.addresses = {}      # messaging address -> session name
@@ -1230,7 +1404,13 @@ class Fleet:
         for sid in list(self.sessions):
             if sid not in seen:
                 del self.sessions[sid]
-        self.agents = loose_agents(self.procs, {s.pid for s in self.sessions.values() if s.pid}) if not self.only else []
+        self.swarms.refresh(now, self.only)
+        self.swarm_pids = {
+            u["pid"]: {"swarm": entry["status"]["swarm_id"], "unit": u["id"], "label": f"{entry['status']['name']}/{u['id']}"}
+            for entry in self.swarms.entries for u in entry["status"]["units"] if u["state"] == "running" and u.get("pid")
+        }
+        self.agents = loose_agents(self.procs, {s.pid for s in self.sessions.values() if s.pid}, self.swarm_pids) \
+            if not self.only else []
         if self.repos is not None:
             self.repos.watch(s.cwd for s in self.sessions.values())
         if self.closed is not None:
@@ -1296,11 +1476,18 @@ class Fleet:
                 if h.finished() and h.last_text_full:
                     items.append({"kind": "report", "from": h.label, "to": boss, "summary": h.last_text,
                                   "body": h.last_text_full, "ts": h.last_ts or h.mtime})
+        for entry in self.swarms.entries:
+            name = entry["status"]["name"]
+            for message in entry["messages"]:
+                items.append({"kind": "swarm", "from": f"{name}/{swarm_sender(message)}", "to": f"{name}/hub",
+                              "summary": first_line(message["text"]), "body": message["text"], "ts": parse_ts(message.get("at"))})
         return sorted(items, key=lambda x: x["ts"] or 0)
 
     # -- the view model
 
     def model(self, now, quota=None, remotes=()):
+        swarms = [swarm_view(entry, now, self.procs, self.sessions, self.addresses) for entry in self.swarms.entries]
+        swarms.sort(key=lambda v: ({"running": 0, "stopped?": 1}.get(v["state"], 2), v["started"], v["id"]))
         sessions = [session_view(s, now, self) for s in self.sessions.values()]
         for v in sessions:
             v["repo"] = self.repos.of(v["cwd"]) if self.repos is not None else None
@@ -1341,10 +1528,14 @@ class Fleet:
                 "helpers": len(helpers),
                 "helpers_working": sum(1 for h in helpers if h["working"]),
                 "agents": len(self.agents),
+                "swarms": sum(1 for v in swarms if v["state"] == "running"),
+                "swarm_units_running": sum(1 for v in swarms for u in v["units"] if u["state"] == "running"),
                 "unsaved": len({(self.repos.roots.get(v["cwd"]) if self.repos else v["cwd"]) for v in sessions
                                 if v.get("repo") and (v["repo"]["dirty"] or v["repo"]["unpushed"])}),
             },
             "agents": self.agents,
+            "swarms": swarms,
+            "swarms_unreadable": self.swarms.unreadable,
             "comms": self.comms(),
             "quota": quota,
             "machine": socket.gethostname(),
@@ -1437,7 +1628,7 @@ def session_view(s, now, fleet):
         teams.append(team_view(team, s.journals.get(team), s.scripts.get(team), [r for r, _v in team_rows]))
     helpers.sort(key=lambda r: r["label"])
     helpers_working = sum(1 for r in rows.values() if r["working"])
-    workers = worker_processes(s.pid, fleet.procs, fleet.children) if s.pid else []
+    workers = worker_processes(s.pid, fleet.procs, fleet.children, fleet.swarm_pids) if s.pid else []
 
     alert, alert_style = "", "warn"
     if status == "busy":
@@ -2051,6 +2242,12 @@ GROUP_LOOK = {
     "blocked": ("!", "err"), "waiting": ("◆", "warn"), "working": ("●", "busy"),
     "parked": ("·", "dim"), "background": ("◇", "c3"), "other": ("○", "dim"),
 }
+SWARM_LOOK = {
+    "queued": ("○", "dim"), "running": ("●", "busy"), "checking": ("◐", "warn"),
+    "accepted": ("✓", "ok"), "done": ("✓", "ok"), "failed": ("✗", "err"),
+    "interrupted": ("?", "warn"), "stopped?": ("?", "warn"),
+}
+ARM_COLORS = {"codex": "c0", "kimi": "c1", "claude": "c2"}
 
 
 def phase_marks(team):
@@ -2089,6 +2286,8 @@ def session_lines(v, name_w, now):
         for a in v["helpers"]:
             lines.append((helper_line(a, now, "     ⎿ ", label_w), f"{v['sid']}::{a['id']}"))
     for w in v["workers"]:
+        if w.get("swarm"):
+            continue  # shown once, in the Swarms section
         lines.append(([("     ⎿ ", "dim"), ("⚙ ", "c2"), (f"pid {w['pid']} up {human_age(etime_seconds(w['etime']))}  ", "dim"),
                        (clean(w["command"]), "plain")], None))
     return lines
@@ -2125,6 +2324,31 @@ def ordered_sessions(model, show_all):
     return [v for key in order for v in model["groups"][key]]
 
 
+def swarm_unit_line(unit, indent="    "):
+    dot, style = SWARM_LOOK[unit["state"]]
+    duration = unit["wall"] if unit["wall"] is not None else unit["age"]
+    return [(indent, "dim"), (dot + " ", style), (clean(unit["id"]) + "  ", "plain"),
+            (clean(unit["arm"]), ARM_COLORS.get(unit["arm"], "plain")),
+            (f"  {human_age(duration)}", "dim")]
+
+
+def swarm_lines(swarm, width):
+    dot, style = SWARM_LOOK[swarm["state"]]
+    counts = {}
+    for unit in swarm["units"]:
+        counts[unit["state"]] = counts.get(unit["state"], 0) + 1
+    summary = ", ".join(f"{n} {state}" for state, n in counts.items()) or "no units"
+    key = f"swarm::{swarm['id']}"
+    header = [(dot + " ", style), (clean(swarm["name"]) + "  ", "head"), (swarm["state"] + "  ", style),
+              (f"{human_age(swarm['age'])}  {summary}  {swarm['messages']} msgs", "dim")]
+    lines = [(fit(header, width), key)]
+    lines += [(fit(swarm_unit_line(unit), width), f"{key}::{unit['id']}") for unit in swarm["units"]]
+    if swarm["last_message"]:
+        last = swarm["last_message"]
+        lines.append((fit([("    " + clean(f"{last['from']} → hub: {last['text']}"), "dim")], width), None))
+    return lines
+
+
 def fleet_lines(model, width, show_all):
     """Every session row, grouped. Returns [(line, sid or None)]."""
     now, groups = model["now"], model["groups"]
@@ -2139,7 +2363,14 @@ def fleet_lines(model, width, show_all):
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
     }
-    for key in ("blocked", "waiting", "working", "agents", "parked", "background", "other"):
+    for key in ("blocked", "waiting", "working", "swarms", "agents", "parked", "background", "other"):
+        if key == "swarms":
+            swarms = [v for v in model.get("swarms", []) if show_all or v["state"] == "running" or v["stale"]]
+            if swarms:
+                out.append((rule(f"Swarms ({len(swarms)})", width, "route swarm · a-mail"), None))
+                for swarm in swarms:
+                    out += swarm_lines(swarm, width)
+            continue
         if key == "agents":
             if model.get("agents"):
                 out.append((rule(f"Other agents ({len(model['agents'])})", width, "outside any Claude session"), None))
@@ -2233,7 +2464,8 @@ def activity_lines(items, limit, scroll=0):
     return lines or [[("Nothing yet.", "dim")]]
 
 
-KIND_LOOK = {"letter": ("✉", "c1"), "task": ("→", "c0"), "report": ("←", "ok"), "note": ("·", "dim")}
+KIND_LOOK = {"letter": ("✉", "c1"), "task": ("→", "c0"), "report": ("←", "ok"), "note": ("·", "dim"),
+             "swarm": ("⇄", "c3")}
 
 
 def comm_line(item):
@@ -2254,6 +2486,13 @@ def resolve(fleet, model, key):
     ("remote", host, v) | ("closed", c) | (None,)."""
     if not key:
         return (None,)
+    if key.startswith("swarm::"):
+        ident, _, unit_id = key[7:].partition("::")
+        swarm = next((v for v in model.get("swarms", []) if v["id"] == ident), None)
+        if swarm is None:
+            return (None,)
+        unit = next((u for u in swarm["units"] if u["id"] == unit_id), None) if unit_id else None
+        return ("swarm", swarm, unit) if not unit_id or unit else (None,)
     if key.startswith("closed::"):
         sid = key[8:]
         c = next((x for x in model.get("closed", []) if x["sid"] == sid), None)
@@ -2288,6 +2527,8 @@ def resolve(fleet, model, key):
 
 def selection_name(item):
     kind = item[0]
+    if kind == "swarm":
+        return item[1]["name"] + ("/" + item[2]["id"] if item[2] else "")
     if kind == "session":
         return item[1]["name"]
     if kind == "helper":
@@ -2304,6 +2545,8 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind == "swarm":
+        return swarm_detail_lines(item[1], item[2], limit, width)
     if kind == "session":
         return detail_lines(fleet, item[1], limit)
     if kind == "closed":
@@ -2331,6 +2574,20 @@ def selection_lines(fleet, model, item, limit, width):
                  [("enter opens an ssh shell there in a new tab", "dim")]]
         return lines
     return [[("Select a row with up/down.", "dim")]]
+
+
+def swarm_detail_lines(swarm, selected, limit, width):
+    lines = [[("swarm ", "dim"), (clean(swarm["name"]) + "  ", "head"),
+              (swarm["state"], SWARM_LOOK[swarm["state"]][1]), ("   read-only", "dim")],
+             [("owner  ", "dim"), (clean(swarm["owner"]) or "-", "plain")]]
+    units = sorted(swarm["units"], key=lambda u: u["id"] != selected["id"]) if selected else swarm["units"]
+    for unit in units:
+        lines.append(swarm_unit_line(unit, "") + [(f"  ({unit['state']})", "dim")])
+        for key in ("log", "branch", "worktree"):
+            lines += [[("  " + part, "dim")] for part in wrap(f"{key}: {unit[key] or '-'}", max(1, width - 4))]
+    for held in swarm["held"]:
+        lines += [[(part, "warn")] for part in wrap(f"held {held['id']}: {held['reason']}", max(1, width - 2))]
+    return lines[:limit] if limit else lines
 
 
 def helper_lines(fleet, v, row, helper, limit, width):
@@ -2432,7 +2689,7 @@ def closed_detail_lines(c, limit, width):
 
 
 def header_line(model):
-    c, q = model["counts"], model["quota"]
+    c = model["counts"]
     line = [
         (" atc ", "title"), (f" {datetime.fromtimestamp(model['now']).strftime('%H:%M:%S')}  ", "dim"),
         (f"{c['live']} sessions · ", "plain"),
@@ -2483,8 +2740,8 @@ def quota_line(q):
         if not p.get("ok") or not p.get("configured", True) or p.get("id") == "claude":
             continue
         name = clean(str(p.get("label") or p.get("id"))).split(" ")[0]
-        parts = [(f"{l.get('label', '').replace(' window', '')} {l.get('percent')}%", pct_style(l.get("percent")))
-                 for l in p.get("limits") or [] if l.get("percent") is not None]
+        parts = [(f"{limit.get('label', '').replace(' window', '')} {limit.get('percent')}%", pct_style(limit.get("percent")))
+                 for limit in p.get("limits") or [] if limit.get("percent") is not None]
         if p.get("balanceUsd") is not None:
             parts.append((f"${p['balanceUsd']:.2f}", "err" if p.get("low") else "plain"))
         if parts:
@@ -2518,12 +2775,33 @@ def tree_lines(fleet, model, only_sid=None):
         dot, dot_style = GROUP_LOOK[v["group"]]
         out.append([(dot + " ", dot_style), (clean(v["name"]) + "  ", v["color"]), (clean(v["state"]) + "  ", "plain"),
                     (clean(v["title"]) + "  ", "dim"), (short_path(v["cwd"]), "dim")])
-        out += draw_tree(session_nodes(s, v, now, letters))
+        nodes = session_nodes(s, v, now, letters)
+        nodes += [swarm_node(swarm, fleet.procs) for swarm in model.get("swarms", []) if swarm["owner"] == v["name"]]
+        out += draw_tree(nodes)
         out.append([])
     if not only_sid:
+        unowned = [swarm_node(swarm, fleet.procs) for swarm in model.get("swarms", []) if swarm["owner"] is None]
+        if unowned:
+            out += [[("route swarms", "head")]] + draw_tree(unowned) + [[]]
         for h in model.get("hosts", []):
             out += host_tree(h)
     return out or [[("No sessions.", "dim")]]
+
+
+def swarm_node(swarm, table):
+    units = []
+    for unit in swarm["units"]:
+        children = []
+        proc = table.get(unit["pid"])
+        if proc:
+            children.append({"line": [("process ", "dim"), (clean(proc["command"])[:90], "c2"),
+                                      (f"  pid {unit['pid']} up {human_age(etime_seconds(proc['etime']))}", "dim")],
+                             "children": []})
+        units.append({"line": [(clean(unit["id"]) + " (", "plain"),
+                               (clean(unit["arm"]), ARM_COLORS.get(unit["arm"], "plain")),
+                               (f", {unit['state']})", SWARM_LOOK[unit["state"]][1])], "children": children})
+    return {"line": [("swarm ", "dim"), (clean(swarm["name"]), "head"),
+                     (f" ({swarm['state']})", SWARM_LOOK[swarm["state"]][1])], "children": units}
 
 
 def host_tree(h):
@@ -2592,6 +2870,8 @@ def session_nodes(s, v, now, letters):
     for hid in sorted((h for h in roots if not rows[h]["team"]), key=lambda h: rows[h]["label"]):
         nodes.append(build(hid))
     for w in v["workers"]:
+        if w.get("swarm"):
+            continue  # attached below its swarm unit instead
         nodes.append({"line": [("process ", "dim"), (clean(w["command"])[:90], "c2"),
                                (f"  pid {w['pid']} up {human_age(etime_seconds(w['etime']))}", "dim")], "children": []})
     counts = {}
@@ -2627,6 +2907,7 @@ HELP = [
     "x x        interrupt the selected session (sends Esc); a background session: `claude stop`;",
     "           an agent process (here or on a server): SIGTERM, over ssh for a server",
     "enter      on a subagent, a process or a server row: open it (its task, steps, report, command)",
+    "           on a route swarm or unit: read its units, logs, branches and worktree paths",
     "C C / F F  type /closecode or /forkcode into the selected session (wrap it up, or split work off)",
     "           Steering never types into a session that is blocked on a prompt: that would answer it.",
     "R R        restore a closed session: opens `claude --resume <id>` in a new tab",
@@ -2634,13 +2915,13 @@ HELP = [
     "S S        save and close a session (/closecode): STATE.md, commit, push, close",
     "D D        hide a closed session from the list (reversible)",
     "N N        rename the selected session (/rename); names are also SendMessage addresses",
-    "c          comms: every message: session to session (✉), task to a helper (→), report back (←)",
+    "c          comms: session to session (✉), task to a helper (→), report back (←), swarm a-mail (⇄)",
     "h          the hierarchy: session > workflow > phase > agent > nested agent, worker processes",
     "           in comms and the tree, s switches between all sessions and the selected one",
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
     "tab        bottom panel: all activity, the selected session, comms",
-    "p          hide or show parked, background and other sessions (shown by default)",
+    "p          hide or show parked, background and other sessions, and finished route swarms",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
 ]
@@ -2658,7 +2939,7 @@ def render(fleet, model, ui, width, height=None):
         frame += [fit(line, width) for line, _sid in rows]
         frame.append(rule("Activity", width, "newest first"))
         frame += [fit(line, width) for line in activity_lines(fleet.activity, 15)]
-        frame.append(rule("Comms", width, "✉ between sessions · → task to a helper · ← report back"))
+        frame.append(rule("Comms", width, "✉ between sessions · → task · ← report · ⇄ swarm"))
         frame += [fit(line, width) for line in comm_lines(model["comms"], 12)]
         return frame, selectable
 
@@ -2744,12 +3025,13 @@ def render_view(fleet, model, ui, width, height):
         if mine:
             helpers = {h.label for h in fleet.sessions[selected].helpers.values()} if selected in fleet.sessions else set()
             names = {name, f"{name} (workflow)"} | helpers
+            names |= {f"{swarm['name']}/hub" for swarm in model.get("swarms", []) if swarm["owner"] == name}
             items = [c for c in items if c["from"] in names or c["to"] in names]
         ui["view_pick"] = max(0, min(ui["view_pick"], len(items) - 1))
         list_h = max(3, room // 2)
         top = max(0, ui["view_pick"] - list_h + 1)
         frame.append(rule(f"Comms: {name if mine else 'all sessions'} ({len(items)})", width,
-                          "✉ letter → task ← report · s: all / selected · ↑↓ pick · esc closes"))
+                          "✉ letter → task ← report ⇄ swarm · s: all / selected · ↑↓ pick · esc closes"))
         for i, item in enumerate(items[top: top + list_h], start=top):
             line = fit(comm_line(item), width - 2)
             if i == ui["view_pick"]:
@@ -2886,7 +3168,7 @@ class App:
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] in ("helper", "process", "closed"):
+            if item[0] in ("helper", "process", "closed", "swarm"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.open_remote(item[1], item[2])

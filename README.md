@@ -22,6 +22,7 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 - **Waiting on you**: sessions that finished their turn, with the first line of what they said
 - **Working**: what each busy session is doing now, its workflow phases and progress, its subagents, and any
   agent processes it started (`codex`, `kimi`, `claude -p` …)
+- **Route swarms**: each `route swarm`, its Codex/Kimi/Claude units, their states, and the latest a-mail to its hub
 - **Parked / background / other**: sessions open but idle for 12h+, `claude --bg` sessions, and sessions with
   only a shell running. Listed by default, so nothing open is invisible; `p` folds them away
 - **Unsaved work**: each session's repo, checked in the background: uncommitted files, and commits that are on no
@@ -104,6 +105,54 @@ Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR
 - [Herdr](https://herdr.dev): agents in Herdr panes, steered through Herdr. `atc` only talks to a Herdr
   server that is already running and never starts one, because starting it resumes every saved agent.
 
+## Route swarms
+
+Run `route swarm` as usual, then watch it in atc:
+
+```bash
+atc                          # Swarms section after Working; enter opens a swarm or unit's details
+atc --once                   # states, unit arms and elapsed times, message count and last message
+atc --tree                   # owning session > swarm > unit > worker process (h in the TUI)
+atc --comms                  # a-mail alongside other messages, marked ⇄ (c in the TUI)
+atc --json                   # swarm data for scripts
+ATC_SWARM_HOURS=24 atc       # keep finished swarms visible for a day (default: 6 hours)
+```
+
+atc reads `swarms/*/status.json` and the adjacent `channel.jsonl` under `$ROUTE_STATE_DIR`, otherwise
+`$XDG_STATE_HOME/route`, otherwise `~/.local/state/route`. It supports the `route-swarm-status/1` schema,
+re-reads status only when its modification time changes, and tails messages incrementally, keeping up to
+200 per swarm. Older runs without a status file are not listed. Swarm monitoring never writes to this state
+directory or acts on message text.
+
+Unit marks are queued `○`, running `●`, checking `◐`, accepted `✓`, failed `✗`, and stopped `?`. A running
+swarm shows `stopped?` when its route PID disappears or belongs to an unrelated command; a running unit shows
+`stopped?` when its PID disappears. Swarms stay visible while their snapshot says running, including stale
+ones. Finished swarms remain for `ATC_SWARM_HOURS` after `finished_at`; `p` folds them away with parked sessions.
+`--here` and `--only` filter swarms by their repo path.
+
+The hierarchy follows route's parent processes to the nearest known session. Unowned swarms appear under
+`route swarms`. Unit processes are labelled `<swarm>/<unit>` in the session's worker data and shown once under
+their swarm, rather than again as other agents. Select a swarm or unit and press `enter` to inspect all its
+units, log paths, branches, worktrees and held-unit reasons. These details are read-only.
+
+Messages with an unknown `from_unit` appear as `<swarm>/?<address before @>`. They are retained: a-mail can
+currently deliver other subagents' traffic to a swarm hub. The comms view preserves the full message body;
+the fleet shows a single line cut to the available width.
+
+`--json` adds:
+
+- `swarms`: views containing `id`, `name`, `state`, `stale`, `owner` (session name or null), `age`, `started`,
+  `finished`, `exit_code`, `messages`, `last_message` (`from`, `text`, `at`, or null), `units`, and `held`.
+- Each unit has `id`, `arm`, `state`, `pid`, `age`, `wall`, `address`, `branch`, `log`, and `worktree`.
+- `counts.swarms`: running swarms after the liveness check; `counts.swarm_units_running`: running units after
+  their liveness checks. `swarms_unreadable` counts unreadable, malformed and unsupported-schema status files
+  in the current scan.
+- `comms` includes `kind: "swarm"`, `from: "<swarm>/<unit>"`, `to: "<swarm>/hub"`, `summary`, `body`, and `ts`.
+
+Times (`started`, `finished`, `last_message.at`, `comms.ts`) are Unix seconds or null; `age` and `wall` are
+elapsed seconds. A finished unit's wall time is preferred in the display. Message counts include the
+producer's total even when only the most recent 200 messages are retained.
+
 ## As a Taxi data source and sink (Orbital)
 
 ![The atc Taxi schema, a query, and the hop Orbital found on its own](docs/atc-taxi.png)
@@ -176,6 +225,12 @@ subagents and a two-phase workflow, a background session, letters between sessio
 `atc` in tmux, press every key, read the screen back as drawn, and check steering in the dummy sessions' own
 terminals: a message arrives, a blocked session receives nothing, Esc lands on interrupt. They also fail if
 the screen loop ever stalls, or if any command `atc` runs is handed the terminal as its input.
+
+Swarm tests use a temporary route state directory, a fake Claude home and a synthetic process table; they
+exercise `--json`, `--once`, `--tree`, `--comms` and the TUI, and check that state files stay unchanged. Fixtures
+that require live processes skip with a specific reason if the sandbox denies `ps`; the swarm screen test
+also skips if tmux is unavailable or its socket is denied. Run the full suite outside such a sandbox to verify
+the live-process and steering tests.
 
 If keys ever seem ignored, `ATC_DEBUG_LOG=/tmp/atc.log atc` logs every refresh and every pass of the screen
 loop with how long it took and which keys arrived.

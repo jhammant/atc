@@ -38,7 +38,8 @@ class Screen:
         self.code = os.path.join(FX.root, f"{self.name}.code")
         self.debug = os.path.join(FX.root, f"{self.name}.debug")
         env = FX.env(ATC_DEBUG_LOG=self.debug, **(extra_env or {}))
-        exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items() if k.startswith(("ATC_", "CLAUDE_", "TERM")))
+        exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()
+                           if k.startswith(("ATC_", "CLAUDE_", "ROUTE_", "TERM")))
         hosts_arg = "" if hosts else "--no-hosts"
         command = (f"cd {shlex.quote(FX.work)} && env {exports} HOME={shlex.quote(env['HOME'])} "
                    f"{shlex.quote(sys.executable)} {shlex.quote(fixture.ATC)} {hosts_arg} {' '.join(args)} "
