@@ -956,6 +956,55 @@ class Repos:
         return self.state.get(self.roots.get(folder) or "", None)
 
 
+class AMail:
+    """Counts only: status reads nothing and acknowledges nothing. Never keep addresses or message content."""
+
+    EVERY = 60.0
+
+    def __init__(self, background=True):
+        self.cmd = command_from_env("ATC_AMAIL", "amail")
+        self.items = []
+        self.worked = False
+        self.checked = None
+        self.lock = threading.Lock()
+        if self.cmd and background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def fetch(self):
+        with self.lock:
+            if not self.cmd or (self.checked is not None and time.monotonic() - self.checked < self.EVERY):
+                return
+            code, out, _err = run(self.cmd + ["status", "--json"], timeout=15)
+            try:
+                data = json.loads(out)
+                if code != 0 or data["health"]["ok"] is not True:
+                    raise ValueError("unreachable")
+                counts = [("amail_approval", data["owner"]["approvals"], "approval", "approvals"),
+                          ("amail_request", data["owner"]["requests"], "request", "requests"),
+                          ("amail_proposal", data["owner"]["proposals"], "proposal", "proposals"),
+                          ("amail_device", data["device"]["awaitingApproval"], "device awaiting approval",
+                           "devices awaiting approval"),
+                          ("amail_inbox", data["inbox"]["waiting"], "inbox item waiting", "inbox items waiting")]
+                if any(type(n) is not int or n < 0 for _kind, n, _one, _many in counts):
+                    raise ValueError("invalid counts")
+                items = []
+                for kind, n, one, many in counts:
+                    if n:
+                        more = "+" if kind == "amail_inbox" and data["inbox"].get("more") is True else ""
+                        items.append(need_item(kind, f"a-mail {n}{more} {one if n == 1 else many}",
+                                               "Counts only; no message content read.", hint="Answer in Roost or the a-mail app."))
+                self.items, self.worked = items, True
+            except (ValueError, KeyError, TypeError):
+                self.items = [need_item("amail_unreachable", "a-mail unreachable",
+                                       "Counts are unavailable.", hint="Check Roost or the a-mail app.")] if self.worked else []
+            self.checked = time.monotonic()
+
+    def loop(self):
+        while True:
+            self.fetch()
+            time.sleep(self.EVERY)
+
+
 class ClosedSessions:
     """Transcripts that changed in the last 14 days but whose session isn't live: closed but resumable."""
 
@@ -1394,6 +1443,7 @@ class Remote:
             "counts": data.get("counts", {}), "groups": data.get("groups", {}), "agents": data.get("agents", []),
             "machine": data.get("machine"),
             "swarms": data.get("swarms", []),
+            "needs": data.get("needs", []),
         }
 
 
@@ -1448,14 +1498,56 @@ class RemoteAtc(Remote):
 
 # ---------------------------------------------------------------- the fleet
 
+# New sources add typed items here; `approval` (pending levers) and `later` (wake-ups/reminders) are reserved.
+NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": 1, "amail_request": 2, "amail_proposal": 3,
+              "amail_device": 4, "amail_unreachable": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
+URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval"}
+
+
+def need_item(kind, title, detail="", host=None, sid=None, since=None, hint=""):
+    return {"kind": kind, "host": host, "sid": sid, "title": title, "detail": detail, "since": since, "hint": hint}
+
+
+def needs_queue(groups, hosts, items=()):
+    needs = [dict(item) for item in items]
+    for host, source, age in [(None, groups, 0)] + [
+            (h["host"], h.get("groups", {}), h.get("age") or 0) for h in hosts]:
+        for kind in ("blocked", "waiting"):
+            for v in source.get(kind, []):
+                hint = "Answer this prompt in that session." if kind == "blocked" else "Continue in that session."
+                since = v.get("since")
+                needs.append(need_item(kind, session_ref(v),
+                                       v.get("doing") if kind == "blocked" else (v.get("said") or v.get("doing")),
+                                       host, v.get("sid"), since + age if since is not None else None, hint))
+    for h in hosts:
+        for item in h.get("needs", []):
+            if not isinstance(item, dict) or item.get("sid") or item.get("host") is not None:
+                continue  # sessions come from groups; another host's items must never come back around
+            if item.get("kind") in ("blocked", "waiting") or not isinstance(item.get("kind"), str):
+                continue
+            needs.append(need_item(item["kind"], item.get("title", ""), item.get("detail", ""), host=h["host"],
+                                   since=item.get("since"), hint=item.get("hint", "")))
+    for item in needs:
+        h = next((h for h in hosts if h["host"] == item["host"]), None)
+        if h and not h["ok"]:
+            item["hint"] = (item["hint"] or "") + f" Last seen {human_age(h.get('age'))} ago; {h['host']} isn't answering."
+    return sorted(needs, key=lambda item: (NEED_ORDER.get(item["kind"], 7),
+                  (item["since"] if item["since"] is not None else float("inf")) if item["kind"] == "waiting" else 0))
+
+
+def needs_counts(items):
+    return {"needs": len(items), "needs_urgent": sum(item["kind"] in URGENT_NEEDS for item in items)}
+
+
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None, amail=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
         self.proc_watch = procs or Procs(background=False)
         self.repos = repos
         self.closed = closed
+        self.amail_poller = amail
         self.swarms = swarms or Swarms()
         self.swarm_pids = {}     # unit pid -> swarm id, unit id and display label
         self.sessions = {}       # sid -> Session
@@ -1665,10 +1757,14 @@ class Fleet:
         groups["background"].sort(key=lambda v: (v["started"] or 0, v["name"]))
         groups["other"].sort(key=lambda v: v["name"])
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
+        hosts = unique_hosts([r.view(now) for r in remotes])
+        needs = needs_queue(groups, hosts, self.amail_poller.items if self.amail_poller else ())
         return {
             "now": now,
             "groups": groups,
+            "needs": needs,
             "counts": {
+                **needs_counts(needs),
                 "live": len(sessions),
                 "blocked": len(groups["blocked"]),
                 "waiting": len(groups["waiting"]),
@@ -1690,7 +1786,7 @@ class Fleet:
             "comms": self.comms(),
             "quota": quota,
             "machine": socket.gethostname(),
-            "hosts": unique_hosts([r.view(now) for r in remotes]),
+            "hosts": hosts,
             "closed": self.closed.visible() if self.closed else [],
         }
 
@@ -2763,12 +2859,15 @@ class Service:
         if path == "/api/taxi/quota":
             return 200, taxi_quota(self.quota)
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
-            return 200, {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
+            result = {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
+            result["needs"] = [item for item in model["needs"] if item["host"] is None]
+            result["counts"] = dict(model["counts"], **needs_counts(result["needs"]))
+            return 200, result
         return 404, {"detail": "not found"}
 
     def web_model(self):
         model = self.cockpit.model()
-        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts")}
+        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs")}
         result.update(closed=model.get("closed", [])[:50], comms=list(reversed(model.get("comms", [])[-200:])),
                       quota=taxi_quota(self.quota), quota_text=tool_quota(self.cockpit, {}, Call()),
                       writes=self.writes, refreshed_at=iso(self.at), error=self.error)
@@ -3139,6 +3238,8 @@ class Cockpit:
             for t in fetches:
                 t.start()
             fleet = self.fleet
+            if fleet.amail_poller:
+                fleet.amail_poller.fetch()
             if fleet.feed:
                 fleet.feed.fetch()
             fleet.proc_watch.fetch()
@@ -3171,7 +3272,8 @@ def on_demand_cockpit(dry_run=False, hosts=(), use_hosts=True):
     feed = Feed(claude_cmd if shutil.which(claude_cmd[0]) else None, background=False)
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), dry_run, background=False)
     repos = Repos(background=False)
-    fleet = Fleet(None, feed, herdr, Procs(background=False), repos, closed=ClosedSessions(repos=repos, background=False))
+    fleet = Fleet(None, feed, herdr, Procs(background=False), repos, closed=ClosedSessions(repos=repos, background=False),
+                  amail=AMail(background=False))
     quota = Quota(command_from_env("ATC_QUOTAMAX", "quotamax"), dry_run, background=False)
     remotes = [Remote(h, background=False) for h in configured_hosts(hosts)] if use_hosts else []
     return Cockpit(fleet, quota, remotes, Terminals(dry_run), claude_cmd, command_from_env("ATC_ROUTE", "route"),
@@ -3413,44 +3515,30 @@ def tool_fleet(ck, a, call):
     return fleet_text(ck, ck.model(hosts=not folder), os.path.abspath(os.path.expanduser(folder)) if folder else None)
 
 
-@mcp_tool("atc_needs_me", "Who needs me", "Sessions blocked on a permission prompt or question (with what they ask) "
-          "and sessions that finished and are waiting for the user (with what they said), on every machine.")
+@mcp_tool("atc_needs_me", "Who needs me", "The ordered needs-you queue on every machine: blocked prompts, "
+          "a-mail owner items, waiting sessions and a-mail inbox counts. Says where to answer each item.")
 def tool_needs_me(ck, a, call):
     model = ck.model()
-    found = {"blocked": [(None, v) for v in model["groups"]["blocked"]],
-             "waiting": [(None, v) for v in model["groups"]["waiting"]]}
-    down = []
+    needs = model["needs"]
+    out, previous = [], None
+    for item in needs:
+        kind = item["kind"]
+        if kind != previous and kind in ("blocked", "waiting"):
+            count = sum(n["kind"] == kind for n in needs)
+            out.append(f"{GROUP_TITLES[kind]} ({count})" + (", newest first:" if kind == "waiting" else ":"))
+        previous = kind
+        host = f" on {item['host']}" if item["host"] else ""
+        label = "asks: " if kind == "blocked" else "said: " if kind == "waiting" else ""
+        out.append(f"  {clean(item['title'])}{host}\n    {label}{clean(item['detail'])}\n    {clean(item['hint'])}")
+    if not needs:
+        out.append("Nobody needs you: the needs-you queue is empty.")
     for h in model.get("hosts", []):
-        for key in found:
-            found[key] += [(h["host"], v) for v in h.get("groups", {}).get(key, [])] if h["ok"] else []
-        if h["ok"]:
-            continue
-        stale = [(key, v) for key in ("blocked", "waiting") for v in h.get("groups", {}).get(key, [])]
-        if h.get("age") is None:
-            down.append(f"\n{h['host']} isn't answering ({clean(h.get('error') or 'no answer yet')}), and atc hasn't "
-                        "seen it yet")
-            continue
-        down.append(f"\n{h['host']} isn't answering ({clean(h.get('error') or 'no answer')}). As last seen "
-                    f"{human_age(h['age'])} ago, " + (f"{len(stale)} needed you:" if stale else "nothing there needed you."))
-        down += [f"  {session_ref(v, h['host'])} · {'blocked' if key == 'blocked' else 'waiting'}: "
-                 f"{clean(v.get('doing') if key == 'blocked' else (v.get('said') or v.get('doing')))}" for key, v in stale]
-    out = []
-    if found["blocked"]:
-        out.append(f"Blocked on a prompt ({len(found['blocked'])}). Answer these in the session; typing into one "
-                   "would answer its prompt:")
-        for h, v in found["blocked"]:
-            out.append(f"  {session_ref(v, h)} · {clean(v.get('state'))} · {short_path(v.get('cwd') or '')}\n"
-                       f"    asks: {clean(v.get('doing'))}")
-    if found["waiting"]:
-        out.append(f"Waiting for you ({len(found['waiting'])}), newest first:")
-        for h, v in found["waiting"]:
-            out.append(f"  {session_ref(v, h)} · {clean(v.get('state'))} · {short_path(v.get('cwd') or '')}\n"
-                       f"    said: {clean(v.get('said') or v.get('doing'))}")
-    if not out:
-        out.append("Nobody needs you: no session is blocked on a prompt or waiting for you.")
+        if not h["ok"] and not any(item["host"] == h["host"] for item in needs):
+            out.append(f"{h['host']} isn't answering; " + ("atc hasn't seen it yet." if h.get("age") is None else
+                       f"nothing needed you as last seen {human_age(h['age'])} ago."))
     c = model["counts"]
     out.append(f"\nAlso here: {c['working']} working, {c['parked']} parked, {c['background']} background.")
-    return "\n".join(out + down)
+    return "\n".join(out)
 
 
 def session_data(ck, a):
@@ -4369,7 +4457,31 @@ def fleet_lines(model, width, show_all):
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
     }
-    for key in ("blocked", "waiting", "working", "swarms", "agents", "parked", "background", "other"):
+    for key in ("blocked", "waiting", "needs", "working", "swarms", "agents", "parked", "background", "other"):
+        if key == "needs":
+            items = [item for item in model.get("needs", []) if item["sid"] is None]
+            if items:
+                out.append((rule("a-mail" if all(n["kind"].startswith("amail_") for n in items) else "Needs you",
+                                 width, "answer in Roost or the a-mail app"), None))
+                for item in items:
+                    host = f" on {item['host']}" if item["host"] else ""
+                    out.append(([(clean(item["title"]) + host, "warn"), (" · " + clean(item["hint"]), "dim")], None))
+            continue
+        if key in ("blocked", "waiting"):
+            items = [item for item in model.get("needs", []) if item["kind"] == key]
+            if items:
+                title, extra = titles[key]
+                out.append((rule(f"{title} ({len(items)})", width, extra), None))
+                for item in items:
+                    if item["host"] is None:
+                        v = next(v for v in groups[key] if v["sid"] == item["sid"])
+                        out += session_lines(v, name_w, now)
+                    else:
+                        dot, style = GROUP_LOOK[key]
+                        out.append(([(f"{dot} {clean(item['title'])} on {item['host']}  ", style),
+                                     (clean(item["detail"]), "plain")], f"@{item['host']}::s::{item['sid']}"))
+                        out.append(([("  " + clean(item["hint"]), "dim")], None))
+            continue
         if key == "swarms":
             swarms = [v for v in model.get("swarms", []) if show_all or v["state"] == "running" or v["stale"]]
             if swarms:
@@ -4396,7 +4508,7 @@ def fleet_lines(model, width, show_all):
     if not everyone:
         out.append(([("No live Claude Code sessions found.", "dim")], None))
     for h in model.get("hosts", []):
-        out += host_lines(h, width, name_w)
+        out += host_lines(h, width, name_w, needs_shown=True)
     closed = model.get("closed", [])
     if closed:
         out.append((rule(f"Closed (resumable) ({len(closed)})", width, "R restore · D done · E exit · S save"), None))
@@ -4433,14 +4545,15 @@ def closed_row(c, name_w, now):
     return line
 
 
-def host_lines(h, width, name_w):
+def host_lines(h, width, name_w, needs_shown=False):
     """One remote machine: its Claude sessions (read-only here) and its agent processes."""
     if not h["ok"]:
         return [(rule(h["host"], width, "unreachable"), None), ([("  " + clean(h["error"] or "no answer"), "err")], None)]
     when = f"{h['latency']:.1f}s ssh · {human_age(h['age'])} ago" if h["age"] is not None else ""
     name = h["host"] + (f" (also {', '.join(h['aliases'])})" if h.get("aliases") else "")
     out = [(rule(name, width, when), None)]
-    remote_sessions = [v for key in ("blocked", "waiting", "working") for v in h["groups"].get(key, [])]
+    remote_sessions = [v for key in (("working",) if needs_shown else ("blocked", "waiting", "working"))
+                       for v in h["groups"].get(key, [])]
     for v in remote_sessions:
         dot, dot_style = GROUP_LOOK.get(v.get("group"), ("○", "dim"))
         out.append(([(dot + " ", dot_style), (col(v.get("name"), name_w) + " ", "c3"),
@@ -4451,7 +4564,7 @@ def host_lines(h, width, name_w):
         out.append(([(f"  + {quiet} idle Claude sessions", "dim")], None))
     for a in h["agents"]:
         out.append((agent_row(a, name_w), f"@{h['host']}::p::{a['pid']}"))
-    if not remote_sessions and not quiet and not h["agents"]:
+    if not remote_sessions and not quiet and not h["agents"] and not any(h["groups"].values()):
         out.append(([("  no Claude sessions or agent processes", "dim")], None))
     return out
 
@@ -4705,6 +4818,10 @@ def header_line(model):
     ]
     if c["blocked"]:
         line.append((f"{c['blocked']} blocked · ", "err"))
+    mail = [item for item in model.get("needs", []) if item["kind"].startswith("amail_")]
+    if mail:
+        note = clean(mail[0]["title"]) + (f" +{len(mail) - 1} more" if len(mail) > 1 else "")
+        line.append((note + " · ", "warn"))
     line += [
         (f"{c['waiting']} waiting", "warn" if c["waiting"] else "dim"), (" · ", "dim"),
         (f"{c['working']} working", "busy" if c["working"] else "dim"),
@@ -5570,13 +5687,16 @@ def main():
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), args.dry_run, background=not one_shot)
     repos = Repos(background=not one_shot)
     closed = ClosedSessions(repos=repos, background=False) if not only and not args.jump else None
-    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed)
+    amail = AMail(background=not one_shot) if not args.jump else None
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
 
     if one_shot:
         workers = [threading.Thread(target=r.fetch) for r in remotes if not args.jump]
+        if amail:
+            workers.append(threading.Thread(target=amail.fetch))
         for w in workers:
             w.start()
         feed.fetch()

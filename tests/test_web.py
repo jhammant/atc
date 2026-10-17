@@ -227,7 +227,7 @@ class WebHTTP(HTTP, unittest.TestCase):
                             token=TOKEN, background=False, web_origin=origin, peer_secret=peer,
                             web_dir=os.path.join(self.tmp.name, "web"))
         service.model = {"now": time.time(), "machine": "hub", "groups": {g: [] for g in m.GROUP_ORDER},
-                         "hosts": [], "swarms": [], "agents": [], "counts": {}, "comms": [], "closed": []}
+                         "hosts": [], "swarms": [], "agents": [], "needs": [], "counts": {}, "comms": [], "closed": []}
         service.at = time.time()
         return service
 
@@ -571,6 +571,8 @@ class WebFleet(HTTP, unittest.TestCase):
         status, model, _ = self.request("/api/web/model", cookie=self.cookie)
         self.assertEqual(status, 200)
         self.assertEqual(model["counts"]["blocked"], 1)
+        self.assertEqual(model["counts"]["needs"], 2)
+        self.assertEqual([n["kind"] for n in model["needs"]], ["blocked", "waiting"])
         status, session, _ = self.request("/api/web/session/" + self.fx.sid("alpha-11"), cookie=self.cookie)
         self.assertEqual(status, 200)
         self.assertTrue(session["steps"])

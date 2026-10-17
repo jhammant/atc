@@ -599,9 +599,9 @@ class Http(unittest.TestCase):
         standin.refresh()
         asleep = text(self.post(needs, url=standin_url)[1]["result"])
         self.assertIn("hasn't answered", asleep)
-        self.assertIn("Nobody needs you", asleep)  # this stand-in's own (empty) fleet...
-        self.assertIn("home-box isn't answering", asleep)  # ...and the sleeping machine, as last seen
-        self.assertIn("2 needed you", asleep)
+        self.assertNotIn("Nobody needs you", asleep)  # the shared queue retains the sleeping host's items
+        self.assertIn("home-box isn't answering", asleep)
+        self.assertIn("Last seen", asleep)
         self.assertIn("gamma-33", asleep)
         fleet = text(self.post(self.rpc("tools/call", {"name": "atc_fleet", "arguments": {}}), url=standin_url)[1]["result"])
         self.assertIn("as last seen", fleet)

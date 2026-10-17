@@ -142,8 +142,8 @@ function swarm(s) {
   if (s.last_message) box.append(node("p", `${s.last_message.from}: ${s.last_message.text}`, "words"));
   box.append(list); return box;
 }
-function fleetView(needs) {
-  const fragment = document.createDocumentFragment(); let total = 0;
+function fleetView() {
+  const fragment = document.createDocumentFragment();
   for (const machine of machines()) {
     const box = node("section", null, "machine");
     box.append(node("h2", machine.host));
@@ -151,21 +151,36 @@ function fleetView(needs) {
       const error = String(machine.error || "Not answering").trim().replace(/[.!]+$/, "");
       box.append(node("p", `${error}. Last seen: ${age(machine.age)}.`, "notice"));
     }
-    let count = 0;
-    for (const group of needs ? ["blocked", "waiting"] : groups) {
+    for (const group of groups) {
       const sessions = (machine.groups || {})[group] || [];
-      if (sessions.length && !needs) box.append(node("h3", `${labels[group]} (${sessions.length})`));
-      for (const s of sessions) { box.append(sessionCard(s, machine.local ? "local" : machine.host, !machine.ok)); count++; }
+      if (sessions.length) box.append(node("h3", `${labels[group]} (${sessions.length})`));
+      for (const s of sessions) box.append(sessionCard(s, machine.local ? "local" : machine.host, !machine.ok));
     }
-    if (!needs) {
-      if ((machine.swarms || []).length) box.append(node("h3", "Route swarms"));
-      for (const s of machine.swarms || []) box.append(swarm(s));
-      if ((machine.agents || []).length) box.append(node("h3", "Other agent processes"));
-      for (const a of machine.agents || []) box.append(node("p", `${a.tool || "Agent"} · pid ${a.pid} · ${a.parent || ""} · ${a.command || ""}`, "words"));
-    }
-    if (count || !needs || !machine.ok) { fragment.append(box); total++; }
+    if ((machine.swarms || []).length) box.append(node("h3", "Route swarms"));
+    for (const s of machine.swarms || []) box.append(swarm(s));
+    if ((machine.agents || []).length) box.append(node("h3", "Other agent processes"));
+    for (const a of machine.agents || []) box.append(node("p", `${a.tool || "Agent"} · pid ${a.pid} · ${a.parent || ""} · ${a.command || ""}`, "words"));
+    fragment.append(box);
   }
-  if (!total) fragment.append(node("p", "Nobody needs you. No sessions are blocked or waiting."));
+  return fragment;
+}
+function needsView() {
+  const fragment = document.createDocumentFragment();
+  for (const item of model.needs || []) {
+    const card = node("article", null, "session " + (groups.includes(item.kind) ? item.kind : "other"));
+    const head = node("header"), title = node(item.sid ? "a" : "strong", item.title);
+    if (item.sid) title.href = sessionURL(item, item.host);
+    head.append(title);
+    card.append(head, node("p", item.host || model.machine || "Hub", "meta"),
+      node("p", item.detail, "words"), node("p", item.hint, "notice"));
+    fragment.append(card);
+  }
+  if (!(model.needs || []).length) fragment.append(node("p", "Nobody needs you. The queue is empty."));
+  for (const machine of model.hosts || []) {
+    if (!machine.ok && !(model.needs || []).some((item) => item.host === machine.host)) {
+      fragment.append(node("p", `${machine.host} isn't answering. Last seen: ${age(machine.age)}.`, "notice"));
+    }
+  }
   return fragment;
 }
 function comms(items) {
@@ -185,12 +200,13 @@ function button(text, fn, isLever = true) {
   b.addEventListener("click", () => action(fn)); return b;
 }
 function drawModel() {
-  const count = machines().reduce((n, m) => n + (m.ok ? ["blocked", "waiting"].reduce((v, g) => v + ((m.groups || {})[g] || []).length, 0) : 1), 0);
+  const count = model.counts.needs;
   $("needs-count").textContent = count; document.title = `(${count}) atc · ${labels[view] || "Needs you"}`;
   $("read-only").hidden = model.writes;
   if (view === "session" || view === "account") return;
   const content = $("content"), frag = document.createDocumentFragment();
-  if (view === "needs" || view === "fleet") frag.append(fleetView(view === "needs"));
+  if (view === "needs") frag.append(needsView());
+  if (view === "fleet") frag.append(fleetView());
   if (view === "comms") {
     const filter = $("filter").value.toLocaleLowerCase();
     frag.append(comms((model.comms || []).filter((c) => `${c.from} ${c.to}`.toLocaleLowerCase().includes(filter))));
