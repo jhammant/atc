@@ -8,12 +8,15 @@ const vm = require("node:vm");
 const source = readFileSync(join(__dirname, "../web/app.js"), "utf8");
 
 function element(tag = "div") {
+  const listeners = new Map();
   return {tag, textContent: "", childNodes: [], hidden: false, value: "", dataset: {},
-    classList: {toggle() {}}, addEventListener() {}, querySelectorAll: () => [],
+    classList: {toggle() {}},
+    addEventListener(name, fn) { listeners.set(name, fn); },
+    fire(name) { return listeners.get(name)?.(); }, querySelectorAll: () => [],
     append(...children) { this.childNodes.push(...children); },
     replaceChildren(...children) { this.childNodes = children; }};
 }
-function page(fetch) {
+function page(fetch, credentials = {}) {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
@@ -24,7 +27,8 @@ function page(fetch) {
     createElement: element, createDocumentFragment: () => element("fragment")};
   let tick;
   const context = vm.createContext({document, fetch, URLSearchParams, location: {hash: ""},
-    window: {addEventListener() {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
+    navigator: {credentials}, atob, btoa,
+    window: {addEventListener() {}, isSecureContext: true, PublicKeyCredential: function () {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
   vm.runInContext(source, context);
   return {get, document, tick: () => tick(), settled: () => vm.runInContext("refreshing", context)};
 }
@@ -117,4 +121,100 @@ test("Needs you names the hub and an unavailable host once, retaining specific e
   for (const notice of notices) assert.equal(queued.filter((n) => n.textContent === notice).length, 1);
   assert.equal(p.get("needs-count").textContent, 2);
   assert.match(p.get("connection").textContent, /^Updated /);
+});
+
+function approvalItem(host = null) {
+  return {kind: "approval", id: "Abcdef1234567890_", host, sid: null, title: "Approval Abcdef1234567890_",
+    summary: "Type <script>example</script> into beta", detail: "Type <script>example</script> into beta",
+    caller: "alpha-11", client: "autonomous-client", expires: 1800000000, hint: "Approve with a passkey."};
+}
+function acceptDialog(p) {
+  const dialog = p.get("confirm-dialog");
+  dialog.showModal = () => { dialog.returnValue = "confirm"; dialog.fire("close"); };
+}
+function credential() {
+  const bytes = () => new Uint8Array([1, 2, 3]).buffer;
+  return {id: "AQID", rawId: bytes(), type: "public-key", response: {
+    clientDataJSON: bytes(), authenticatorData: bytes(), signature: bytes(), userHandle: null}};
+}
+
+test("approval cards show owner, machine and expiry, then request a fresh assertion for that action", async () => {
+  const data = model(), item = approvalItem("laptop"), calls = [];
+  data.needs = [item]; data.counts = {needs: 1, needs_urgent: 1};
+  const path = "/api/web/approvals/" + item.id + "/";
+  const p = page(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : undefined;
+    calls.push({url, body});
+    if (url.endsWith("/model")) return response(200, data);
+    if (url === path + "options") return response(200, {challenge: "bm9uY2U", userVerification: "required",
+      allowCredentials: [{type: "public-key", id: "AQID"}], rpId: "atc.example.com"});
+    assert.equal(url, path + "approve");
+    assert.equal(body.challenge, "bm9uY2U"); assert.equal(body.host, "laptop");
+    assert.equal(body.response.signature, "AQID");
+    assert.equal(body.id, "AQID"); assert.equal(body.rawId, "AQID");
+    return response(200, {ok: true, text: "Approval approved."});
+  }, {async get({publicKey}) {
+    calls.push({url: "passkey"});
+    assert.equal(publicKey.userVerification, "required");
+    assert.equal(Buffer.from(publicKey.challenge).toString(), "nonce");
+    assert.equal(Buffer.from(publicKey.allowCredentials[0].id).toString("hex"), "010203");
+    return credential();
+  }});
+  await p.settled();
+  acceptDialog(p);
+  const cards = descendants(p.get("content"));
+  assert.ok(cards.some((n) => n.textContent === item.summary));
+  assert.ok(cards.some((n) => n.textContent === "laptop"));
+  assert.ok(cards.some((n) => /Caller: alpha-11 · autonomous-client · Expires/.test(n.textContent)));
+
+  await cards.find((n) => n.textContent === "Approve with passkey").fire("click");
+
+  assert.deepEqual(calls.filter((c) => !c.url.endsWith("/model")).map((c) => c.url),
+    [path + "options", "passkey", path + "approve"]);
+  assert.deepEqual(calls.find((c) => c.url === path + "options").body, {host: "laptop"});
+  assert.equal(p.get("result").textContent, "Approval approved.");
+  assert.match(p.get("confirm-summary").textContent, /Caller: alpha-11 · laptop · Expires/);
+});
+
+test("denying an approval only uses the signed-in session", async () => {
+  const data = model(), item = approvalItem(), calls = [];
+  data.needs = [item];
+  const p = page(async (url, options) => {
+    if (url.endsWith("/model")) return response(200, data);
+    calls.push({url, body: JSON.parse(options.body)});
+    return response(200, {ok: true, text: "Approval denied."});
+  }, {get() { assert.fail("deny must not request a passkey"); }});
+  await p.settled();
+  acceptDialog(p);
+
+  await descendants(p.get("content")).find((n) => n.textContent === "Deny").fire("click");
+
+  assert.deepEqual(calls, [{url: "/api/web/approvals/" + item.id + "/deny", body: {host: "local"}}]);
+  assert.equal(p.get("result").textContent, "Approval denied.");
+});
+
+test("cancelled passkey and failed approval request never send a decision or retry it", async () => {
+  for (const fault of ["cancel", "options", "lost decision"]) {
+    const data = model(), item = approvalItem(), calls = [];
+    data.needs = [item];
+    const p = page(async (url) => {
+      if (url.endsWith("/model")) return response(200, data);
+      calls.push(url);
+      if (fault === "options") return response(409, {text: "Approval expired"});
+      if (url.endsWith("/options")) return response(200, {challenge: "bm9uY2U", userVerification: "required"});
+      throw new TypeError("Connection lost");
+    }, {async get() {
+      if (fault === "cancel") throw new Error("Passkey cancelled");
+      return credential();
+    }});
+    await p.settled();
+    acceptDialog(p);
+
+    await descendants(p.get("content")).find((n) => n.textContent === "Approve with passkey").fire("click");
+    await p.tick();
+
+    assert.equal(calls.filter((url) => url.endsWith("/approve")).length, fault === "lost decision" ? 1 : 0);
+    assert.equal(calls.filter((url) => url.endsWith("/options")).length, 1);
+    assert.match(p.get("result").textContent, /cancelled|expired|Connection lost/);
+  }
 });

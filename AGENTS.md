@@ -21,6 +21,9 @@ agent process on this machine and on configured servers, with levers to steer th
 ```bash
 python3 -m unittest discover -s tests -v                 # everything; needs tmux and ps; about 2 minutes
 python3 -m unittest discover -s tests -p test_mcp.py     # MCP and HTTP only; about 20 s
+node --test tests/test_web_ui.js                        # browser polling, rendering and approvals
+node --test tests/test_*.js                            # every JavaScript test file
+node --check web/app.js                               # browser syntax
 ruff check --select F,E9 atc.py tests/                   # lint (errors only)
 /usr/bin/python3 -c 'import ast; ast.parse(open("atc.py").read())'   # still Python 3.9
 ```

@@ -381,7 +381,7 @@ class Fixture:
         env.update({
             "CLAUDE_CONFIG_DIR": self.claude_home, "ATC_CLAUDE": os.path.join(self.stub, "claude"),
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
-            "ATC_AMAIL": "",
+            "ATC_AMAIL": "", "ATC_APPROVAL_WAIT": "0",
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
             "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
