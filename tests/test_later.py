@@ -348,6 +348,64 @@ class LaterCase(unittest.TestCase, HTTP):
                 self.assertIn("Study notes", proc.stdout)
             self.assertIn("Check the build", proc.stdout)
 
+    def test_jobs_and_later_share_queue_cli_and_owned_exports(self):
+        env = dict(self.env, ATC_LOOM=os.path.join(self.fx.stub, "loom"), ATC_LOOM_HOSTS="server1",
+                   ATC_AMAIL=os.path.join(self.fx.stub, "amail"))
+        with mock.patch.dict(os.environ, env):
+            loom = self.m.Loom(background=False)
+            amail = self.m.AMail(background=False)
+        loom.fetch()
+        amail.fetch()
+        self.fleet.loom, self.fleet.amail_poller = loom, amail
+        self.fleet.approvals.create("atc_run_job", {"job": "crashed"}, "run job crashed now on local",
+                                    "owner-session", "fixture")
+        due = self.m.iso(time.time() + 300)
+        self.script("notes", "import json\nprint(json.dumps([dict(title='Review notes', when=" + repr(due) + ")]))\n")
+        self.poller.fetch()
+        remote = self.m.Remote("laptop", background=False)
+        remote.data = {"machine": "laptop", "groups": {},
+                       "jobs": {"local": dict(loom.data["local"], jobs=[dict(loom.data["local"]["jobs"][0], name="peer-job")])},
+                       "needs": [dict(self.m.need_item("job", "peer-job", host="local"), job="peer-job")],
+                       "later": [dict(title="Peer reminder", when=time.time() + 200, source="notes", kind="reminder",
+                                      sid=None, host=None)]}
+        remote.ok_at = time.time()
+        remote.latency = 0.01
+
+        service = self.service_for(remotes=[remote])
+        model = service.web_model()
+        exported = service.get("/api/fleet")[1]
+        cli = subprocess.run([sys.executable, fixture.ATC, "--json", "--no-hosts"], env=env,
+                             capture_output=True, text=True, timeout=30)
+
+        kinds = list(dict.fromkeys(n["kind"] for n in model["needs"]))
+        self.assertEqual(kinds, ["blocked", "approval", "amail_approval", "amail_request", "amail_proposal",
+                                 "amail_device", "job", "later", "waiting", "amail_inbox"])
+        deferred = [n for n in model["needs"] if n["kind"] in ("job", "later")]
+        self.assertGreater(len(deferred), 2)
+        self.assertEqual(self.m.needs_counts(deferred)["needs_urgent"], 0)
+        self.assertEqual(model["counts"]["needs_urgent"], 5)
+        self.assertEqual(model["jobs"]["laptop"]["via"], "laptop")
+        self.assertEqual(set(exported["jobs"]), {"local", "server1"})
+        self.assertEqual(exported["jobs"], service.model["jobs_own"])
+        self.assertTrue(all(n["host"] is None for n in exported["later"]))
+        self.assertNotIn("Peer reminder", [n["title"] for n in exported["later"]])
+        self.assertFalse(any(n.get("via") or n["host"] == "laptop" for n in exported["needs"]))
+        self.assertEqual(exported["counts"]["jobs_failing"], 2)
+        self.assertEqual(cli.returncode, 0, cli.stderr)
+        cli_model = json.loads(cli.stdout)
+        self.assertEqual(set(cli_model["jobs"]), {"local", "server1"})
+        self.assertIn("Review notes", [n["title"] for n in cli_model["later"]])
+        self.assertEqual(cli_model["counts"]["needs_urgent"], 5)
+        screen = "\n".join(self.m.plain(line) for line, _ in self.m.fleet_lines(model, 200, True))
+        self.assertIn("── Later", screen)
+        self.assertIn("── Jobs & apps", screen)
+
+        relay = self.m.Remote("hub", background=False)
+        relay.data, relay.ok_at = dict(exported, machine="hub"), time.time()
+        relay_model = self.m.Fleet(only="/no-sessions").model(time.time(), remotes=[relay])
+        self.assertNotIn("laptop", relay_model["jobs"])
+        self.assertNotIn("Peer reminder", [n["title"] for n in relay_model["later"]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,7 +42,7 @@ p { margin: .5rem 0; max-width: 80ch; overflow-wrap: anywhere; }
 .machine > h2 { border-bottom: 1px solid var(--line); padding: .5rem 0; }
 .session { background: var(--surface); border-bottom: 1px solid var(--line); border-left: 3px solid var(--line); padding: .75rem 1rem; }
 .session.blocked { border-left-color: var(--blocked); }
-.session.waiting { border-left-color: var(--alert); }
+.session.waiting, .session.warning { border-left-color: var(--alert); }
 .session.working { border-left-color: var(--ok); }
 .session header { display: flex; gap: .7rem; align-items: baseline; flex-wrap: wrap; }
 .session header a { font-weight: 650; }

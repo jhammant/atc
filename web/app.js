@@ -1,7 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const groups = ["blocked", "waiting", "working", "parked", "background", "other"];
-const labels = {needs: "Needs you", later: "Later", fleet: "Fleet", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
+const labels = {needs: "Needs you", later: "Later", fleet: "Fleet", jobs: "Jobs & apps", job: "Job", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
   blocked: "Blocked on a prompt", waiting: "Waiting for you", working: "Working", parked: "Parked", background: "Background", other: "Other"};
 let model = null, signedIn = false, busy = false, refreshing = null, generation = 0;
 let view = "needs", selected = null;
@@ -116,7 +116,59 @@ function age(seconds) {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 function when(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "Time unknown"; }
+function jobDue(ts, now = Date.now() / 1000) {
+  const seconds = ts - now;
+  if (seconds <= 0) {
+    if (seconds > -60) return "now";
+    const ago = -seconds;
+    const duration = ago < 3600 ? `${Math.floor(ago / 60)}m` : ago < 86400 ? `${Math.floor(ago / 3600)}h` : `${Math.floor(ago / 86400)}d`;
+    return "overdue by " + duration;
+  }
+  if (seconds < 3600) return `in ${Math.ceil(seconds / 60)}m`;
+  const due = new Date(ts * 1000), today = new Date(now * 1000), tomorrow = new Date(now * 1000);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const clock = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`;
+  if (due.toDateString() === today.toDateString()) return "at " + clock;
+  if (due.toDateString() === tomorrow.toDateString()) return "tomorrow " + clock;
+  return due.toLocaleDateString(undefined, {month: "short", day: "numeric",
+    ...(due.getFullYear() !== today.getFullYear() ? {year: "numeric"} : {weekday: "short"})}) + " at " + clock;
+}
 function sessionURL(s, host) { return "#session?" + new URLSearchParams({sid: s.sid, host: host || "local"}); }
+function jobURL(name, host) { return "#job?" + new URLSearchParams({job: name, host}); }
+function jobState(job) { return job.failing ? "Failing" : job.running ? "Running" : job.expired ? "Expired" : job.state || "Idle"; }
+function jobsView() {
+  const fragment = document.createDocumentFragment();
+  for (const [host, entry] of Object.entries(model.jobs || {})) {
+    const box = node("section", null, "machine");
+    box.append(node("h2", host === "local" ? model.machine || host : host));
+    if (!entry.ok) box.append(node("p", `Unavailable: ${entry.error || "No answer"}. Showing last seen rows.`, "notice"));
+    for (const job of entry.jobs || []) {
+      const card = node("article", null, "session " + (job.failing ? "warning" : job.running ? "working" : "other"));
+      const head = node("header"), link = node("a", job.name);
+      link.href = jobURL(job.name, host);
+      head.append(link, node("span", jobState(job), "state"));
+      card.append(head, node("p", job.purpose || "", "words"), node("p", job.schedule || "No schedule", "meta"));
+      if (job.next_run) {
+        const due = jobDue(job.next_run, model.now);
+        card.append(node("p", (due.startsWith("overdue") ? "" : "Due ") + due + " (estimated)", "meta"));
+      }
+      if (job.last_exit !== null && job.last_exit !== undefined) card.append(node("p", "Last exit: " + job.last_exit, "meta"));
+      if (entry.ok) card.append(button("Run now", () => lever("atc_run_job", {host, job: job.name})));
+      box.append(card);
+    }
+    if (entry.apps_error) box.append(node("p", `Apps unavailable: ${entry.apps_error}. Showing last seen apps.`, "notice"));
+    for (const app of entry.apps || []) {
+      const card = node("article", null, "session");
+      card.append(node("h3", "App · " + app.name), node("p", `${app.status || "Unknown"} · ${app.health || "Health unknown"}`));
+      if (app.url) card.append(node("p", app.url, "meta"));
+      box.append(card);
+    }
+    if (!(entry.jobs || []).length && !(entry.apps || []).length) box.append(node("p", "No jobs or apps."));
+    fragment.append(box);
+  }
+  if (!fragment.childNodes.length) fragment.append(node("p", "Loom is not available."));
+  return fragment;
+}
 function helpers(s, parent) {
   const list = node("ul", null, "children");
   for (const team of s.teams || []) {
@@ -182,16 +234,18 @@ function fleetView() {
 }
 function needsView() {
   const fragment = document.createDocumentFragment();
-  let laterHeading = false;
+  let laterSection = null;
   for (const item of model.needs || []) {
-    if (item.kind === "later" && !laterHeading) {
-      fragment.append(node("h2", "Later · due within an hour")); laterHeading = true;
+    if (item.kind === "later" && !laterSection) {
+      laterSection = node("section");
+      laterSection.append(node("h2", "Later · due within an hour")); fragment.append(laterSection);
     }
-    const card = node("article", null, "session " + (groups.includes(item.kind) ? item.kind : "other"));
-    const head = node("header"), title = node(item.sid ? "a" : "strong", item.title);
+    const card = node("article", null, "session " + (item.kind === "job" ? "warning" : groups.includes(item.kind) ? item.kind : "other"));
+    const head = node("header"), title = node(item.sid || item.job ? "a" : "strong", item.title);
     if (item.sid) title.href = sessionURL(item, item.host);
+    else if (item.job) title.href = jobURL(item.job, item.host);
     head.append(title);
-    card.append(head, node("p", item.host || model.machine || "Hub", "meta"),
+    card.append(head, node("p", item.host && item.host !== "local" ? item.host : model.machine || "Hub", "meta"),
       node("p", item.detail, "words"), node("p", item.hint, "notice"));
     if (item.kind === "approval") {
       card.append(node("p", `Caller: ${item.caller || "unknown"}${item.client ? " · " + item.client : ""} · Expires ${when(item.expires)}`, "meta"));
@@ -201,7 +255,7 @@ function needsView() {
       }
       card.append(controls);
     }
-    fragment.append(card);
+    (item.kind === "later" ? laterSection : fragment).append(card);
   }
   if (!(model.needs || []).length) fragment.append(node("p", "Nobody needs you. The queue is empty."));
   const upcoming = (model.later || []).filter((item) => item.in !== null && item.in > 3600 && item.in <= 86400);
@@ -260,11 +314,13 @@ function drawModel() {
   const count = model.counts.needs;
   $("needs-count").textContent = count; document.title = `(${count}) atc · ${labels[view] || "Needs you"}`;
   $("read-only").hidden = model.writes;
-  if (view === "session" || view === "account") return;
+  $("jobs-link").hidden = !Object.keys(model.jobs || {}).length;
+  if (view === "session" || view === "job" || view === "account") return;
   const content = $("content"), frag = document.createDocumentFragment();
   if (view === "needs") frag.append(needsView());
   if (view === "later") frag.append(laterView());
   if (view === "fleet") frag.append(fleetView());
+  if (view === "jobs") frag.append(jobsView());
   if (view === "comms") {
     const filter = $("filter").value.toLocaleLowerCase();
     frag.append(comms((model.comms || []).filter((c) => `${c.from} ${c.to}`.toLocaleLowerCase().includes(filter))));
@@ -315,6 +371,13 @@ function drawSession(s) {
   frag.append(node("h2", "Recent messages"), comms(s.messages || []));
   replaceContent($("content"), frag);
 }
+function drawJob(data, target) {
+  const frag = document.createDocumentFragment();
+  $("view-title").textContent = `${target.job} on ${target.host}`;
+  frag.append(node("pre", data.text));
+  if (model.jobs?.[target.host]?.ok) frag.append(button("Run now", () => lever("atc_run_job", target)));
+  replaceContent($("content"), frag);
+}
 async function drawAccount() {
   const data = await api("passkeys");
   if (view !== "account") return;
@@ -335,9 +398,10 @@ async function drawAccount() {
 function navigate() {
   status("");
   const [name, query] = location.hash.slice(1).split("?");
-  view = ["needs", "later", "fleet", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
+  view = ["needs", "later", "fleet", "jobs", "job", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
   const args = new URLSearchParams(query || "");
-  const next = view === "session" ? {session: args.get("sid") || "", host: args.get("host") || "local"} : null;
+  const next = view === "session" ? {session: args.get("sid") || "", host: args.get("host") || "local"} :
+    view === "job" ? {job: args.get("job") || "", host: args.get("host") || "local"} : null;
   if (JSON.stringify(next) !== JSON.stringify(selected)) { $("message").value = ""; $("new-name").value = ""; }
   selected = next; generation++;
   $("view-title").textContent = labels[view];
@@ -363,6 +427,10 @@ function refresh() {
       if (view === "session" && selected) {
         const s = await api("session/" + encodeURIComponent(selected.session) + "?" + new URLSearchParams({host: selected.host}));
         if (current === generation) drawSession(s);
+      } else if (view === "job" && selected) {
+        const target = {...selected};
+        const data = await api("job/" + encodeURIComponent(target.job) + "?" + new URLSearchParams({host: target.host}));
+        if (current === generation) drawJob(data, target);
       } else if (view === "account") await drawAccount();
       $("connection").textContent = model.error ? "Reading failed · showing last snapshot" : "Updated " + new Date().toLocaleTimeString();
       disableActions(busy);

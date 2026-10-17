@@ -139,6 +139,54 @@ def stub_amail(directory):
         json.dump(amail_status(), fh)
 
 
+STUB_LOOM = '''#!/usr/bin/env python3
+import json, os, sys, time
+d = os.path.dirname(os.path.abspath(__file__))
+args = sys.argv[1:]
+with open(os.path.join(d, "calls.log"), "a") as fh:
+    fh.write("loom " + " ".join(args) + "\\n")
+host = "local"
+if args[:1] == ["--host"]:
+    host, args = args[1], args[2:]
+if os.path.exists(os.path.join(d, "loom-delay")):
+    time.sleep(float(open(os.path.join(d, "loom-delay")).read()))
+if os.path.exists(os.path.join(d, "loom-fail-" + host)):
+    print("host unavailable", file=sys.stderr)
+    sys.exit(1)
+if args == ["jobs", "list", "--json"]:
+    print(open(os.path.join(d, "loom-jobs-" + host + ".json")).read())
+elif args == ["list", "--json"]:
+    if os.path.exists(os.path.join(d, "loom-fail-apps")):
+        print("app registry unavailable", file=sys.stderr)
+        sys.exit(1)
+    print(open(os.path.join(d, "loom-apps.json")).read())
+elif args[:2] == ["jobs", "status"]:
+    print(args[2] + " on " + host + "\\nRecent log: fixture job output")
+elif args[:2] == ["jobs", "run"]:
+    print("triggered " + args[2] + " on " + host)
+else:
+    sys.exit(2)
+'''
+
+
+def stub_loom(directory):
+    path = os.path.join(directory, "loom")
+    with open(path, "w") as fh:
+        fh.write(STUB_LOOM)
+    os.chmod(path, 0o755)
+    base = {"kind": "cron", "schedule": "every 300s", "schedule_raw": {"every": 300}, "state": "idle",
+            "running": False, "pid": None, "failing": False, "last_exit": 0, "last_run": iso(60),
+            "egress": None, "expires": None, "expired": False, "purpose": "Fixture job", "log": "/tmp/job.log"}
+    jobs = [dict(base, name="expired", expired=True, state="EXPIRED"), dict(base, name="later", last_run=iso(10)),
+            dict(base, name="crashed", failing=True, last_exit=1, state="failed"),
+            dict(base, name="running", running=True, pid=321, state="running"), dict(base, name="due-next")]
+    for host, rows in (("local", jobs), ("server1", [dict(base, name="remote-failure", failing=True, last_exit=3)])):
+        with open(os.path.join(directory, "loom-jobs-" + host + ".json"), "w") as fh:
+            json.dump(rows, fh)
+    with open(os.path.join(directory, "loom-apps.json"), "w") as fh:
+        json.dump([{"name": "dashboard", "status": "running", "health": "healthy", "url": "https://example.com"}], fh)
+
+
 STUB_ROUTE = '''#!/usr/bin/env python3
 import json, os, sys
 d = os.path.dirname(os.path.abspath(__file__))
@@ -172,6 +220,7 @@ class Fixture:
             raise unittest.SkipTest(f"live-process fixture needs ps: {probe.stderr.strip()}")
         os.makedirs(self.stub)
         stub_amail(self.stub)
+        stub_loom(self.stub)
         for name, body in (("claude", STUB_CLAUDE), ("quotamax", STUB_QUOTAMAX), ("route", STUB_ROUTE)):
             path = os.path.join(self.stub, name)
             with open(path, "w") as fh:
@@ -381,7 +430,8 @@ class Fixture:
         env.update({
             "CLAUDE_CONFIG_DIR": self.claude_home, "ATC_CLAUDE": os.path.join(self.stub, "claude"),
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
-            "ATC_AMAIL": "", "ATC_APPROVAL_WAIT": "0", "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
+            "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "", "ATC_APPROVAL_WAIT": "0",
+            "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
             "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
@@ -427,6 +477,7 @@ class AmailFixture(Fixture):
         super().__init__()
         os.makedirs(self.stub)
         stub_amail(self.stub)
+        stub_loom(self.stub)
         for i, name in enumerate(NAMES):
             cwd = os.path.join(self.work, name)
             os.makedirs(cwd)
@@ -587,7 +638,8 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
         return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,
                 "ROUTE_STATE_DIR": self.state, "ATC_SWARM_HOURS": "6", "PATH": self.stub + os.pathsep + os.environ["PATH"],
                 "ATC_CLAUDE": os.path.join(self.stub, "claude"), "ATC_QUOTAMAX": "", "ATC_HERDR": "", "ATC_HOSTS": "",
-                "ATC_AMAIL": "", "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
+                "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "", "ATC_APPROVAL_WAIT": "0",
+                "ATC_LATER_DIR": os.path.join(self.root, "later.d"),
                 "ATC_TERMINAL": "none", **extra}
 
     def stop(self):

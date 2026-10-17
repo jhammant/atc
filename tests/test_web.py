@@ -227,7 +227,8 @@ class WebHTTP(HTTP, unittest.TestCase):
                             token=TOKEN, background=False, web_origin=origin, peer_secret=peer,
                             web_dir=os.path.join(self.tmp.name, "web"))
         service.model = {"now": time.time(), "machine": "hub", "groups": {g: [] for g in m.GROUP_ORDER},
-                         "hosts": [], "swarms": [], "agents": [], "needs": [], "counts": {}, "comms": [], "closed": []}
+                         "hosts": [], "swarms": [], "agents": [], "needs": [], "jobs": {},
+                         "counts": {"jobs_failing": 0}, "comms": [], "closed": []}
         service.at = time.time()
         return service
 

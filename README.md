@@ -51,7 +51,7 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 | `enter` on a process or server row | Its command, uptime and what started it; on a server's session, an ssh shell there in a new tab |
 | `m` | Type a message into the selected session, as if you typed it there. A busy session queues it |
 | `M` | The same message to every session in the selected session's project folder |
-| `x` `x` | Interrupt the session (Esc). A background session: `claude stop`. An agent process, here or on a server: stop it (SIGTERM, over ssh) |
+| `x` `x` | Interrupt the session (Esc). A background session: `claude stop`. An agent process, here or on a server: stop it (SIGTERM, over ssh). A loom job: run it now |
 | `C` `C` / `F` `F` | Type `/closecode` or `/forkcode` into the session: wrap it up, or split work off |
 | `+` `-` `0` | Raise, lower or reset the swarm cap (`quotamax override`, pinned for 2h by default) |
 | `n` | New task: `route --plan-only` says where it should run (Claude, Codex, Kimi …); `enter` dispatches it in a new tab |
@@ -100,21 +100,22 @@ a detached `atc` tmux session you can attach to from anywhere, including over ss
 
 ### Optional tools
 
-Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`, `ATC_AMAIL`, and `ATC_SSH`
+Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`, `ATC_AMAIL`, `ATC_LOOM`, and `ATC_SSH`
 (e.g. `ssh -J bastion`).
 
 - [quotamax](https://github.com/jhammant/quotamax): quota for every provider, and the swarm cap
 - `route`: picks where a new task should run
 - `amail`: a-mail owner and inbox counts via `amail status --json`; `ATC_AMAIL=` disables it
+- `loom`: jobs and apps via its JSON lists; `ATC_LOOM=` disables it
 - [Herdr](https://herdr.dev): agents in Herdr panes, steered through Herdr. `atc` only talks to a Herdr
   server that is already running and never starts one, because starting it resumes every saved agent.
 
 ### One needs-you queue
 
 The web Needs view, MCP `atc_needs_me`, `--json` (including menu-bar consumers such as Roost), and the terminal
-share `needs`. Blocked sessions from every machine come first, then a-mail approvals, requests, proposals and
-devices awaiting approval, then waiting sessions (newest first across machines), Later items due within an hour,
-then a-mail inbox waiting. Pending lever approvals lead the queue.
+share `needs`. Blocked sessions from every machine come first, then pending lever approvals, a-mail approvals, requests, proposals and
+devices awaiting approval, then failing loom jobs, Later items due within an hour, waiting sessions (newest first
+across machines), and a-mail inbox waiting.
 The terminal keeps its session sections and adds an **a-mail** section after Waiting and a short header note;
 `--once` includes both. Answer session prompts in that session, and a-mail items in **Roost or the a-mail app**.
 
@@ -126,14 +127,16 @@ reading worked and later fails, one **a-mail unreachable** item replaces the cou
 
 `--json` adds these fields without changing existing keys:
 
-- `needs`: ordered items with `kind`, `host` (null on this machine), `sid` (null except for sessions), `title`,
+- `needs`: ordered items with `kind`, `host` (null on this machine, or `local` for loom jobs), `sid` (null except for sessions), `title`,
   `detail`, `since` (seconds in that state; null when unknown), and `hint` (where to answer).
 - Kinds today: `blocked`, `waiting`, `amail_approval`, `amail_request`, `amail_proposal`, `amail_device`,
-  `amail_inbox`, `amail_unreachable`, `approval` and `later`. Consumers should render unknown kinds using their
-  title, detail and hint.
+  `amail_inbox`, `amail_unreachable`, `approval`, `job` (also carries its `job` name) and `later`. Consumers
+  should render unknown kinds using their title, detail and hint.
 - `counts.needs`: number of queue items, including the unreachable note when present. Each nonzero a-mail
   category is one item, with its quantity in the title (`4+` means the inbox has more). `counts.needs_urgent`
-  counts blocked sessions plus a-mail approvals, requests and devices awaiting approval.
+  counts blocked sessions, pending lever approvals, and a-mail approvals, requests and devices awaiting approval.
+  Failing jobs contribute to `counts.needs` and `counts.jobs_failing`, and use an orange warning signal; they
+  do not contribute to `counts.needs_urgent`. Due Later items also count toward `needs`, never `needs_urgent`.
 
 These two counts cover the whole fleet; existing session counts still describe this machine. Sleeping hosts'
 cached items stay in the queue and its counts, with a last-seen hint. A host never seen has only a connection
@@ -181,6 +184,45 @@ or null) and `in` (seconds until due, negative if overdue, or null). Session vie
 mark cached items from unavailable machines as last seen. Due Later items retain their timing and source in
 `needs`; `later_kind` preserves their original kind.
 
+### Loom jobs and apps
+
+When `loom` is on `PATH`, **Jobs & apps** appears after Other agents in the terminal, and **Jobs** appears in the
+web navigation. Set `ATC_LOOM` to a command override (arguments are supported), or to an empty string to disable
+it. Missing loom is silent. Add loom hosts with `ATC_LOOM_HOSTS=server1,server2`; these are separate from atc's
+agent hosts and are reached with `loom --host <host> jobs list --json`. Apps come from local `loom list --json`.
+
+Each host lists failing jobs first, then running jobs, then estimated due times. The terminal shows the nearest
+due job and folds the remaining healthy idle jobs into one line, including an expired count; `p` toggles those
+rows alongside Parked. Select a job and press Enter for status and recent logs. `x x` triggers it now. The web
+Jobs view shows all jobs, links to status, and has **Run now** buttons using the existing preview and confirm
+dialog. MCP `atc_jobs` reads the same list; pass `job` and optionally `host` for status. `atc_run_job` accepts the
+exact `job` name and an optional `host` (default `local`), and supports confirmation, `dry_run`, and the audit log.
+Manual runs are allowed for known expired jobs; expiration excludes them from due estimates.
+`--serve --serve-writes --dry-run` keeps web and MCP runs dry, including confirmed or approved requests.
+
+Lists poll every 60 seconds in background threads under the screen and `--serve`, and on demand with a 60-second
+cache under `atc mcp`. `--json` and `--once` read once. Hosts and the local app list are read concurrently with
+15-second command timeouts. Poll workers are daemon threads, so quitting does not wait for a stalled poll.
+An unavailable job list keeps its last rows, marked as last seen; runs are refused until it answers again.
+App-list failures are reported separately and leave job status and runs available. Status and run commands also
+have a timeout; an uncertain run is never retried.
+
+`jobs` in `--json` and the web model is a map from `local` or a configured loom host to
+`{ok, error, jobs, apps, apps_ok, apps_error}`. `ok` and `error` describe the job list; `apps_ok` and `apps_error`
+describe the local app list (`apps_ok` is null for remote hosts, where apps are not queried). Job fields come
+from loom, plus nullable `next_run` (Unix seconds) and `next_run_iso` (ISO UTC). `counts.jobs_failing`
+counts failed jobs across those hosts, including stale rows; each gets a `kind: job` needs item. `/api/fleet`
+exports only this atc's own loom readings (`jobs_own`), including its configured `ATC_LOOM_HOSTS`.
+Hubs merge peers' jobs into `jobs`, marked with `via` and `via_key` so status and runs reach the owning atc.
+Those merged jobs and their needs items are never re-exported to another peer.
+
+Due times read as `in 12m`, `at 08:05` or `tomorrow 01:30` in the terminal, MCP list and web view; JSON keeps machine
+timestamps. Clock times use the reading machine's timezone for terminal/MCP and the browser's timezone for web.
+These are estimates: intervals use loom's last-log-write timestamp plus the interval, one-shot schedules use
+their timestamp, and calendar schedules use the reading machine's timezone. Expired, running and already-run
+one-shot jobs have no due estimate. Unknown schedules or intervals with no last run remain idle. Check loom's
+status for scheduler details, especially when machines use different timezones.
+
 ## Talk to it from Claude (MCP)
 
 `atc mcp` is an [MCP](https://modelcontextprotocol.io) server, and `atc --serve` answers MCP at `POST /mcp` too.
@@ -198,6 +240,8 @@ claude mcp add --transport http --scope user atc https://atc.example.ts.net/mcp 
 | `atc_fleet` | Every session by state (blocked, waiting, working, parked, background, other), swarms, other agents, servers | `atc --once` |
 | `atc_needs_me` | The ordered needs-you queue on every machine, including a-mail counts and where to answer | Needs you |
 | `atc_later` | Wake-ups, next cron runs and plug-in items, ordered by time across machines | Later |
+| `atc_jobs` | Loom jobs and apps, per host; optional job status and recent log | Jobs & apps / Enter |
+| `atc_run_job` | Trigger a known loom job now, with confirmation and audit | `x x` on a job |
 | `atc_session` | One session: folder, state, what it is doing and said, git, helpers and workflow phases, worker processes, recent steps | `enter`, the bottom panel |
 | `atc_tree` | Session › workflow › phase › agent › worker process | `atc --tree`, `h` |
 | `atc_comms` | Messages between sessions, tasks to helpers and their reports, swarm a-mail; newest first | `atc --comms`, `c` |
@@ -494,6 +538,7 @@ straight to the agents working on it. [Try the schema in the Taxi playground](ht
 
 ```bash
 python3 -m unittest discover -s tests -v    # needs tmux
+node --test tests/test_web_ui.js           # browser polling, rendering and confirmation paths
 ATC_TEST_PLAYGROUND=1 python3 -m unittest discover -s tests -p test_taxi.py   # the Taxi schema, online
 ```
 
@@ -514,6 +559,11 @@ Web tests build P-256 keys and WebAuthn registration/sign-in vectors with OpenSS
 signature failures, cookie and CSRF boundaries, and route calls between two in-process HTTP services.
 These run without live processes; only the real-pane web tests need the live fixture. Cryptographic
 round trips skip with a reason when OpenSSL is missing.
+
+Loom tests use a stub CLI with local and remote jobs, a failed job, a running job, an expired job and an app.
+They cover caching, missing loom, independent job/app failures, timeouts, shutdown during stalled polls, readable
+due times, needs ordering, text/JSON output, status, MCP and web confirmation/approval/dry-run/audit paths, and
+screen controls. They never trigger real loom jobs.
 
 If keys ever seem ignored, `ATC_DEBUG_LOG=/tmp/atc.log atc` logs every refresh and every pass of the screen
 loop with how long it took and which keys arrived.

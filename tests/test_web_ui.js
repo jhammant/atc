@@ -10,28 +10,34 @@ const source = readFileSync(join(__dirname, "../web/app.js"), "utf8");
 function element(tag = "div") {
   const listeners = new Map();
   return {tag, textContent: "", childNodes: [], hidden: false, value: "", dataset: {},
-    classList: {toggle() {}},
-    addEventListener(name, fn) { listeners.set(name, fn); },
-    fire(name) { return listeners.get(name)?.(); }, querySelectorAll: () => [],
+    classList: {toggle() {}}, addEventListener(type, fn) { listeners.set(type, fn); }, querySelectorAll: () => [],
+    fire(type) { return listeners.get(type)?.(); }, closest() { return null; },
+    hasAttribute(name) { return name === "data-lever" && Boolean(this.dataset.lever); },
+    showModal() { this.open = true; },
     append(...children) { this.childNodes.push(...children); },
     replaceChildren(...children) { this.childNodes = children; }};
 }
-function page(fetch, credentials = {}) {
+function page(fetch, credentials = {}, hash = "") {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
   };
   get("connection").textContent = "Connecting…";
-  const document = {hidden: false, getElementById: get, querySelectorAll: () => [], addEventListener() {},
+  const document = {hidden: false, getElementById: get,
+    querySelectorAll: (selector) => selector === "button" ? [...elements.values()].flatMap(descendants).filter((n) => n.tag === "button") : [],
+    addEventListener() {},
     createElement: element, createDocumentFragment: () => element("fragment")};
   let tick;
-  const context = vm.createContext({document, fetch, URLSearchParams, location: {hash: ""},
+  const location = {hash};
+  const context = vm.createContext({document, fetch, URLSearchParams, location,
     navigator: {credentials}, atob, btoa,
     window: {addEventListener() {}, isSecureContext: true, PublicKeyCredential: function () {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
   vm.runInContext(source, context);
   return {get, document, tick: () => tick(), settled: () => vm.runInContext("refreshing", context),
-    navigate(hash) { context.location.hash = hash; vm.runInContext("navigate()", context); }};
+    navigate(hash) { location.hash = hash; vm.runInContext("navigate()", context); },
+    confirm(accepted) { const dialog = get("confirm-dialog"); dialog.returnValue = accepted ? "confirm" : "cancel";
+      dialog.open = false; dialog.fire("close"); }};
 }
 function response(status, body) {
   return {ok: status === 200, status, json: async () => body};
@@ -122,6 +128,133 @@ test("Needs you names the hub and an unavailable host once, retaining specific e
   for (const notice of notices) assert.equal(queued.filter((n) => n.textContent === notice).length, 1);
   assert.equal(p.get("needs-count").textContent, 2);
   assert.match(p.get("connection").textContent, /^Updated /);
+});
+
+function jobsModel() {
+  return {...model(), jobs: {
+    local: {ok: true, error: null, jobs: [
+      {name: "failed", failing: true, state: "failed", last_exit: 1, purpose: "<script>job output</script>"},
+      {name: "working", running: true, state: "running"},
+      {name: "due-next", next_run: 1900000000, schedule: "every 300s"},
+      {name: "expired", expired: true, state: "EXPIRED"},
+    ], apps: [{name: "dashboard", status: "running", health: "healthy", url: "https://example.com"}]},
+    server1: {ok: false, error: "jobs: host unavailable", jobs: [{name: "remote-failure", failing: true}], apps: []},
+  }};
+}
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test("Jobs view renders per host in model order, treats content as text, and labels expired and stale rows", async () => {
+  const p = page(async () => response(200, jobsModel()), {}, "#jobs");
+  await p.settled();
+  const content = descendants(p.get("content"));
+  assert.equal(p.get("jobs-link").hidden, false);
+  assert.deepEqual(content.filter((n) => n.tag === "a").map((n) => n.textContent),
+    ["failed", "working", "due-next", "expired", "remote-failure"]);
+  assert.deepEqual(content.filter((n) => n.tag === "h2").map((n) => n.textContent), ["hub", "server1"]);
+  assert.ok(content.some((n) => n.textContent === "<script>job output</script>" && n.tag === "p"));
+  assert.ok(content.some((n) => n.textContent === "Expired"));
+  assert.ok(content.some((n) => n.textContent === "App · dashboard"));
+  assert.ok(content.some((n) => n.textContent.includes("(estimated)")));
+  assert.ok(content.some((n) => n.textContent.includes("Unavailable: jobs: host unavailable")));
+  assert.equal(content.filter((n) => n.tag === "button").length, 4); // stale remote cannot run
+  assert.equal(content.filter((n) => n.tag === "article" && n.className === "session warning").length, 2);
+  assert.ok(!content.some((n) => n.className === "session blocked"));
+});
+
+test("Jobs view renders relative, same-day and tomorrow due times without exposing ISO timestamps", async () => {
+  const timestamp = (day, hour, minute) => new Date(2026, 9, day, hour, minute).getTime() / 1000;
+  const data = model();
+  data.now = timestamp(17, 7, 0);
+  data.jobs = {local: {ok: true, jobs: [
+    {name: "soon", next_run: timestamp(17, 7, 12)},
+    {name: "today", next_run: timestamp(17, 8, 5)},
+    {name: "tomorrow", next_run: timestamp(18, 1, 30)},
+    {name: "late", next_run: timestamp(17, 6, 48)},
+  ].map((job) => ({...job, next_run_iso: new Date(job.next_run * 1000).toISOString()}))}};
+  const p = page(async () => response(200, data), {}, "#jobs");
+
+  await p.settled();
+  const text = descendants(p.get("content")).map((n) => n.textContent).join("\n");
+
+  for (const due of ["Due in 12m", "Due at 08:05", "Due tomorrow 01:30", "overdue by 12m"]) {
+    assert.ok(text.includes(due + " (estimated)"), text);
+  }
+  assert.ok(!text.includes("2026-10-"));
+});
+
+test("an app-list failure leaves job status links and Run buttons available", async () => {
+  const data = jobsModel();
+  data.jobs.local.apps_ok = false;
+  data.jobs.local.apps_error = "apps: app registry unavailable";
+  const p = page(async () => response(200, data), {}, "#jobs");
+
+  await p.settled();
+  const content = descendants(p.get("content"));
+
+  assert.ok(content.some((n) => n.textContent.includes("Apps unavailable: apps: app registry unavailable")));
+  assert.ok(content.some((n) => n.tag === "a" && n.href === "#job?job=failed&host=local"));
+  assert.equal(content.filter((n) => n.tag === "button" && !n.disabled).length, 4);
+  assert.ok(content.some((n) => n.textContent === "App · dashboard"));
+});
+
+test("Run now previews, cancels without mutation, and only executes after the existing confirm dialog", async () => {
+  const calls = [], data = jobsModel();
+  data.jobs.server1.ok = true; data.jobs.server1.error = null;
+  const p = page(async (path, options) => {
+    if (path === "/api/web/model") return response(200, data);
+    const args = JSON.parse(options.body).arguments;
+    calls.push({path, args});
+    return response(200, {ok: true, text: args.dry_run ? "run job remote-failure now on server1" : "triggered remote-failure on server1"});
+  }, {}, "#jobs");
+  await p.settled();
+  const run = () => descendants(p.get("content")).filter((n) => n.tag === "button").at(-1).fire("click");
+  let pending = run();
+  await flush();
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], {path: "/api/web/tools/atc_run_job", args: {host: "server1", job: "remote-failure", dry_run: true}});
+  assert.equal(p.get("confirm-dialog").open, true);
+  assert.match(p.get("confirm-summary").textContent, /remote-failure.*server1/);
+  p.confirm(false);
+  await pending; await p.settled();
+  assert.equal(calls.length, 1);
+  assert.match(p.get("result").textContent, /Cancelled/);
+  pending = run();
+  await flush();
+  assert.equal(calls.length, 2);
+  p.confirm(true);
+  await pending; await p.settled();
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[2].args, {host: "server1", job: "remote-failure", dry_run: false});
+  assert.match(p.get("result").textContent, /triggered remote-failure on server1/);
+});
+
+test("failing needs items open job status, reads show log as text, and read-only jobs disable Run", async () => {
+  const data = jobsModel();
+  data.writes = false;
+  data.needs = [{kind: "job", host: "local", job: "failed", title: "failed", detail: "Last exit 1", hint: "Open Jobs"}];
+  data.counts.needs = 1;
+  const calls = [];
+  const p = page(async (path) => {
+    calls.push(path);
+    return response(200, path === "/api/web/model" ? data : {text: "Recent log: <script>untrusted</script>"});
+  });
+  await p.settled();
+  const link = descendants(p.get("content")).find((n) => n.tag === "a");
+  assert.equal(link.href, "#job?job=failed&host=local");
+  assert.equal(descendants(p.get("content")).find((n) => n.tag === "article").className, "session warning");
+  p.navigate(link.href);
+  await p.settled();
+  const content = descendants(p.get("content"));
+  assert.ok(calls.includes("/api/web/job/failed?host=local"));
+  assert.ok(content.some((n) => n.tag === "pre" && n.textContent === "Recent log: <script>untrusted</script>"));
+  assert.equal(content.find((n) => n.tag === "button").disabled, true);
+  assert.equal(p.get("session-actions").hidden, true);
+});
+
+test("missing loom hides the Jobs navigation entry", async () => {
+  const p = page(async () => response(200, model()));
+  await p.settled();
+  assert.equal(p.get("jobs-link").hidden, true);
 });
 
 function approvalItem(host = null) {
@@ -269,4 +402,38 @@ test("Later's empty view keeps remote plug-in failures visible", async () => {
   const nodes = descendants(p.get("content"));
   assert.ok(nodes.some((n) => n.textContent === "Nothing scheduled for later."));
   assert.ok(nodes.some((n) => n.textContent === "laptop: Later plug-in cards failed; skipped."));
+});
+
+test("Jobs and Later coexist in navigation and keep their needs cards separate", async () => {
+  const data = jobsModel();
+  const later = {kind: "reminder", title: "Review notes", source: "notes", when: 1800000600, in: 600, host: null, sid: null};
+  data.later = [later];
+  data.needs = [
+    {kind: "job", job: "crashed", title: "crashed", host: "local", sid: null, detail: "failing", hint: "Open Jobs"},
+    {...later, kind: "later", detail: "Check notes", hint: "Due soon"},
+    {kind: "waiting", title: "beta", sid: "beta-22", host: null, detail: "Done", hint: "Continue"},
+  ];
+  data.counts.needs = 3;
+  const p = page(async () => response(200, data));
+  await p.settled();
+
+  let nodes = descendants(p.get("content"));
+  assert.equal(p.get("jobs-link").hidden, false);
+  assert.deepEqual(nodes.filter((n) => n.tag === "a" || n.tag === "strong").map((n) => n.textContent),
+    ["crashed", "Review notes", "beta"]);
+  assert.match(nodes.find((n) => n.textContent === "crashed").href, /^#job\?/);
+  const due = nodes.find((n) => n.tag === "section" && n.childNodes.some((c) => c.textContent === "Later · due within an hour"));
+  assert.ok(due);
+  assert.equal(descendants(due).some((n) => n.textContent === "beta"), false);
+  p.navigate("#jobs");
+  await p.settled();
+  assert.equal(p.get("view-title").textContent, "Jobs & apps");
+  assert.ok(descendants(p.get("content")).some((n) => n.textContent === "Run now"));
+  p.navigate("#later");
+  await p.settled();
+  assert.equal(p.get("view-title").textContent, "Later");
+  assert.ok(descendants(p.get("content")).some((n) => n.textContent === "Review notes"));
+  const html = readFileSync(join(__dirname, "../web/index.html"), "utf8");
+  assert.match(html, /href="#jobs"[^>]*data-view="jobs"/);
+  assert.match(html, /href="#later"[^>]*data-view="later"/);
 });
