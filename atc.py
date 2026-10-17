@@ -31,6 +31,7 @@ import argparse
 import base64
 import collections
 import curses
+import fcntl
 import hashlib
 import hmac
 import itertools
@@ -51,6 +52,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import tempfile
 import time
 import unicodedata
 import urllib.error
@@ -58,6 +60,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie, CookieError
 
 CLAUDE_HOME = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 SESSIONS_DIR = os.path.join(CLAUDE_HOME, "sessions")
@@ -1342,6 +1345,7 @@ class Remote:
             "age": now - self.ok_at if self.ok_at else None, "latency": self.latency,
             "counts": data.get("counts", {}), "groups": data.get("groups", {}), "agents": data.get("agents", []),
             "machine": data.get("machine"),
+            "swarms": data.get("swarms", []),
         }
 
 
@@ -1361,12 +1365,31 @@ class RemoteAtc(Remote):
                 data = json.loads(r.read())
         except (OSError, ValueError) as exc:
             self.error = f"its atc doesn't answer ({getattr(exc, 'reason', None) or exc})"
+            self.every = 30.0
             return
         if not isinstance(data, dict):
             self.error = "its atc sent something odd"
+            self.every = 30.0
             return
         self.data, self.error, self.ok_at, self.latency = data, None, time.time(), time.time() - start
         self.host = str(data.get("machine") or self.host).split(".")[0]  # its own name, not its address
+        self.every = 5.0
+
+    def tool(self, name, arguments, token, caller=None):
+        if not token:
+            return False, "HTTP levers need ATC_PEER_TOKEN or ~/.config/atc/peer-token on both atc instances"
+        req = urllib.request.Request(self.url + "/api/peer/tools/" + name,
+                                     data=json.dumps({"arguments": arguments, "caller": caller}).encode(),
+                                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                result = json.loads(response.read())
+            return result.get("ok") is True, str(result.get("text") or "")
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return False, f"{self.host} refused the peer call (HTTP {exc.code}); check its peer secret and --serve-writes"
+        except (OSError, ValueError, AttributeError):
+            return False, f"{self.host} stopped answering; the call may have run. Check the session before trying again."
 
 
 # ---------------------------------------------------------------- the fleet
@@ -2136,18 +2159,423 @@ def serve_token(create):
         return token
 
 
+# ---------------------------------------------------------------- browser identity (WebAuthn, ES256 only)
+
+WEB_FILES = {"/": ("index.html", "text/html; charset=utf-8"),
+             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+             "/app.css": ("app.css", "text/css; charset=utf-8")}
+WEB_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+           "img-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+WEB_BODY_LIMIT = 262144
+
+
+class WebError(Exception):
+    def __init__(self, text, status=400):
+        self.status = status
+        super().__init__(text)
+
+
+def b64url(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def unb64url(value, limit=65536):
+    if not isinstance(value, str) or len(value) > limit * 2 or not re.fullmatch(r"[A-Za-z0-9_-]*", value):
+        raise WebError("Invalid base64url data")
+    try:
+        data = base64.b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True)
+    except ValueError:
+        raise WebError("Invalid base64url data") from None
+    if len(data) > limit or b64url(data) != value:
+        raise WebError("Invalid base64url data")
+    return data
+
+
+def private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise WebError("Web identity directory must be a real directory")
+    os.chmod(path, 0o700)
+
+
+def private_read(path, default=None):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return default
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        if os.fstat(fh.fileno()).st_mode & 0o777 != 0o600:
+            raise WebError("Identity and peer files must have mode 0600")
+        return json.load(fh)
+
+
+def private_write(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def web_directory():
+    return os.path.expanduser("~/.config/atc/web")
+
+
+def web_enroll(directory=None, is_tty=None, now=None):
+    """Mint a single-use bootstrap code only from a terminal. Store only its digest, for ten minutes."""
+    if not (is_tty or sys.stdin.isatty)():
+        raise WebError("web-enroll needs a terminal on the hub (stdin must be a TTY)")
+    directory = directory or web_directory()
+    private_dir(directory)
+    code = secrets.token_urlsafe(24)
+    path = os.path.join(directory, "enroll.json")
+    with web_file_lock(directory):
+        private_write(path, {"hash": hashlib.sha256(code.encode()).hexdigest(),
+                             "expires": (time.time() if now is None else now) + 600})
+    audit({"transport": "web", "caller": "hub terminal", "tool": "web-enroll", "outcome": "issued"})
+    return code
+
+
+def web_file_lock(directory):
+    fd = os.open(os.path.join(directory, "identity.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    fh = os.fdopen(fd, "r+")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh  # closing the file releases the lock, including on exceptions
+
+
+def peer_token():
+    token = os.environ.get("ATC_PEER_TOKEN")
+    if token:
+        return token
+    path = os.path.expanduser("~/.config/atc/peer-token")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        if os.fstat(fh.fileno()).st_mode & 0o777 != 0o600:
+            raise WebError("~/.config/atc/peer-token must have mode 0600")
+        return fh.read().strip() or None
+
+
+def cbor_read(data, offset=0):
+    """The bounded, definite-length CBOR subset used by none attestation and COSE EC2 keys."""
+    if not isinstance(data, bytes) or len(data) > 65536:
+        raise WebError("Invalid CBOR size")
+    budget = [512]
+
+    def read(pos, depth):
+        budget[0] -= 1
+        if depth > 8 or budget[0] < 0 or pos >= len(data):
+            raise WebError("Invalid or excessive CBOR")
+        head, pos = data[pos], pos + 1
+        major, small = head >> 5, head & 31
+        if small < 24:
+            size = small
+        elif small in (24, 25, 26, 27):
+            width = 1 << (small - 24)
+            if pos + width > len(data):
+                raise WebError("Truncated CBOR")
+            size, pos = int.from_bytes(data[pos:pos + width], "big"), pos + width
+        else:
+            raise WebError("Indefinite CBOR is not supported")
+        if major in (0, 1):
+            return (size if major == 0 else -1 - size), pos
+        if major in (2, 3):
+            if size > 65536 or pos + size > len(data):
+                raise WebError("Truncated CBOR string")
+            raw, pos = data[pos:pos + size], pos + size
+            try:
+                return (raw if major == 2 else raw.decode("utf-8")), pos
+            except UnicodeError:
+                raise WebError("Invalid CBOR text") from None
+        if major in (4, 5):
+            if size > 128:
+                raise WebError("Excessive CBOR collection")
+            items = [] if major == 4 else {}
+            for _ in range(size):
+                key, pos = read(pos, depth + 1)
+                if major == 4:
+                    items.append(key)
+                else:
+                    if type(key) not in (str, int, bytes) or key in items:
+                        raise WebError("Invalid or duplicate CBOR key")
+                    value, pos = read(pos, depth + 1)
+                    items[key] = value
+            return items, pos
+        if major == 7 and small in (20, 21, 22):
+            return {20: False, 21: True, 22: None}[small], pos
+        raise WebError("Unsupported CBOR value")
+
+    return read(offset, 0)
+
+
+def openssl_run(args, data=None):
+    exe = shutil.which("openssl")
+    if not exe:
+        raise WebError("Passkeys need openssl on the hub; sign-in is unavailable", 503)
+    try:
+        return subprocess.run([exe] + args, input=data, capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        raise WebError("openssl could not verify the passkey", 503) from None
+
+
+def cose_pem(key):
+    if not isinstance(key, dict) or key.get(1) != 2 or key.get(3) != -7 or key.get(-1) != 1:
+        raise WebError("Only ES256 P-256 passkeys are supported")
+    x, y = key.get(-2), key.get(-3)
+    if not isinstance(x, bytes) or not isinstance(y, bytes) or len(x) != 32 or len(y) != 32:
+        raise WebError("Invalid P-256 public key")
+    # SubjectPublicKeyInfo: id-ecPublicKey, prime256v1, uncompressed point. OpenSSL checks the curve.
+    der = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004") + x + y
+    pem = "-----BEGIN PUBLIC KEY-----\n" + "\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)) + "\n-----END PUBLIC KEY-----\n"
+    checked = openssl_run(["ec", "-pubin", "-check", "-noout"], pem.encode())
+    if checked.returncode:
+        raise WebError("Invalid P-256 public key")
+    return pem
+
+
+class WebAuth:
+    """Single-owner passkeys on disk; challenges and twelve-hour sessions only in this process."""
+
+    def __init__(self, origin, directory=None):
+        parsed = urllib.parse.urlsplit(origin)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path or parsed.query or parsed.fragment or origin != "https://" + parsed.netloc
+                or parsed.hostname != parsed.hostname.lower() or any(c.isspace() for c in origin)):
+            raise WebError("--web-origin must be an HTTPS origin, e.g. https://atc.example.com (no path)")
+        try:
+            parsed.port
+        except ValueError:
+            raise WebError("Invalid --web-origin port") from None
+        self.origin, self.rp = origin, parsed.hostname
+        self.directory = directory or web_directory()
+        private_dir(self.directory)
+        self.path = os.path.join(self.directory, "passkeys.json")
+        self.lock = threading.RLock()
+        self.challenges, self.sessions = {}, {}
+        with web_file_lock(self.directory):
+            self.data = private_read(self.path)
+            if self.data is None:
+                self.data = {"rp": self.rp, "user": b64url(secrets.token_bytes(32)), "keys": {}}
+                private_write(self.path, self.data)
+            if self.data.get("rp") != self.rp:
+                raise WebError("Stored passkeys belong to a different RP hostname")
+
+    def prune(self):
+        now = time.time()
+        self.challenges = {k: v for k, v in self.challenges.items() if v["expires"] > now}
+        self.sessions = {k: v for k, v in self.sessions.items() if v["expires"] > now
+                         and v["id"] in self.data["keys"]}
+
+    def identity(self, cookie):
+        with self.lock:
+            self.prune()
+            jar = SimpleCookie()
+            try:
+                jar.load(cookie or "")
+                token = jar["atc_session"].value if "atc_session" in jar else ""
+            except CookieError:
+                return None
+            session = self.sessions.get(token)
+            if not session:
+                return None
+            return dict(session, token=token, name=self.data["keys"][session["id"]]["name"])
+
+    def issue(self, kind, **bound):
+        self.prune()
+        if len(self.challenges) >= 1024:
+            raise WebError("Too many sign-in attempts; try again shortly", 429)
+        challenge = b64url(secrets.token_bytes(32))
+        self.challenges[challenge] = dict(bound, kind=kind, expires=time.time() + 120)
+        return challenge
+
+    def consume_code(self, code):
+        if not isinstance(code, str) or len(code) > 200:
+            raise WebError("Enter the code from atc web-enroll", 401)
+        with web_file_lock(self.directory):
+            path = os.path.join(self.directory, "enroll.json")
+            saved = private_read(path, {})
+            digest = hashlib.sha256(code.encode()).hexdigest()
+            if saved.get("expires", 0) <= time.time() or not hmac.compare_digest(digest, saved.get("hash", "")):
+                raise WebError("Enrollment code is invalid or expired; run atc web-enroll on the hub", 401)
+            os.unlink(path)
+
+    def begin(self, kind, body, identity=None):
+        with self.lock:
+            if kind == "register":
+                name = body.get("name")
+                if not isinstance(name, str) or not name.strip() or len(name) > 80 or any(ord(c) < 32 for c in name):
+                    raise WebError("Give this passkey a name (1–80 characters)")
+                if not identity:
+                    self.consume_code(body.get("code"))
+                challenge = self.issue(kind, name=name.strip(), session=identity["token"] if identity else None)
+                return {"challenge": challenge, "rp": {"id": self.rp, "name": "atc"},
+                        "user": {"id": self.data["user"], "name": "owner", "displayName": "atc owner"},
+                        "pubKeyCredParams": [{"type": "public-key", "alg": -7}], "timeout": 120000,
+                        "attestation": "none", "authenticatorSelection": {
+                            "userVerification": "required", "residentKey": "preferred"},
+                        "excludeCredentials": [{"type": "public-key", "id": k} for k in self.data["keys"]]}
+            return {"challenge": self.issue(kind), "rpId": self.rp, "timeout": 120000,
+                    "userVerification": "required",
+                    "allowCredentials": [{"type": "public-key", "id": k} for k in self.data["keys"]]}
+
+    def client_data(self, body, kind, identity):
+        # The separate challenge field lets a malformed response consume its challenge too.
+        challenge = body.get("challenge")
+        pending = self.challenges.pop(challenge, None) if isinstance(challenge, str) else None
+        if not pending or pending["kind"] != kind or pending["expires"] <= time.time():
+            raise WebError("Challenge is expired, reused or unknown")
+        if pending.get("session") and (not identity or pending["session"] != identity["token"]):
+            raise WebError("Sign in again before adding a passkey", 401)
+        response = body.get("response")
+        if not isinstance(response, dict) or body.get("type") != "public-key":
+            raise WebError("Invalid passkey response")
+        raw = unb64url(response.get("clientDataJSON"))
+        try:
+            data = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise WebError("Invalid client data") from None
+        if not isinstance(data, dict) or data.get("type") != "webauthn." + ("create" if kind == "register" else "get"):
+            raise WebError("Wrong client data type")
+        if data.get("origin") != self.origin or data.get("crossOrigin", False) is not False or data.get("topOrigin"):
+            raise WebError("Wrong passkey origin")
+        if data.get("challenge") != challenge:
+            raise WebError("Wrong passkey challenge")
+        cid = body.get("id")
+        if not unb64url(cid, 1024):
+            raise WebError("Missing credential id")
+        if body.get("rawId", cid) != cid:
+            raise WebError("Credential ids differ")
+        return pending, response, raw, cid
+
+    def auth_data(self, raw, registering=False):
+        if len(raw) < 37 or raw[:32] != hashlib.sha256(self.rp.encode()).digest():
+            raise WebError("Wrong RP ID hash")
+        flags = raw[32]
+        if flags & 5 != 5:
+            raise WebError("Passkey must verify user presence and user verification (UP and UV)")
+        if flags & 16 and not flags & 8:
+            raise WebError("Invalid passkey backup flags")
+        if bool(flags & 64) != registering:
+            raise WebError("Invalid attested credential flag")
+        return int.from_bytes(raw[33:37], "big")
+
+    @staticmethod
+    def extensions(raw, offset):
+        if raw[32] & 128:
+            value, offset = cbor_read(raw, offset)
+            if not isinstance(value, dict):
+                raise WebError("Invalid authenticator extensions")
+        if offset != len(raw):
+            raise WebError("Unexpected authenticator data")
+
+    def finish(self, kind, body, identity=None):
+        with self.lock:
+            self.prune()
+            pending, response, client, cid = self.client_data(body, kind, identity)
+            if kind == "register":
+                raw = unb64url(response.get("attestationObject"))
+                att, end = cbor_read(raw)
+                if end != len(raw) or not isinstance(att, dict) or att.get("fmt") != "none" or att.get("attStmt") != {}:
+                    raise WebError("Only none attestation is supported")
+                auth = att.get("authData")
+                if not isinstance(auth, bytes):
+                    raise WebError("Missing authenticator data")
+                count = self.auth_data(auth, True)
+                if len(auth) < 55:
+                    raise WebError("Truncated attested credential")
+                length = int.from_bytes(auth[53:55], "big")
+                if not 1 <= length <= 1024 or 55 + length > len(auth) or b64url(auth[55:55 + length]) != cid:
+                    raise WebError("Wrong attested credential id")
+                key, offset = cbor_read(auth, 55 + length)
+                self.extensions(auth, offset)
+                pem = cose_pem(key)
+                if cid in self.data["keys"]:
+                    raise WebError("This passkey is already enrolled")
+                entry = {"id": cid, "name": pending["name"], "pem": pem, "sign_count": count,
+                         "created": iso(time.time()), "last_used": None}
+            else:
+                entry = self.data["keys"].get(cid)
+                if entry is None:
+                    raise WebError("Unknown passkey", 401)
+                auth = unb64url(response.get("authenticatorData"))
+                count = self.auth_data(auth)
+                self.extensions(auth, 37)
+                handle = response.get("userHandle")
+                if handle is not None and handle != self.data["user"]:
+                    raise WebError("Wrong passkey user")
+                if (count or entry["sign_count"]) and count <= entry["sign_count"]:
+                    raise WebError("Passkey sign count did not increase")
+                sig = unb64url(response.get("signature"), 128)
+                with tempfile.TemporaryDirectory(prefix="atc-verify-") as tmp:
+                    pub, signature = os.path.join(tmp, "pub.pem"), os.path.join(tmp, "sig")
+                    for path, data in ((pub, entry["pem"].encode()), (signature, sig)):
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "wb") as fh:
+                            fh.write(data)
+                    checked = openssl_run(["dgst", "-sha256", "-verify", pub, "-signature", signature],
+                                          auth + hashlib.sha256(client).digest())
+                if checked.returncode:
+                    raise WebError("Bad passkey signature", 401)
+                entry = dict(entry, sign_count=count, last_used=iso(time.time()))
+            updated = dict(self.data, keys=dict(self.data["keys"], **{cid: entry}))
+            private_write(self.path, updated)
+            self.data = updated
+            self.prune()
+            token = b64url(secrets.token_bytes(32))
+            self.sessions[token] = {"id": cid, "expires": time.time() + 12 * 3600}
+            audit({"transport": "web", "caller": entry["name"], "tool": kind, "outcome": "done"})
+            return token
+
+    def list_keys(self):
+        with self.lock:
+            return [{k: entry[k] for k in ("id", "name", "created", "last_used")} for entry in self.data["keys"].values()]
+
+    def remove(self, cid, confirm_last, identity):
+        with self.lock:
+            if not isinstance(cid, str) or cid not in self.data["keys"]:
+                raise WebError("No such passkey", 404)
+            if len(self.data["keys"]) == 1 and confirm_last is not True:
+                raise WebError("Removing the last passkey needs confirmation; enrollment will need a new hub code", 409)
+            keys = dict(self.data["keys"])
+            removed = keys.pop(cid)
+            updated = dict(self.data, keys=keys)
+            private_write(self.path, updated)
+            self.data = updated
+            self.prune()
+            audit({"transport": "web", "caller": identity["name"], "tool": "remove_passkey",
+                   "passkey": removed["name"], "outcome": "done"})
+
+    @staticmethod
+    def cookie(token, max_age=43200):
+        return f"atc_session={token}; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict; Path=/"
+
+
 class Service:
     """What `atc --serve` serves: the same fleet the screen shows, refreshed in the background, as JSON for Taxi
     and as MCP at /mcp. With `prefer` (another atc's URL), /mcp is passed through to that atc while it answers,
     and answered here when it doesn't: an always-on server standing in for a Mac that sleeps."""
 
     def __init__(self, fleet, quota, remotes, terminals, writes=False, token=None, background=True,
-                 claude_cmd=None, route_cmd=None, prefer=None):
+                 claude_cmd=None, route_cmd=None, prefer=None, web_origin=None, web_dir=None, peer_secret=None):
         self.fleet, self.quota, self.remotes, self.terminals = fleet, quota, remotes, terminals
         self.writes, self.token = writes, token
         self.model, self.at, self.error = None, 0.0, None
         self.cockpit = Cockpit(fleet, quota, remotes, terminals, claude_cmd or ["claude"], route_cmd, service=self)
         self.mcp = McpServer(self.cockpit, "http", levers=writes)
+        self.web = WebAuth(web_origin, web_dir) if web_origin else None
+        self.peer_secret = peer_secret if peer_secret is not None else peer_token()
+        if token and self.peer_secret and hmac.compare_digest(token.encode(), self.peer_secret.encode()):
+            raise WebError("The peer secret must differ from the bearer token")
+        self.web_tools = McpServer(self.cockpit, "web", levers=writes)
+        self.peer_tools = McpServer(self.cockpit, "peer", levers=writes)
         self.prefer = prefer.rstrip("/") if prefer else None
         self.prefer_name = url_host(self.prefer) if prefer else None   # until its atc says its own name
         self.prefer_ok, self.prefer_checked, self.prefer_down_since = False, 0.0, None
@@ -2244,8 +2672,41 @@ class Service:
         if path == "/api/taxi/quota":
             return 200, taxi_quota(self.quota)
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
-            return 200, {key: model.get(key) for key in ("machine", "counts", "groups", "agents")}
+            return 200, {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
         return 404, {"detail": "not found"}
+
+    def web_model(self):
+        model = self.cockpit.model()
+        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts")}
+        result.update(closed=model.get("closed", [])[:50], comms=list(reversed(model.get("comms", [])[-200:])),
+                      quota=taxi_quota(self.quota), quota_text=tool_quota(self.cockpit, {}, Call()),
+                      writes=self.writes, refreshed_at=iso(self.at), error=self.error)
+        # Some readers use sets internally. The web contract contains only JSON values.
+        return json.loads(json.dumps(result, default=lambda x: list(x) if isinstance(x, set) else str(x)))
+
+    def run_tool(self, transport, name, body, caller):
+        if not isinstance(body.get("arguments", {}), dict) or not isinstance(name, str):
+            raise WebError("arguments must be an object")
+        args = body.get("arguments", {})
+        tool = TOOLS.get(name)
+        if tool is None:
+            raise WebError("No such tool", 404)
+        schema = tool["spec"]["inputSchema"]
+        for key in schema["required"]:
+            if key not in args:
+                raise WebError(f"Missing argument: {key}")
+        types = {"string": str, "boolean": bool, "integer": int}
+        for key, value in args.items():
+            spec = schema["properties"].get(key)
+            if spec is None or type(value) is not types.get(spec["type"]):
+                raise WebError(f"Invalid argument: {key}")
+        server = self.web_tools if transport == "web" else self.peer_tools
+        try:
+            result = server.call_tool({"name": name, "arguments": args},
+                                      {"modern": True, "caps": {}, "client": None}, caller)
+        except BadParams as exc:
+            raise WebError(str(exc)) from None
+        return {"ok": not result.get("isError"), "text": result["content"][0]["text"]}
 
     def post(self, path, body):
         """(status, body) for a POST (a write)."""
@@ -2290,6 +2751,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", WEB_CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
         for name, value in (extra or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -2299,6 +2764,20 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(405, {"detail": "MCP is POST /mcp"}, extra={"Allow": "POST"})
 
     def do_GET(self):
+        raw_path = self.path.split("?", 1)[0]
+        if raw_path in WEB_FILES:
+            if not self.server.service.web and raw_path == "/":
+                return self.reply(200, "<!doctype html><title>atc</title><p>The web UI is off. Start atc --serve with "
+                                  "--web-origin https://atc.example.com behind a TLS proxy on a private network.</p>",
+                                  "text/html; charset=utf-8")
+            filename, ctype = WEB_FILES[raw_path]
+            try:
+                with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "web", filename), "rb") as fh:
+                    return self.reply(200, fh.read(), ctype)
+            except OSError:
+                return self.reply(404, {"detail": "web/ must be next to atc.py"})
+        if raw_path.startswith("/api/web/"):
+            return self.web_request(raw_path)
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/mcp":  # no server-sent stream to open: every MCP message is its own POST
             return self.reply(405, {"detail": "MCP is POST /mcp"}, extra={"Allow": "POST"})
@@ -2314,6 +2793,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path.startswith("/api/web/"):
+            return self.web_request(path, post=True)
+        if path.startswith("/api/peer/tools/"):
+            return self.peer_request(path)
         if path == "/mcp":
             return self.mcp()
         if not self.server.service.writes:
@@ -2327,6 +2810,93 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self.reply(400, {"detail": "body must be JSON"})
         self.reply(*self.server.service.post(path, body if isinstance(body, dict) else {}))
+
+    def json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= WEB_BODY_LIMIT or self.headers.get("Transfer-Encoding"):
+                raise WebError("Send a JSON body of at most 256 KiB", 413)
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict):
+                raise WebError("body must be a JSON object")
+            return body
+        except (ValueError, UnicodeError):
+            raise WebError("body must be JSON") from None
+
+    def peer_request(self, path):
+        service = self.server.service
+        if not service.peer_secret or not service.writes:
+            return self.reply(404, {"detail": "not found"})
+        sent = self.headers.get("Authorization", "")
+        if not hmac.compare_digest(sent.encode(), f"Bearer {service.peer_secret}".encode()):
+            return self.reply(401, {"detail": "a peer secret is required"})
+        try:
+            body = self.json_body()
+            caller = body.get("caller")
+            if caller is not None and (not isinstance(caller, str) or len(caller) > 200):
+                raise WebError("Invalid caller")
+            return self.reply(200, service.run_tool("peer", path.rsplit("/", 1)[1], body, caller))
+        except WebError as exc:
+            return self.reply(exc.status, {"ok": False, "text": str(exc)})
+
+    def web_request(self, path, post=False):
+        service, extra = self.server.service, {}
+        web = service.web
+        if web is None:
+            return self.reply(404, {"detail": "not found"})
+        identity = web.identity(self.headers.get("Cookie"))
+        auth = re.fullmatch(r"/api/web/auth/(register|login)/(options|finish)", path) if post else None
+        if not identity and not auth:
+            return self.reply(401, {"detail": "Sign in with a passkey"})
+        if post and (self.headers.get("X-Atc-Web") != "1" or self.headers.get("Origin") != web.origin):
+            return self.reply(403, {"detail": "The web Origin and X-Atc-Web: 1 are required"})
+        try:
+            if post:
+                body = self.json_body()
+                if auth:
+                    kind, stage = auth.groups()
+                    if stage == "options":
+                        result = web.begin(kind, body, identity)
+                    else:
+                        token = web.finish(kind, body, identity)
+                        if identity:
+                            with web.lock:
+                                web.sessions.pop(identity["token"], None)
+                        extra["Set-Cookie"] = web.cookie(token)
+                        result = {"ok": True}
+                elif path == "/api/web/signout":
+                    with web.lock:
+                        web.sessions.pop(identity["token"], None)
+                    extra["Set-Cookie"] = web.cookie("", 0)
+                    result = {"ok": True}
+                elif path == "/api/web/passkeys/remove":
+                    web.remove(body.get("id"), body.get("confirm_last"), identity)
+                    result = {"ok": True}
+                elif path.startswith("/api/web/tools/"):
+                    result = service.run_tool("web", path.rsplit("/", 1)[1], body, identity["name"])
+                else:
+                    raise WebError("not found", 404)
+            elif path == "/api/web/model":
+                result = service.web_model()
+            elif path == "/api/web/passkeys":
+                result = {"passkeys": web.list_keys(), "name": identity["name"]}
+            elif path.startswith("/api/web/session/"):
+                sid = urllib.parse.unquote(path[len("/api/web/session/"):])
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                result = session_data(service.cockpit, {"session": sid, "host": query.get("host", ["local"])[0]})
+            else:
+                raise WebError("not found", 404)
+            return self.reply(200, result, extra=extra)
+        except (WebError, ToolError) as exc:
+            if auth:
+                audit({"transport": "web", "caller": identity["name"] if identity else "unsigned",
+                       "tool": auth.group(1), "outcome": "refused", "detail": str(exc)})
+            elif post and path == "/api/web/passkeys/remove":
+                audit({"transport": "web", "caller": identity["name"], "tool": "remove_passkey",
+                       "outcome": "refused", "detail": str(exc)})
+            return self.reply(getattr(exc, "status", 400), {"ok": False, "text": str(exc)})
+        except (OSError, ValueError):
+            return self.reply(503, {"ok": False, "text": "Web identity storage is unavailable; check the hub"})
 
     def mcp(self):
         """POST /mcp: one JSON-RPC message. The token is required even from this machine, since a reverse proxy in
@@ -2625,7 +3195,24 @@ def on_server(ck, h, name, arguments, summary, call, confirm=True):
         seen = f"; last seen {human_age(view['age'])} ago" if view.get("age") is not None else ""
         raise ToolError(f"{h} isn't answering ({clean(view.get('error') or 'no answer')}){seen}: its sessions can't be "
                         "steered until it is back")
-    return Lever(summary, lambda: remote_tool(h, name, dict(arguments, dry_run=call.dry_run)), confirm)
+    remote = next((r for r in ck.remotes if r.host == h and isinstance(r, RemoteAtc)), None)
+    args = dict(arguments, dry_run=call.dry_run, allow_self=call.allow_self)
+    if remote:
+        token = ck.service.peer_secret if ck.service else peer_token()
+        if not token:
+            raise ToolError("HTTP levers need a separate peer secret on both atc instances")
+        if call.transport in ("web", "peer") and call.dry_run:
+            ok, preview = remote.tool(name, dict(args, dry_run=True), token, call.caller)
+            if not ok:
+                raise ToolError(preview)
+            summary = f"On {h}: {preview}"
+        return Lever(summary, lambda: remote.tool(name, args, token, call.caller), confirm)
+    if call.transport == "web" and call.dry_run:
+        ok, preview = remote_tool(h, name, args)
+        if not ok:
+            raise ToolError(preview)
+        summary += "\n" + preview
+    return Lever(summary, lambda: remote_tool(h, name, args), confirm)
 
 
 def done(result, *prefixes):
@@ -2775,6 +3362,28 @@ def tool_needs_me(ck, a, call):
     return "\n".join(out + down)
 
 
+def session_data(ck, a):
+    """Structured detail shared by the browser and atc_session; remote detail uses its last fleet snapshot."""
+    model = ck.model()
+    h, v = find_session(model, a.get("session"), a.get("host"))
+    result = dict(v, host=h or "local", last_words=v.get("said") or "", steps=[], messages=[])
+    if h:
+        host = next(x for x in model.get("hosts", []) if x["host"] == h)
+        result.update(remote=True, ok=host["ok"], age=host.get("age"), error=host.get("error"))
+        return result
+    session = ck.fleet.sessions.get(v["sid"])
+    if session is not None:
+        result["last_words"] = session.last_text_full or result["last_words"]
+        limit = max(1, min(200, int(a.get("steps") or 20)))
+        mine = [item for item in list(ck.fleet.activity)
+                if item[1] is session or getattr(item[1], "owner", None) is session]
+        result["steps"] = [{"ts": ts, "agent": getattr(agent, "label", None) or getattr(agent, "name", ""),
+                            "tool": tool, "detail": detail} for ts, agent, tool, detail in reversed(mine[-limit:])]
+    result["messages"] = list(reversed([c for c in model.get("comms", [])
+                                       if v["name"] in (c["from"], c["to"])][-8:]))
+    return result
+
+
 @mcp_tool("atc_session", "One session", "One session in detail: folder, state, what it is doing and last said, git "
           "state, its helpers and workflow phases, worker processes, recent steps and recent messages.",
           {"session": SESSION_ARG, "host": HOST_ARG,
@@ -2782,7 +3391,8 @@ def tool_needs_me(ck, a, call):
           required=("session",))
 def tool_session(ck, a, call):
     model = ck.model()
-    h, v = find_session(model, a.get("session"), a.get("host"))
+    v = session_data(ck, a)
+    h = v["host"] if v["host"] != "local" else None
     now = model["now"]
     if h:
         out = [session_ref(v, h), f"folder   {v.get('cwd')}", f"title    {clean(v.get('title')) or '-'}",
@@ -2795,9 +3405,8 @@ def tool_session(ck, a, call):
     steps = max(1, min(200, int(a.get("steps") or 20)))
     out = [plain(line) for line in detail_lines(ck.fleet, v, steps + 12)]
     out[0] = session_ref(v) + "  " + out[0]
-    s = ck.fleet.sessions.get(v["sid"])
-    if s is not None and s.last_text_full and len(s.last_text_full) > len(v.get("said") or ""):
-        out.insert(4, "said (in full):\n" + textwrap.indent(s.last_text_full[:4000], "    "))
+    if len(v["last_words"]) > len(v.get("said") or ""):
+        out.insert(4, "said (in full):\n" + textwrap.indent(v["last_words"][:4000], "    "))
     sub = session_text(v, now)[1:]
     if sub:
         out += ["", "helpers, workflows and workers"] + sub
@@ -3002,6 +3611,9 @@ def tool_stop_process(ck, a, call):
     up = human_age(proc.get("age", etime_seconds(proc.get("etime", "0"))))
     summary = (f"stop {proc.get('tool') or 'process'} pid {pid}{' on ' + host if host else ''} (up {up}): "
                f"{clean(proc.get('command'))[:160]}")
+    if host and (call.transport in ("web", "peer") or any(
+            isinstance(r, RemoteAtc) and r.host == host for r in ck.remotes)):
+        return on_server(ck, host, "atc_stop_process", {"pid": pid}, summary, call)
     return Lever(summary, lambda: done(stop_process(host, pid, call.dry_run), "stopped", f"pid {pid} had already"))
 
 
@@ -3144,6 +3756,9 @@ def tool_new_task(ck, a, call):
 def tool_jump(ck, a, call):
     h, v = find_session(ck.model(), a.get("session"), a.get("host"))
     if h:
+        if call.transport in ("web", "peer") or any(isinstance(r, RemoteAtc) and r.host == h for r in ck.remotes):
+            return on_server(ck, h, "atc_jump", {"session": v["sid"]},
+                             f"bring {session_ref(v, h)}'s tab to the front on that machine", call, confirm=False)
         command = remote_shell_command(h, v.get("cwd"))
         return Lever(f"open an ssh shell on {h} in {v.get('cwd') or '~'}",
                      lambda: done(open_tab(HOME, command, call.dry_run), "opened", "started"), confirm=False)
@@ -3183,7 +3798,7 @@ class McpServer:
 
     def __init__(self, cockpit, transport, levers=True, caller=None, attended=True, ask=None):
         self.cockpit, self.transport = cockpit, transport
-        self.policy = "auto" if transport == "ssh" else lever_policy()   # ssh: asked about on the machine that sent it
+        self.policy = "auto" if transport in ("ssh", "web", "peer") else lever_policy()  # confirmed upstream
         self.levers = levers and self.policy != "off"
         self.caller, self.attended, self.ask = caller, attended, ask
         self.legacy = None                  # stdio, after `initialize`: the version, capabilities and client
@@ -3276,6 +3891,8 @@ class McpServer:
         if tool is None:
             raise BadParams(f"no tool {name!r}; tools/list has them")
         if tool["lever"] and not self.levers:
+            if self.transport in ("web", "peer"):
+                self.record(name, args, ctx, caller, "refused", LEVERS_OFF)
             return text_result(LEVERS_OFF, True)
         call = Call(caller, bool(args.get("dry_run")), bool(args.get("allow_self")), self.transport)
         try:
@@ -3289,6 +3906,9 @@ class McpServer:
         if not tool["lever"]:
             return text_result(self.cockpit.notice() + outcome)
         lever = outcome
+        if call.dry_run and self.transport in ("web", "peer"):
+            self.record(name, args, ctx, caller, "dry run", lever.summary)
+            return text_result(lever.summary)
         if lever.confirm and not call.dry_run and self.policy == "confirm":
             answer = self.confirmation(name, args, ctx, caller, lever, params)
             if isinstance(answer, dict):
@@ -4784,6 +5404,14 @@ def tui(stdscr, app):
 
 
 def main():
+    if sys.argv[1:] == ["web-enroll"]:
+        try:
+            code = web_enroll()
+        except (WebError, OSError) as exc:
+            print(f"atc: {exc}", file=sys.stderr)
+            return 1
+        print("One-time enrollment code (expires in 10 minutes):\n" + code)
+        return 0
     if sys.argv[1:2] == ["mcp"]:
         return mcp_main(sys.argv[2:])
     if sys.argv[1:2] == ["mcp-call"] and len(sys.argv) == 3:
@@ -4814,7 +5442,11 @@ def main():
     parser.add_argument("--serve-prefer", metavar="URL",
                         help="with --serve: pass /mcp through to the atc at URL while it answers (a Mac that sleeps), "
                              "and answer here when it doesn't")
+    parser.add_argument("--web-origin", metavar="HTTPS_ORIGIN",
+                        help="with --serve: enable the passkey web UI behind TLS at this exact origin")
     args = parser.parse_args()
+    if args.web_origin and not args.serve:
+        parser.error("--web-origin needs --serve")
 
     only = os.path.abspath(os.path.expanduser(args.only)) if args.only else (os.getcwd() if args.here else None)
     quota_cmd = command_from_env("ATC_QUOTAMAX", "quotamax")
@@ -4898,8 +5530,10 @@ def main():
         if args.serve_prefer:  # keep the preferred atc's machine on show, as last seen once it sleeps
             remotes.append(RemoteAtc(args.serve_prefer, token))
         service = Service(fleet, quota, remotes, Terminals(args.dry_run), writes=args.serve_writes, token=token,
-                          claude_cmd=claude_cmd, route_cmd=route_cmd, prefer=args.serve_prefer)
+                          claude_cmd=claude_cmd, route_cmd=route_cmd, prefer=args.serve_prefer,
+                          web_origin=args.web_origin)
         server = make_server(service, address)
+        address = f"{server.server_address[0]}:{server.server_address[1]}"
         reads = "open on this machine" if server.open_reads else "token required"
         writes = "on, token required" if args.serve_writes else "off (--serve-writes)"
         print(f"atc: serving http://{address}  reads: {reads} · writes: {writes} · MCP: /mcp (token) · "
@@ -4926,4 +5560,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

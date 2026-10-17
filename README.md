@@ -179,6 +179,80 @@ atc speaks protocol `2026-07-28` (stateless; `server/discover`; confirmation by 
 the handshake revisions `2025-11-25`, `2025-06-18` and `2025-03-26` (`initialize`; confirmation as an
 `elicitation/create` request over stdio). Results are plain text, written for a model to read.
 
+## Web interface
+
+Keep an always-on hub behind a TLS reverse proxy on a **private network**, for example a tailnet-only
+hostname. Install `openssl` on the hub and keep `web/` next to `atc.py`. There is no build step or CDN.
+
+```bash
+atc --serve 127.0.0.1:7070 --serve-writes --web-origin https://atc.example.com
+```
+
+Point the proxy at that listener and preserve the browser's `Origin` header. `--web-origin` is the exact
+HTTPS origin, with no trailing slash or path; its hostname is the WebAuthn RP ID. Without it, `/` explains
+that the web UI is off and `/api/web/*` returns 404. Omit `--serve-writes` for a read-only dashboard.
+
+On the hub, in an interactive terminal, run:
+
+```bash
+atc web-enroll
+```
+
+Open the HTTPS page, choose **Add your first passkey**, and enter the code and a passkey name. The code is
+single use and expires after ten minutes; starting enrollment consumes it, even if you cancel the browser
+prompt. Run the command again if needed. Stdin must be a TTY. Face ID, Touch ID or another authenticator
+must verify you. Once signed in, the **Passkeys** view adds further passkeys without a code, removes them,
+and signs out. Removing the last passkey requires explicit confirmation; recovery uses a new hub code.
+Removing a passkey revokes its web sessions. Restarting atc signs every browser out.
+
+**Needs you** comes first: prompts to answer in their own sessions, finished sessions waiting for you, and
+machines that aren't answering with their last snapshot. Its count includes each live blocked/waiting
+session and each unreachable machine. **Fleet** groups sessions, helpers, workflow phases, workers, route
+swarms and other processes by machine. Open a session for its full last words, git state, recent steps and
+messages. Remote session detail uses its fleet snapshot, so it has less detail. **Comms**, **Quota** (including
+swarm cap controls), and **Closed** (including Restore) cover the hub's messages, quota and closed sessions.
+The page refreshes every five seconds while visible, works on phones, and follows the system color scheme.
+
+Message, Interrupt, Save & close, Exit, Fork, Rename, Jump, Restore and swarm cap changes first run a dry
+run. The page shows the tool's own summary and runs it only after you confirm. Existing refusals still
+apply, including blocked prompts and unsaved work. Jump focuses the terminal on the session's machine;
+it does not turn the browser into a terminal. Save & close sends `/closecode`, whose session workflow can
+commit and push work before closing.
+
+### Identity and peer calls
+
+The machine bearer token protects MCP and machine reads. It is **never accepted as web authentication**.
+Web tools and data require an in-memory, twelve-hour session from a passkey. The cookie is HttpOnly, Secure
+and SameSite=Strict. Every web POST also checks the configured Origin and `X-Atc-Web: 1`. Only the dedicated
+`/api/web/auth/{register,login}/{options,finish}` bootstrap endpoints allow unsigned requests; registration
+still needs a hub enrollment code or an existing web session. WebAuthn challenges expire after two minutes
+and can be used once. Only ES256/P-256 keys are accepted, with user presence and verification required.
+OpenSSL verifies signatures; if it is missing, sign-in fails closed. Passkeys, hashed enrollment codes and
+identity files live in `~/.config/atc/web/` (0700 directory, 0600 files). Cookies are never stored on disk or
+written to the audit log. Sign-in, enrollment, passkey removal and web levers are audited with the passkey
+name. Session text is rendered as text, under a policy that allows only same-origin assets and no inline scripts.
+
+To steer a laptop through its HTTP atc, configure **the same separate peer secret on both atc instances**:
+`ATC_PEER_TOKEN` or `~/.config/atc/peer-token` (0600). Provision this secret yourself; atc never creates it.
+It must differ from `ATC_SERVE_TOKEN`. Keep it out of MCP clients and scripts. Both instances need
+`--serve-writes`. For example, the hub can add the laptop through:
+
+```bash
+atc --serve 127.0.0.1:7070 --serve-writes --web-origin https://atc.example.com \
+  --serve-prefer http://100.64.0.1:7070
+```
+
+`--serve-prefer` keeps its existing MCP forwarding behavior. The web UI stays on the hub and sends that
+host's levers to `/api/peer/tools/<tool>` using the peer secret, after confirmation on the hub. SSH hosts
+still use SSH. Peer calls run the same tools and refusals, with transport `peer`, and are audited on both
+sides. A lost response is not retried automatically because the action may already have run. HTTP hosts
+poll every five seconds while reachable and every thirty seconds while offline.
+
+Bearer tokens are for machines, passkeys are for people, and the peer secret is between atc instances.
+The web UI needs HTTPS: WebAuthn requires a secure context and the session cookie is Secure. The backend
+listener may use HTTP behind the TLS proxy, confined to loopback or the private network. This does not
+sandbox processes running as the hub owner; those processes already control that account.
+
 ## Route swarms
 
 Run `route swarm` as usual, then watch it in atc:
@@ -307,6 +381,11 @@ exercise `--json`, `--once`, `--tree`, `--comms` and the TUI, and check that sta
 that require live processes skip with a specific reason if the sandbox denies `ps`; the swarm screen test
 also skips if tmux is unavailable or its socket is denied. Run the full suite outside such a sandbox to verify
 the live-process and steering tests.
+
+Web tests build P-256 keys and WebAuthn registration/sign-in vectors with OpenSSL, exercise replay and
+signature failures, cookie and CSRF boundaries, and route calls between two in-process HTTP services.
+These run without live processes; only the real-pane web tests need the live fixture. Cryptographic
+round trips skip with a reason when OpenSSL is missing.
 
 If keys ever seem ignored, `ATC_DEBUG_LOG=/tmp/atc.log atc` logs every refresh and every pass of the screen
 loop with how long it took and which keys arrived.
