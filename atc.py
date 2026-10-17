@@ -2387,6 +2387,7 @@ AUDIT_LOG = os.path.expanduser("~/.config/atc/audit.jsonl")
 CONFIRM_TTL = 600            # seconds a question about a lever stays answerable
 ASK_TIMEOUT = 600            # stdio, handshake revisions: how long to wait for an answer to elicitation/create
 PREFER_CHECK_EVERY = 5.0     # --serve-prefer: how often to check that the preferred atc answers
+LIST_TTL_MS = 300_000        # 2026-07-28 caching hint on discover and tools/list (private: the list depends on policy)
 GROUP_ORDER = ("blocked", "waiting", "working", "parked", "background", "other")
 GROUP_TITLES = {"blocked": "Blocked on a prompt", "waiting": "Waiting for you", "working": "Working",
                 "parked": "Parked (idle 12h+)", "background": "Background (claude --bg)", "other": "Other"}
@@ -2528,7 +2529,7 @@ def session_ref(v, host=None):
 
 
 def url_host(url):
-    """A short name for the machine at a URL: ghost for ghost.tail1234.ts.net, the whole address for an IP."""
+    """A short name for the machine at a URL: laptop for laptop.tail1234.ts.net, the whole address for an IP."""
     host = urllib.parse.urlsplit(url).hostname or url
     return host if re.match(r"^[\d.]+$|:", host) else host.split(".")[0]
 
@@ -2900,7 +2901,7 @@ def tool_message(ck, a, call):
     not_self(call, h, v)
     refuse_blocked(h, v)
     live_only(h, v)
-    summary = f"type into {session_ref(v, h)} in {short_path(v.get('cwd') or '')}: “{squash(text)[:300]}”"
+    summary = f"type “{squash(text)[:300]}” into {session_ref(v, h)}, in {short_path(v.get('cwd') or '')}"
     if h:
         return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call)
 
@@ -2935,8 +2936,8 @@ def tool_broadcast(ck, a, call):
                  and v.get("kind") in ("interactive", "herdr") and v.get("sid") != call.caller]
         if not peers:
             raise ToolError(f"no live session in {folder} on {h['host']}")
-        summary = (f"type into {len(peers)} session(s) in {folder} on {h['host']} "
-                   f"({', '.join(session_ref(v) for v in peers)}): “{squash(text)[:300]}”")
+        summary = (f"type “{squash(text)[:300]}” into {len(peers)} session(s) in {folder} on {h['host']}: "
+                   f"{', '.join(session_ref(v) for v in peers)}")
         return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call)
     folder = os.path.abspath(os.path.expanduser(folder))
     everyone = [v for v in ordered_sessions(model, True) if within(v.get("cwd") or "", folder)
@@ -2945,8 +2946,8 @@ def tool_broadcast(ck, a, call):
     if not targets:
         raise ToolError(f"no live session in {short_path(folder)}" + (" besides the calling one" if everyone else ""))
     blocked = [v for v in targets if v["group"] == "blocked"]
-    summary = (f"type into {len(targets) - len(blocked)} session(s) in {short_path(folder)} "
-               f"({', '.join(session_ref(v) for v in targets if v not in blocked)}): “{squash(text)[:300]}”"
+    summary = (f"type “{squash(text)[:300]}” into {len(targets) - len(blocked)} session(s) in {short_path(folder)}: "
+               f"{', '.join(session_ref(v) for v in targets if v not in blocked)}"
                + (f"; skipping {', '.join(session_ref(v) for v in blocked)} (blocked on a prompt)" if blocked else ""))
     if len(blocked) == len(targets):
         raise ToolError("every session there is blocked on a prompt: " + ", ".join(session_ref(v) for v in blocked))
@@ -3012,7 +3013,7 @@ def slash_lever(ck, a, call, tool, command, summary_verb, check=None, after=None
     live_only(h, v)
     if check:
         check(h, v)
-    summary = f"{summary_verb} {session_ref(v, h)} in {short_path(v.get('cwd') or '')}: types {command}"
+    summary = f"{summary_verb} {session_ref(v, h)} (types {command}), in {short_path(v.get('cwd') or '')}"
     if h:
         return on_server(ck, h, tool, dict({k: a[k] for k in ("how", "name") if a.get(k)}, session=v["sid"]), summary, call)
 
@@ -3240,11 +3241,13 @@ class McpServer:
         try:
             if method == "server/discover":
                 result = {"supportedVersions": MCP_MODERN + MCP_LEGACY, "capabilities": {"tools": {}},
-                          "instructions": MCP_INSTRUCTIONS}
+                          "instructions": MCP_INSTRUCTIONS, "ttlMs": LIST_TTL_MS, "cacheScope": "private"}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
                 result = {"tools": [t["spec"] for t in TOOLS.values() if self.levers or not t["lever"]]}
+                if modern:
+                    result.update(ttlMs=LIST_TTL_MS, cacheScope="private")
             elif method == "tools/call":
                 result = self.call_tool(params, ctx, caller)
             else:

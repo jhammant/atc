@@ -131,7 +131,11 @@ class Stdio(unittest.TestCase):
         self.assertEqual(found["resultType"], "complete")
         self.assertIn(MODERN, found["supportedVersions"])
         self.assertIn("2025-11-25", found["supportedVersions"])
-        tools = {t["name"]: t for t in self.c.request("tools/list")["result"]["tools"]}
+        listed = self.c.request("tools/list")["result"]
+        for result in (found, listed):  # 2026-07-28 requires caching hints on both; Claude Code rejects a list without
+            self.assertGreaterEqual(result["ttlMs"], 0)
+            self.assertIn(result["cacheScope"], ("public", "private"))
+        tools = {t["name"]: t for t in listed["tools"]}
         self.assertEqual(len(tools), 18)
         for name, t in tools.items():
             self.assertEqual(t["inputSchema"]["type"], "object", name)
