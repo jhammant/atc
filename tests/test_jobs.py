@@ -1,4 +1,6 @@
 """Loom's CLI boundary, model, screen controls, MCP and passkey web paths, using only the fixture stub."""
+import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import threading
 import time
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest import mock
 
 import fixture
@@ -69,7 +72,8 @@ class Jobs(unittest.TestCase, HTTP):
         self.assertEqual(model["counts"]["jobs_failing"], 2)
         needs = [n for n in model["needs"] if n["kind"] == "job"]
         self.assertEqual([(n["host"], n["job"]) for n in needs], [("local", "crashed"), ("server1", "remote-failure")])
-        self.assertEqual(model["counts"]["needs_urgent"], 3)
+        self.assertEqual((model["counts"]["needs"], model["counts"]["needs_urgent"]), (4, 1))
+        self.assertEqual(self.m.needs_counts(needs), {"needs": 2, "needs_urgent": 0})
         kinds = [n["kind"] for n in model["needs"]]
         self.assertLess(kinds.index("job"), kinds.index("waiting"))
         self.assertTrue(all(n["sid"] is None and "Open Jobs" in n["hint"] for n in needs))
@@ -260,6 +264,11 @@ print("stalled daemon poll started", flush=True)
             self.assertIn("2 idle jobs (1 expired)", text)
             self.assertLess(text.index("crashed  failing"), text.index("running  running"))
             self.assertLess(text.index("running  running"), text.index("due-next  "))
+            failing = next(line for line, key in rows if key == self.m.job_key("local", "crashed"))
+            self.assertTrue(all(style == "warn" for _, style in failing))
+            notice = next(line for line, key in rows if line[0][0] == "crashed on local")
+            self.assertEqual(notice[0][1], "warn")
+            self.assertIn(("2 failing jobs · ", "warn"), self.m.header_line(model))
             self.assertEqual(len(keys), len(set(keys)))
             key = self.m.job_key("server1", "remote-failure")
             item = self.m.resolve(self.fleet, model, key)
@@ -394,6 +403,11 @@ print("stalled daemon poll started", flush=True)
         needs = self.service.model["needs"]
         self.assertEqual(needs[0]["kind"], "approval")
         self.assertEqual(sum(n["kind"] == "job" for n in needs), 2)
+        for model in (self.service.web_model(), json.loads(self.cli("--json", "--no-hosts"))):
+            self.assertEqual((model["counts"]["needs"], model["counts"]["needs_urgent"]), (5, 2))
+        exported = self.service.get("/api/fleet")[1]
+        self.assertEqual((exported["counts"]["needs"], exported["counts"]["needs_urgent"]), (4, 2))
+        self.fx.clear_calls()
         row = self.fleet.approvals.access()[0]
         self.fleet.approvals.decide(row["id"], "approve", "owner", "terminal")
         params = {"name": "atc_run_job", "arguments": dict(args, approval=row["id"])}
@@ -472,8 +486,44 @@ print("stalled daemon poll started", flush=True)
         self.assertTrue(web["ok"])
         self.assertIn("dry run:", web["text"])
         body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "atc_run_job", "arguments": args}}
-        status, reply, _ = self.request("/mcp", body, headers=headers)
-        self.assertEqual(status, 200)
+        mcp_headers = {**headers, "Origin": None, "X-Atc-Web": None}  # native MCP client, not a browser request
+        status, reply, _ = self.request("/mcp", body, headers=mcp_headers)
+        self.assertEqual(status, 200, reply)
+        self.assertFalse(reply["result"]["isError"])
+        self.assertIn("dry run:", reply["result"]["content"][0]["text"])
+        self.assertNotIn("jobs run", self.fx.calls())
+
+    def test_mcp_job_dry_run_http_rejects_browser_origin(self):
+        service = self.m.Service(self.fleet, None, [], self.m.Terminals(dry_run=True), writes=True,
+                                 token="fixture-token", background=False, peer_secret="")
+        service.refresh()
+        self.url = "http://127.0.0.1:7070"
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "atc_run_job", "arguments": {"host": "server1", "job": "remote-failure", "dry_run": False}}}
+        headers = {"Authorization": "Bearer fixture-token"}
+
+        def dispatch(request, timeout):
+            # Exercise the actual HTTP parser and handler without a listening socket.
+            payload = request.data or b""
+            sent = dict(request.header_items(), **{"Content-Length": str(len(payload))})
+            raw = f"{request.get_method()} {request.selector} HTTP/1.0\r\n"
+            raw += "".join(f"{key}: {value}\r\n" for key, value in sent.items()) + "\r\n"
+            stream, output = mock.Mock(), bytearray()
+            stream.makefile.return_value = io.BytesIO(raw.encode() + payload)
+            stream.sendall.side_effect = output.extend
+            self.m.Handler(stream, ("127.0.0.1", 12345), SimpleNamespace(service=service))
+            stream.makefile.return_value = io.BytesIO(output)
+            response = http.client.HTTPResponse(stream)
+            response.begin()
+            return response
+
+        with mock.patch("urllib.request.urlopen", side_effect=dispatch), mock.patch.dict(os.environ, ATC_MCP_ORIGINS=""):
+            status, reply, _ = self.request("/mcp", body, headers=headers)
+            self.assertEqual(status, 403)
+            self.assertIn("Origin " + ORIGIN + " is not allowed", reply["error"]["message"])
+            status, reply, _ = self.request("/mcp", body, headers={**headers, "Origin": None, "X-Atc-Web": None})
+
+        self.assertEqual(status, 200, reply)
         self.assertFalse(reply["result"]["isError"])
         self.assertIn("dry run:", reply["result"]["content"][0]["text"])
         self.assertNotIn("jobs run", self.fx.calls())

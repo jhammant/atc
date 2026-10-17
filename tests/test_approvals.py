@@ -23,7 +23,8 @@ class ApprovalCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="atc-approvals-")
         self.addCleanup(self.tmp.cleanup)
         env = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "ATC_PEER_TOKEN": "",
-                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": "", "ATC_APPROVAL_WAIT": "0"})
+                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": "", "ATC_APPROVAL_WAIT": "0",
+                                          "ATC_LOOM": "", "ATC_LOOM_HOSTS": ""})
         env.start()
         self.addCleanup(env.stop)
         self.m = load_atc({})

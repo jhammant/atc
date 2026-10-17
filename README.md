@@ -133,7 +133,9 @@ reading worked and later fails, one **a-mail unreachable** item replaces the cou
   scheduled wake-ups and reminders. Consumers should render unknown kinds using their title, detail and hint.
 - `counts.needs`: number of queue items, including the unreachable note when present. Each nonzero a-mail
   category is one item, with its quantity in the title (`4+` means the inbox has more). `counts.needs_urgent`
-  counts blocked sessions, failing jobs, and a-mail approvals, requests and devices awaiting approval.
+  counts blocked sessions, pending lever approvals, and a-mail approvals, requests and devices awaiting approval.
+  Failing jobs contribute to `counts.needs` and `counts.jobs_failing`, and use an orange warning signal; they
+  do not contribute to `counts.needs_urgent`.
 
 These two counts cover the whole fleet; existing session counts still describe this machine. Sleeping hosts'
 cached items stay in the queue and its counts, with a last-seen hint. A host never seen has only a connection

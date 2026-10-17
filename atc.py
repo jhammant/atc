@@ -1701,7 +1701,7 @@ class RemoteAtc(Remote):
 # Typed needs shared by the screen, web UI, MCP and JSON. `later` is reserved for wake-ups/reminders.
 NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": -1, "amail_request": 2, "amail_proposal": 3,
               "amail_device": 4, "amail_unreachable": 5, "job": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
-URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval", "job"}
+URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval"}
 
 
 def need_item(kind, title, detail="", host=None, sid=None, since=None, hint=""):
@@ -5019,7 +5019,7 @@ def jobs_lines(model, width, expanded=False):
             if not expanded and not job.get("failing") and not job.get("running") and job is not due:
                 idle.append(job)
                 continue
-            style = "err" if job.get("failing") else "busy" if job.get("running") else "dim"
+            style = "warn" if job.get("failing") else "busy" if job.get("running") else "dim"
             out.append(([("  " + clean(job["name"]) + "  ", style), (job_summary(job, model["now"]), style)],
                         job_key(host, job["name"])))
         if idle:
@@ -5069,7 +5069,7 @@ def fleet_lines(model, width, show_all, jobs_all=False):
                                  width, "where to answer"), None))
                 for item in items:
                     host = f" on {item['host']}" if item["host"] else ""
-                    out.append(([(clean(item["title"]) + host, "err" if item["kind"] == "job" else "warn"),
+                    out.append(([(clean(item["title"]) + host, "warn"),
                                  (" · " + clean(item["hint"]), "dim")], None))
             continue
         if key in ("blocked", "waiting"):
@@ -5459,7 +5459,7 @@ def header_line(model):
     if c["blocked"]:
         line.append((f"{c['blocked']} blocked · ", "err"))
     if c.get("jobs_failing"):
-        line.append((f"{c['jobs_failing']} failing jobs · ", "err"))
+        line.append((f"{c['jobs_failing']} failing jobs · ", "warn"))
     mail = [item for item in model.get("needs", []) if item["kind"].startswith("amail_")]
     if mail:
         note = clean(mail[0]["title"]) + (f" +{len(mail) - 1} more" if len(mail) > 1 else "")

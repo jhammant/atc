@@ -157,6 +157,8 @@ test("Jobs view renders per host in model order, treats content as text, and lab
   assert.ok(content.some((n) => n.textContent.includes("(estimated)")));
   assert.ok(content.some((n) => n.textContent.includes("Unavailable: jobs: host unavailable")));
   assert.equal(content.filter((n) => n.tag === "button").length, 4); // stale remote cannot run
+  assert.equal(content.filter((n) => n.tag === "article" && n.className === "session warning").length, 2);
+  assert.ok(!content.some((n) => n.className === "session blocked"));
 });
 
 test("Jobs view renders relative, same-day and tomorrow due times without exposing ISO timestamps", async () => {
@@ -239,6 +241,7 @@ test("failing needs items open job status, reads show log as text, and read-only
   await p.settled();
   const link = descendants(p.get("content")).find((n) => n.tag === "a");
   assert.equal(link.href, "#job?job=failed&host=local");
+  assert.equal(descendants(p.get("content")).find((n) => n.tag === "article").className, "session warning");
   p.navigate(link.href);
   await p.settled();
   const content = descendants(p.get("content"));

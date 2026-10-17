@@ -143,7 +143,7 @@ function jobsView() {
     box.append(node("h2", host === "local" ? model.machine || host : host));
     if (!entry.ok) box.append(node("p", `Unavailable: ${entry.error || "No answer"}. Showing last seen rows.`, "notice"));
     for (const job of entry.jobs || []) {
-      const card = node("article", null, "session " + (job.failing ? "blocked" : job.running ? "working" : "other"));
+      const card = node("article", null, "session " + (job.failing ? "warning" : job.running ? "working" : "other"));
       const head = node("header"), link = node("a", job.name);
       link.href = jobURL(job.name, host);
       head.append(link, node("span", jobState(job), "state"));
@@ -234,7 +234,7 @@ function fleetView() {
 function needsView() {
   const fragment = document.createDocumentFragment();
   for (const item of model.needs || []) {
-    const card = node("article", null, "session " + (item.kind === "job" ? "blocked" : groups.includes(item.kind) ? item.kind : "other"));
+    const card = node("article", null, "session " + (item.kind === "job" ? "warning" : groups.includes(item.kind) ? item.kind : "other"));
     const head = node("header"), title = node(item.sid || item.job ? "a" : "strong", item.title);
     if (item.sid) title.href = sessionURL(item, item.host);
     else if (item.job) title.href = jobURL(item.job, item.host);
