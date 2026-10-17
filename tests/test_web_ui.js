@@ -32,7 +32,7 @@ function response(status, body) {
   return {ok: status === 200, status, json: async () => body};
 }
 function model() {
-  return {machine: "hub", groups: {}, hosts: [], writes: true};
+  return {machine: "hub", groups: {}, hosts: [], needs: [], counts: {needs: 0, needs_urgent: 0}, writes: true};
 }
 function descendants(root) {
   return [root, ...root.childNodes.flatMap(descendants)];
@@ -61,6 +61,7 @@ test("initial network/proxy failures stay visible and retry through sign-in to r
   assert.match(p.get("connection").textContent, /^Updated /);
   assert.equal(p.get("signin").hidden, true);
   assert.equal(p.get("workspace").hidden, false);
+  assert.equal(p.get("needs-count").textContent, 0);
 });
 
 test("retry polling preserves one request in flight and pauses when hidden", async () => {
@@ -76,6 +77,7 @@ test("retry polling preserves one request in flight and pauses when hidden", asy
   assert.equal(calls, 1);
   resolve(response(200, model()));
   await first;
+  assert.match(p.get("connection").textContent, /^Updated /);
   p.document.hidden = true;
   await p.tick();
 
@@ -91,11 +93,28 @@ test("Needs you names the hub and an unavailable host once, retaining specific e
   await p.settled();
   const content = descendants(p.get("content"));
 
-  assert.deepEqual(content.filter((n) => n.tag === "h2").map((n) => n.textContent), ["laptop", "server1"]);
-  assert.deepEqual(content.filter((n) => n.className === "notice").map((n) => n.textContent),
-    ["Not answering. Last seen: 5m ago.", "Connection refused. Last seen: never seen."]);
-  // Needs you omits an empty hub; a waiting session makes its heading visible.
-  data.groups.waiting = [{sid: "beta-22", name: "beta", group: "waiting", said: "Done"}];
+  const notices = ["laptop: Not answering. Last seen: 5m ago.", "server1: Connection refused. Last seen: never seen."];
+  assert.deepEqual(content.filter((n) => n.className === "notice").map((n) => n.textContent), notices);
+  for (const host of ["laptop", "server1"]) {
+    assert.equal(content.map((n) => n.textContent).join("\n").split(host).length - 1, 1);
+  }
+  assert.equal(content.some((n) => n.textContent === "hub"), false);
+  // The ordered queue uses per-item machine labels instead of machine headings.
+  // A cached item must not hide its machine's specific connection error.
+  data.needs = [
+    {kind: "amail_approval", host: "laptop", sid: null, title: "a-mail 2 approvals", detail: "Counts only",
+      since: null, hint: "Answer in Roost or the a-mail app."},
+    {kind: "waiting", host: null, sid: "beta-22", title: "beta", detail: "Done",
+      since: 60, hint: "Continue in that session."},
+  ];
+  data.counts = {needs: 2, needs_urgent: 1};
   await p.tick();
-  assert.equal(descendants(p.get("content")).find((n) => n.tag === "h2").textContent, "hub");
+  const queued = descendants(p.get("content"));
+  assert.deepEqual(queued.filter((n) => n.className === "meta").map((n) => n.textContent), ["laptop", "hub"]);
+  assert.deepEqual(queued.filter((n) => n.tag === "strong" || n.tag === "a").map((n) => n.textContent),
+    ["a-mail 2 approvals", "beta"]);
+  assert.equal(queued.filter((n) => n.textContent === "hub").length, 1);
+  for (const notice of notices) assert.equal(queued.filter((n) => n.textContent === notice).length, 1);
+  assert.equal(p.get("needs-count").textContent, 2);
+  assert.match(p.get("connection").textContent, /^Updated /);
 });

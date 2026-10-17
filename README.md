@@ -240,6 +240,8 @@ Removing a passkey revokes its web sessions. Restarting atc signs every browser 
 
 **Needs you** comes first: the shared queue of prompts, a-mail owner items, waiting sessions and inbox counts,
 including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
+Unavailable machines keep one connection notice with their specific error and last-seen time, even when
+their cached items are in the queue. Each queue item names its machine.
 **Fleet** groups sessions, helpers, workflow phases, workers, route
 swarms and other processes by machine. Open a session for its full last words, git state, recent steps and
 messages. Remote session detail uses its fleet snapshot, so it has less detail. **Comms**, **Quota** (including
