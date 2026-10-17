@@ -113,8 +113,9 @@ Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR
 ### One needs-you queue
 
 The web Needs view, MCP `atc_needs_me`, `--json` (including menu-bar consumers such as Roost), and the terminal
-share `needs`. Blocked sessions from every machine come first, then a-mail approvals, requests, proposals and
-devices awaiting approval, then failing loom jobs, waiting sessions (newest first across machines), and a-mail inbox waiting.
+share `needs`. Blocked sessions from every machine come first, then pending lever approvals, a-mail approvals, requests, proposals and
+devices awaiting approval, then failing loom jobs, Later items due within an hour, waiting sessions (newest first
+across machines), and a-mail inbox waiting.
 The terminal keeps its session sections and adds an **a-mail** section after Waiting and a short header note;
 `--once` includes both. Answer session prompts in that session, and a-mail items in **Roost or the a-mail app**.
 
@@ -129,18 +130,59 @@ reading worked and later fails, one **a-mail unreachable** item replaces the cou
 - `needs`: ordered items with `kind`, `host` (null on this machine, or `local` for loom jobs), `sid` (null except for sessions), `title`,
   `detail`, `since` (seconds in that state; null when unknown), and `hint` (where to answer).
 - Kinds today: `blocked`, `waiting`, `amail_approval`, `amail_request`, `amail_proposal`, `amail_device`,
-  `amail_inbox`, `amail_unreachable`, and `job` (also carries its `job` name). `approval` is reserved for pending lever approvals and `later` for
-  scheduled wake-ups and reminders. Consumers should render unknown kinds using their title, detail and hint.
+  `amail_inbox`, `amail_unreachable`, `approval`, `job` (also carries its `job` name) and `later`. Consumers
+  should render unknown kinds using their title, detail and hint.
 - `counts.needs`: number of queue items, including the unreachable note when present. Each nonzero a-mail
   category is one item, with its quantity in the title (`4+` means the inbox has more). `counts.needs_urgent`
   counts blocked sessions, pending lever approvals, and a-mail approvals, requests and devices awaiting approval.
   Failing jobs contribute to `counts.needs` and `counts.jobs_failing`, and use an orange warning signal; they
-  do not contribute to `counts.needs_urgent`.
+  do not contribute to `counts.needs_urgent`. Due Later items also count toward `needs`, never `needs_urgent`.
 
 These two counts cover the whole fleet; existing session counts still describe this machine. Sleeping hosts'
 cached items stay in the queue and its counts, with a last-seen hint. A host never seen has only a connection
 notice. `/api/fleet` exports only this machine's needs and matching local counts; hubs add each host's
 non-session items, and build its session items from groups, avoiding duplicates and forwarding loops.
+
+### Needs you later
+
+**Later** is one time-ordered list of session wake-ups, next cron runs and items from your own tools, such as
+reminders or study cards. Anything overdue or due within 60 minutes also enters `needs` with kind `later`.
+Undated items sort last and stay out of the needs queue. The terminal's Later section follows Waiting and
+shows the next 24 hours plus overdue items; `p` expands or folds it alongside Parked. Session rows show
+`wakes in 12m`. The web Needs view includes upcoming items, and the **Later** view shows the full list.
+MCP `atc_needs_me` adds a short “Later today” preview (the next 24 hours); `atc_later` reads the full list.
+
+atc reads `ScheduleWakeup`, `CronCreate` and `CronDelete` from live session transcripts, never helpers. A new
+wake-up replaces the previous one; stopping it or transcript activity after its due time removes it. Cron
+expressions have five fields in this machine's local time, with numbers, `*`, lists, ranges and steps. When
+both day-of-month and day-of-week are restricted, either may match. Recurring crons advance to their next
+run; one-shot crons remain due until subsequent transcript activity. All session schedules disappear when
+their session ends. As with other transcript details, startup reads the recent transcript backlog.
+
+Put executables in `~/.config/atc/later.d/`, or set `ATC_LATER_DIR` to another folder (empty disables plug-ins). Each is run directly,
+without a shell, in the background every ten minutes, with a 30-second timeout. It prints a JSON array of
+items with a `title`, `when` (ISO 8601 or null), `detail`, `kind` and `source`. Prefer explicit time zones;
+times without an offset use this machine's local time. For example, save this as `later.d/review`, then
+`chmod +x ~/.config/atc/later.d/review`:
+
+```python
+#!/usr/bin/env python3
+import json
+from datetime import datetime, timedelta, timezone
+due = datetime.now(timezone.utc) + timedelta(hours=2)
+print(json.dumps([dict(title="Review notes", when=due.isoformat(), detail="Study cards", kind="study", source="notes")]))
+```
+
+This example always reports two hours from the poll; a real plug-in should read its tool's stored due time.
+Plug-in output is data: atc never interprets it as commands or actions. A failing plug-in contributes one
+diagnostic in `later_errors` and no items; other plug-ins still work. The diagnostic clears after recovery.
+`--json` and `--once` wait for one reading; MCP reads use the same ten-minute cache on demand.
+
+`later` items have `title`, `detail`, `kind`, `source`, `sid` (or null), `host` (or null), `when` (Unix seconds
+or null) and `in` (seconds until due, negative if overdue, or null). Session views include `wakes_at`.
+`/api/fleet` exports this machine's Later items; hubs merge each host once, set `host`, recalculate `in`, and
+mark cached items from unavailable machines as last seen. Due Later items retain their timing and source in
+`needs`; `later_kind` preserves their original kind.
 
 ### Loom jobs and apps
 
@@ -170,8 +212,9 @@ have a timeout; an uncertain run is never retried.
 describe the local app list (`apps_ok` is null for remote hosts, where apps are not queried). Job fields come
 from loom, plus nullable `next_run` (Unix seconds) and `next_run_iso` (ISO UTC). `counts.jobs_failing`
 counts failed jobs across those hosts, including stale rows; each gets a `kind: job` needs item. `/api/fleet`
-exports only local loom data. Configure `ATC_LOOM_HOSTS` on the atc doing the reading to include other machines;
-loom lists are not merged again from atc agent peers.
+exports only this atc's own loom readings (`jobs_own`), including its configured `ATC_LOOM_HOSTS`.
+Hubs merge peers' jobs into `jobs`, marked with `via` and `via_key` so status and runs reach the owning atc.
+Those merged jobs and their needs items are never re-exported to another peer.
 
 Due times read as `in 12m`, `at 08:05` or `tomorrow 01:30` in the terminal, MCP list and web view; JSON keeps machine
 timestamps. Clock times use the reading machine's timezone for terminal/MCP and the browser's timezone for web.
@@ -196,6 +239,7 @@ claude mcp add --transport http --scope user atc https://atc.example.ts.net/mcp 
 |---|---|---|
 | `atc_fleet` | Every session by state (blocked, waiting, working, parked, background, other), swarms, other agents, servers | `atc --once` |
 | `atc_needs_me` | The ordered needs-you queue on every machine, including a-mail counts and where to answer | Needs you |
+| `atc_later` | Wake-ups, next cron runs and plug-in items, ordered by time across machines | Later |
 | `atc_jobs` | Loom jobs and apps, per host; optional job status and recent log | Jobs & apps / Enter |
 | `atc_run_job` | Trigger a known loom job now, with confirmation and audit | `x x` on a job |
 | `atc_session` | One session: folder, state, what it is doing and said, git, helpers and workflow phases, worker processes, recent steps | `enter`, the bottom panel |

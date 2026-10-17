@@ -92,6 +92,8 @@ WORKER_NAMES = {"codex", "kimi", "claude", "aider", "gemini", "opencode", "goose
                 "hermes"}
 STALE_AGENT_SECONDS = 24 * 3600  # an agent process running longer than this is probably stuck or forgotten
 REMOTE_EVERY = 15.0
+LATER_EVERY = 600.0
+LATER_TIMEOUT = 30.0
 SERVE_POLL = {"feed": 10.0, "procs": 15.0, "remote": 60.0}  # --serve runs all day: poll less than the screen does
 HOSTS_FILE = os.path.expanduser("~/.config/atc/hosts")
 CLOSED_CONFIG = os.path.expanduser("~/.config/atc/closed.json")
@@ -505,6 +507,127 @@ def swarm_view(entry, now, table, sessions, addresses=None):
             "units": units, "held": data.get("held", [])}
 
 
+def cron_fields(expression):
+    """Five numeric cron fields; Sunday is 0 or 7."""
+    if not isinstance(expression, str) or len(expression.split()) != 5:
+        raise ValueError("expected five cron fields")
+    fields = []
+    for field, (low, high) in zip(expression.split(), ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))):
+        values = set()
+        for part in field.split(","):
+            match = re.fullmatch(r"(\*|\d+(?:-\d+)?)(?:/(\d+))?", part)
+            if not match:
+                raise ValueError("invalid cron field")
+            span, step = match.groups()
+            step = int(step or 1)
+            if span == "*":
+                start, end = low, high
+            elif "-" in span:
+                start, end = map(int, span.split("-"))
+            else:
+                start = int(span)
+                end = high if match.group(2) else start
+            if not low <= start <= end <= high or step < 1:
+                raise ValueError("cron field out of range")
+            values.update(range(start, end + 1, step))
+        fields.append(values)
+    fields[4] = {v % 7 for v in fields[4]}
+    return fields
+
+
+def cron_next(expression, after):
+    """First minute strictly after `after`, in local time. Impossible dates return None."""
+    minutes, hours, days, months, weekdays = cron_fields(expression)
+    dom_any, dow_any = (expression.split()[i].startswith("*") for i in (2, 4))
+    day = datetime.fromtimestamp(after).date()
+    for offset in range(8 * 366):  # includes the longest leap-day gap across a non-leap century
+        date = day + timedelta(days=offset)
+        dom, dow = date.day in days, (date.weekday() + 1) % 7 in weekdays
+        matches = (dom and dow) if dom_any or dow_any else (dom or dow)
+        if date.month not in months or not matches:
+            continue
+        candidates = set()
+        for hour in sorted(hours):
+            bases = {time.mktime((date.year, date.month, date.day, hour, 0, 0, -1, -1, dst))
+                     for dst in (-1, 0, 1)}
+            for minute in sorted(minutes):
+                for base in bases:
+                    stamp = base + minute * 60
+                    if stamp > after:
+                        candidates.add(stamp)
+        # Try in time order: most days need one round-trip, even for every-minute crons.
+        # Reject skipped DST minutes; both offsets retain repeated minutes.
+        for stamp in sorted(candidates):
+            local = time.localtime(stamp)
+            if local[:3] == (date.year, date.month, date.day) and local.tm_hour in hours and local.tm_min in minutes:
+                return stamp
+    return None
+
+
+class Later:
+    """Owner plug-ins, polled off the screen thread. Each failure has just one diagnostic."""
+
+    def __init__(self, directory=None, background=True):
+        path = directory if directory is not None else os.environ.get("ATC_LATER_DIR", "~/.config/atc/later.d")
+        self.directory = os.path.abspath(os.path.expanduser(path)) if path else None
+        self.items, self.errors = [], []
+        self.checked = None
+        self.lock = threading.Lock()
+        if background and self.directory:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def fetch(self):
+        if not self.directory:
+            return
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            if self.checked is not None and time.monotonic() - self.checked < LATER_EVERY:
+                return
+            self.checked = time.monotonic()
+            items, errors = [], []
+            try:
+                paths = sorted(os.scandir(self.directory), key=lambda p: p.name)
+            except FileNotFoundError:
+                paths = []
+            except OSError:
+                self.items, self.errors = [], ["Later plug-in folder cannot be read."]
+                return
+            for entry in paths:
+                try:
+                    if not entry.is_file() or not os.access(entry.path, os.X_OK):
+                        continue
+                    proc = subprocess.run([entry.path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL, timeout=LATER_TIMEOUT, check=True)
+                    data = json.loads(proc.stdout)
+                    if not isinstance(data, list):
+                        raise ValueError("expected an array")
+                    parsed = []
+                    for item in data:
+                        if not isinstance(item, dict) or not isinstance(item.get("title"), str) or not item["title"].strip():
+                            raise ValueError("expected a title")
+                        if any(not isinstance(item.get(k, ""), str) for k in ("detail", "kind", "source")):
+                            raise ValueError("expected text fields")
+                        when = item.get("when")
+                        stamp = parse_ts(when) if isinstance(when, str) else None
+                        if when is not None and (stamp is None or not math.isfinite(stamp) or when.isdigit()):
+                            raise ValueError("expected an ISO 8601 time or null")
+                        parsed.append({"title": item["title"], "when": stamp, "detail": item.get("detail", ""),
+                                       "kind": item.get("kind") or "reminder", "source": item.get("source") or entry.name,
+                                       "sid": None, "host": None})
+                    items.extend(parsed)
+                except (OSError, ValueError, OverflowError, subprocess.SubprocessError):
+                    errors.append(f"Later plug-in {clean(entry.name)} failed or returned invalid data; skipped.")
+            self.items, self.errors = items, errors
+        finally:
+            self.lock.release()
+
+    def loop(self):
+        while True:
+            self.fetch()
+            time.sleep(max(0.01, LATER_EVERY - (time.monotonic() - self.checked)))
+
+
 class Agent:
     """One transcript: a top-level session or a helper (a subagent or a workflow agent)."""
 
@@ -532,6 +655,9 @@ class Agent:
         self.amail_received = []
         self.amail_addresses = set()
         self.amail_calls = {}     # tool_use_id -> tool name, kept until its result arrives
+        self.wakeup = None
+        self.crons = {}
+        self.schedule_calls = {}
 
     @property
     def base(self):
@@ -558,6 +684,8 @@ class Agent:
 
     def ingest(self, rec, fleet):
         ts = parse_ts(rec.get("timestamp"))
+        if self.wakeup and ts is not None and ts > self.wakeup["when"]:
+            self.wakeup = None
         if ts:
             self.last_ts = max(self.last_ts or 0.0, ts)
         kind = rec.get("type")
@@ -596,6 +724,8 @@ class Agent:
                 if block.get("id"):
                     self.pending[block["id"]] = ts or time.time()
                 fleet.activity.append((ts or 0.0, self, name, detail))
+                if isinstance(self, Session):
+                    self.ingest_schedule(name, inp, block.get("id"), ts)
                 if name == "SendMessage" and inp.get("message"):
                     self.sent.append({"ts": ts, "to": str(inp.get("to") or ""), "body": str(inp["message"]),
                                       "summary": str(inp.get("summary") or "")})
@@ -624,7 +754,76 @@ class Agent:
                         name = self.amail_calls.pop(tid, None)
                         if name and not block.get("is_error"):
                             self.ingest_amail_result(name, block.get("content"), ts)
+                        scheduled = self.schedule_calls.pop(tid, None)
+                        if scheduled:
+                            self.schedule_result(tid, scheduled, block)
         self.scan_incoming(text_of(content), ts)
+
+    def ingest_schedule(self, name, inp, tid, ts):
+        if name == "ScheduleWakeup":
+            self.wakeup = None  # every new call supersedes the previous wake-up
+            delay = inp.get("delaySeconds")
+            if not inp.get("stop") and ts is not None and type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
+                try:
+                    datetime.fromtimestamp(ts + delay)
+                except (ValueError, OverflowError, OSError):
+                    return
+                self.wakeup = {"when": ts + delay, "title": str(inp.get("reason") or "Scheduled wake-up"),
+                               "detail": str(inp.get("prompt") or ""), "id": tid}
+                if isinstance(tid, str):
+                    self.schedule_calls[tid] = name
+        elif name == "CronCreate" and ts is not None and isinstance(tid, str):
+            try:
+                when = cron_next(inp.get("cron"), ts)
+            except (ValueError, OverflowError, OSError):
+                return
+            self.crons[tid] = {"id": tid, "cron": inp["cron"], "recurring": inp.get("recurring", True) is not False,
+                               "when": when, "title": "Scheduled cron", "detail": str(inp.get("prompt") or "")}
+            self.schedule_calls[tid] = name
+        elif name == "CronDelete":
+            ids = inp.get("ids", [inp.get("id")])
+            if isinstance(ids, list):
+                for ident in ids:
+                    if isinstance(ident, str):
+                        self.crons.pop(ident, None)
+
+    def schedule_result(self, tid, name, block):
+        if name == "ScheduleWakeup":
+            if block.get("is_error") and self.wakeup and self.wakeup["id"] == tid:
+                self.wakeup = None
+            return
+        cron = self.crons.get(tid)
+        if not cron:
+            return
+        if block.get("is_error"):
+            self.crons.pop(tid, None)
+            return
+        content = text_of(block.get("content"))
+        data = json_in(content)
+        ident = data.get("id") if data else None
+        if not isinstance(ident, str):
+            match = re.search(r"\b(?:job|cron)\s+([\w-]+)\s*(?:\(|:|$)", content, re.I)
+            ident = match.group(1) if match else None
+        if ident:
+            self.crons.pop(tid)
+            self.crons[ident] = dict(cron, id=ident)
+
+    def later(self, now):
+        items = []
+        if self.wakeup:
+            items.append(dict(self.wakeup, kind="wakeup"))
+        for cron in self.crons.values():
+            when = cron["when"]
+            if when is None:
+                continue
+            if cron["recurring"] and when <= now:
+                cron["when"] = when = cron_next(cron["cron"], now)
+            elif not cron["recurring"] and (self.last_ts or 0) > when:
+                continue
+            if when is not None:
+                items.append(dict(cron, kind="cron"))
+        return [dict(item, sid=self.sid, session=self.title or self.name, source=self.title or self.name, host=None)
+                for item in items]
 
     def ingest_amail_result(self, name, content, ts):
         try:
@@ -1644,6 +1843,8 @@ class Remote:
             "machine": data.get("machine"),
             "swarms": data.get("swarms", []),
             "needs": data.get("needs", []),
+            "later": data.get("later", []),
+            "later_errors": data.get("later_errors", []),
             "jobs": data.get("jobs", {}) if isinstance(data.get("jobs"), dict) else {},
         }
 
@@ -1699,9 +1900,9 @@ class RemoteAtc(Remote):
 
 # ---------------------------------------------------------------- the fleet
 
-# Typed needs shared by the screen, web UI, MCP and JSON. `later` is reserved for wake-ups/reminders.
-NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": -1, "amail_request": 2, "amail_proposal": 3,
-              "amail_device": 4, "amail_unreachable": 5, "job": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
+# Typed needs shared by the screen, web UI, MCP and JSON.
+NEED_ORDER = {"blocked": 0, "approval": 1, "amail_approval": 2, "amail_request": 3, "amail_proposal": 4,
+              "amail_device": 5, "amail_unreachable": 6, "job": 7, "later": 8, "waiting": 9, "amail_inbox": 10}
 URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval"}
 
 
@@ -1709,7 +1910,42 @@ def need_item(kind, title, detail="", host=None, sid=None, since=None, hint=""):
     return {"kind": kind, "host": host, "sid": sid, "title": title, "detail": detail, "since": since, "hint": hint}
 
 
-def needs_queue(groups, hosts, items=()):
+def later_queue(items, hosts, now):
+    result = [dict(item) for item in items]
+    for h in hosts:
+        for item in h.get("later", []):
+            if isinstance(item, dict) and item.get("host") is None and isinstance(item.get("title"), str):
+                result.append(dict(item, host=h["host"], stale=not h["ok"]))
+    for item in result:
+        when = item.get("when")
+        try:
+            when = when if type(when) in (int, float) and math.isfinite(when) else None
+            if when is not None:
+                datetime.fromtimestamp(when)
+        except (ValueError, OverflowError, OSError):
+            when = None
+        item["when"] = when
+        item["in"] = item["when"] - now if item["when"] is not None else None
+    return sorted(result, key=lambda item: item["when"] if item["when"] is not None else float("inf"))
+
+
+def later_when(item):
+    seconds = item.get("in")
+    if seconds is None:
+        return "undated"
+    relative = f"in {human_age(seconds)}" if seconds > 0 else f"{human_age(-seconds)} overdue"
+    return datetime.fromtimestamp(item["when"]).strftime("%a %d %b %H:%M") + " · " + relative
+
+
+def wake_text(view, now):
+    when = view.get("wakes_at")
+    if when is None:
+        return ""
+    seconds = when - now
+    return f"wakes in {human_age(seconds)}" if seconds > 0 else f"wake {human_age(-seconds)} overdue"
+
+
+def needs_queue(groups, hosts, items=(), later=None):
     needs = [dict(item) for item in items]
     for host, source, age in [(None, groups, 0)] + [
             (h["host"], h.get("groups", {}), h.get("age") or 0) for h in hosts]:
@@ -1729,8 +1965,12 @@ def needs_queue(groups, hosts, items=()):
                                                 since=item.get("since"), hint=item.get("hint", "")),
                                       job=item.get("job"), via=h["host"]))
                 continue
-            if not isinstance(item, dict) or item.get("sid") or item.get("host") is not None:
+            if not isinstance(item, dict) or item.get("host") is not None:
                 continue  # sessions come from groups; another host's items must never come back around
+            if item.get("kind") == "later" and later is not None:
+                continue  # rebuilt from the merged list, using this machine's current time
+            if item.get("sid") and item.get("kind") != "later":
+                continue
             if item.get("kind") in ("blocked", "waiting", "job") or not isinstance(item.get("kind"), str):
                 continue
             needs.append(need_item(item["kind"], item.get("title", ""), item.get("detail", ""), host=h["host"],
@@ -1738,14 +1978,24 @@ def needs_queue(groups, hosts, items=()):
             if item["kind"] == "approval":
                 needs[-1].update({key: item.get(key) for key in
                                   ("id", "tool", "args_digest", "summary", "target", "caller", "client", "expires")})
+            elif item["kind"] == "later":
+                needs[-1].update({key: item.get(key) for key in ("sid", "source", "when", "in")})
+    for item in later or ():
+        if item["in"] is not None and item["in"] <= 3600:
+            need = need_item("later", item["title"], item.get("detail", ""), item.get("host"), item.get("sid"),
+                             hint=later_when(item) + ". Check " + str(item.get("source") or "the source") + ".")
+            need.update({key: item.get(key) for key in ("source", "when", "in", "session")})
+            need["later_kind"] = item.get("kind")
+            needs.append(need)
     for item in needs:
         if item["kind"] == "job":
             continue  # loom has its own hosts and availability, independent of atc's agent peers
         h = next((h for h in hosts if h["host"] == item["host"]), None)
         if h and not h["ok"]:
             item["hint"] = (item["hint"] or "") + f" Last seen {human_age(h.get('age'))} ago; {h['host']} isn't answering."
-    return sorted(needs, key=lambda item: (NEED_ORDER.get(item["kind"], 7),
-                  (item["since"] if item["since"] is not None else float("inf")) if item["kind"] == "waiting" else 0))
+    return sorted(needs, key=lambda item: (NEED_ORDER.get(item["kind"], 8),
+                  (item["since"] if item["since"] is not None else float("inf")) if item["kind"] == "waiting" else
+                  (item.get("when") or 0) if item["kind"] == "later" else 0))
 
 
 def needs_counts(items):
@@ -1754,7 +2004,7 @@ def needs_counts(items):
 
 class Fleet:
     def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None,
-                 amail=None, loom=None, approvals=None):
+                 amail=None, loom=None, approvals=None, later=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
@@ -1762,6 +2012,7 @@ class Fleet:
         self.repos = repos
         self.closed = closed
         self.amail_poller = amail
+        self.later_poller = later
         self.loom = loom
         self.approvals = approvals or Approvals()
         self.swarms = swarms or Swarms()
@@ -1974,6 +2225,8 @@ class Fleet:
         groups["other"].sort(key=lambda v: v["name"])
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
         hosts = unique_hosts([r.view(now) for r in remotes])
+        later = later_queue([item for s in self.sessions.values() for item in s.later(now)] +
+                            list(self.later_poller.items if self.later_poller else ()), hosts, now)
         own_jobs = self.loom.data if self.loom else {}
         jobs = dict(own_jobs)
         for h in hosts:  # another atc's loom hosts, reached through it; "local" there is that machine
@@ -1990,11 +2243,13 @@ class Fleet:
                         hint += " Last seen; loom isn't answering: " + (entry["error"] or "unknown error")
                     items.append(dict(need_item("job", job["name"], job_summary(job, now), host=host, hint=hint),
                                       job=job["name"]))
-        needs = needs_queue(groups, hosts, items)
+        needs = needs_queue(groups, hosts, items, later)
         return {
             "now": now,
             "groups": groups,
             "needs": needs,
+            "later": later,
+            "later_errors": list(self.later_poller.errors if self.later_poller else ()),
             "jobs": jobs,
             "jobs_own": own_jobs,
             "counts": {
@@ -2155,7 +2410,7 @@ def session_view(s, now, fleet):
         "status": status, "waiting_for": s.entry.get("waitingFor"), "since": since, "last": last, "group": group,
         "state": state, "doing": doing, "said": s.last_text, "alert": alert, "alert_style": alert_style,
         "teams": teams, "helpers": helpers, "helpers_hidden": hidden, "helpers_working": helpers_working,
-        "workers": workers,
+        "workers": workers, "wakes_at": s.wakeup["when"] if s.wakeup else None,
     }
 
 
@@ -3259,6 +3514,8 @@ class Service:
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
             result = {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
             result["jobs"] = model.get("jobs_own", {})  # never re-export another atc's: no loops
+            result["later"] = [item for item in model.get("later", []) if item["host"] is None]
+            result["later_errors"] = model.get("later_errors", [])
             result["needs"] = [item for item in model["needs"] if item["host"] is None
                                or (item["kind"] == "job" and not item.get("via"))]
             result["counts"] = dict(model["counts"], **needs_counts(result["needs"]),
@@ -3268,7 +3525,8 @@ class Service:
 
     def web_model(self):
         model = self.cockpit.model()
-        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs", "jobs")}
+        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs",
+                                           "later", "later_errors", "jobs")}
         result.update(closed=model.get("closed", [])[:50], comms=list(reversed(model.get("comms", [])[-200:])),
                       quota=taxi_quota(self.quota), quota_text=tool_quota(self.cockpit, {}, Call()),
                       writes=self.writes, refreshed_at=iso(self.at), error=self.error)
@@ -3719,6 +3977,10 @@ class Cockpit:
             for t in fetches:
                 t.start()
             fleet = self.fleet
+            if fleet.later_poller:
+                t = threading.Thread(target=fleet.later_poller.fetch, daemon=True)
+                t.start()
+                fetches.append(t)
             if fleet.amail_poller:
                 fleet.amail_poller.fetch()
             if fleet.loom:
@@ -3735,6 +3997,7 @@ class Cockpit:
                 fleet.repos.fetch()
             for t in fetches:
                 t.join(60)
+            now = time.time()
             self.cached, self.cached_at = fleet.model(now, self.quota, self.remotes), now
             return self.cached
 
@@ -3756,7 +4019,7 @@ def on_demand_cockpit(dry_run=False, hosts=(), use_hosts=True):
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), dry_run, background=False)
     repos = Repos(background=False)
     fleet = Fleet(None, feed, herdr, Procs(background=False), repos, closed=ClosedSessions(repos=repos, background=False),
-                  amail=AMail(background=False), loom=Loom(background=False))
+                  amail=AMail(background=False), loom=Loom(background=False), later=Later(background=False))
     quota = Quota(command_from_env("ATC_QUOTAMAX", "quotamax"), dry_run, background=False)
     remotes = [Remote(h, background=False) for h in configured_hosts(hosts)] if use_hosts else []
     return Cockpit(fleet, quota, remotes, Terminals(dry_run), claude_cmd, command_from_env("ATC_ROUTE", "route"),
@@ -4068,7 +4331,7 @@ def tool_run_job(ck, a, call):
 
 
 @mcp_tool("atc_needs_me", "Who needs me", "The ordered needs-you queue on every machine: blocked prompts, "
-          "pending lever approvals, a-mail owner items, failing jobs, waiting sessions and a-mail inbox counts. "
+          "pending lever approvals, a-mail owner items, failing jobs, due Later items, waiting sessions and a-mail inbox counts. "
           "Says where to answer each item.")
 def tool_needs_me(ck, a, call):
     model = ck.model()
@@ -4090,7 +4353,34 @@ def tool_needs_me(ck, a, call):
             out.append(f"{h['host']} isn't answering; " + ("atc hasn't seen it yet." if h.get("age") is None else
                        f"nothing needed you as last seen {human_age(h['age'])} ago."))
     c = model["counts"]
+    later = [item for item in model.get("later", []) if item.get("in") is not None and 3600 < item["in"] <= 86400]
+    if later:
+        out.append("\nLater today:")
+        out.extend(later_text(item) for item in later[:10])
+        if len(later) > 10:
+            out.append(f"  {len(later) - 10} more; use atc_later.")
     out.append(f"\nAlso here: {c['working']} working, {c['parked']} parked, {c['background']} background.")
+    return "\n".join(out)
+
+
+def later_text(item):
+    host = f" on {item['host']}" if item.get("host") else ""
+    stale = " (last seen; machine isn't answering)" if item.get("stale") else ""
+    return clean(f"  {later_when(item)} · {item['title']} · {item.get('source') or 'unknown source'}{host}{stale}")
+
+
+@mcp_tool("atc_later", "Needs you later", "Scheduled session wake-ups, next cron runs and owner plug-in items, "
+          "ordered by time across machines, with undated items last. Includes overdue items and plug-in errors.")
+def tool_later(ck, a, call):
+    model = ck.model()
+    out = ["Needs you later:"] if model.get("later") else ["Nothing scheduled for later."]
+    for item in model.get("later", []):
+        out.append(later_text(item))
+        if item.get("detail"):
+            out.append("    " + clean(item["detail"]))
+    out.extend(model.get("later_errors", []))
+    for h in model.get("hosts", []):
+        out.extend(clean(f"{h['host']}: {error}") for error in h.get("later_errors", []))
     return "\n".join(out)
 
 
@@ -4955,6 +5245,8 @@ def session_lines(v, name_w, now):
     state_style = {"blocked": "err", "waiting": "warn", "working": "busy", "background": "c3"}.get(v["group"], "dim")
     display = v.get("display_name") or v["name"]
     row = [(dot + " ", dot_style), (col(display, name_w) + " ", v["color"]), (col(v["state"], 13) + " ", state_style)]
+    if v.get("wakes_at") is not None:
+        row.append((wake_text(v, now) + "   ", "c3"))
     if v["alert"]:
         row.append(("! " + clean(v["alert"]) + "   ", v["alert_style"]))
     row.append((clean(v["doing"]), "plain" if v["group"] in ("working", "waiting", "blocked") else "dim"))
@@ -5091,7 +5383,21 @@ def fleet_lines(model, width, show_all, jobs_all=False):
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
     }
-    for key in ("approvals", "blocked", "waiting", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
+    for key in ("blocked", "approvals", "waiting", "later", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
+        if key == "later":
+            items = [item for item in model.get("later", []) if item.get("in") is not None and item["in"] <= 86400]
+            if items:
+                if show_all:
+                    out.append((rule(f"Later ({len(items)})", width, "next 24h · p folds"), None))
+                    out.extend(([(later_text(item), "warn" if item["in"] <= 3600 else "dim")], None) for item in items)
+                else:
+                    out.append(([(f"Later ({len(items)}): {later_when(items[0])} · {clean(items[0]['title'])}   p lists them", "dim")], None))
+            for error in model.get("later_errors", []):
+                out.append(([(clean(error), "warn")], None))
+            for h in model.get("hosts", []):
+                for error in h.get("later_errors", []):
+                    out.append(([(clean(f"{h['host']}: {error}"), "warn")], None))
+            continue
         if key == "approvals":
             items = [item for item in model.get("needs", []) if item["kind"] == "approval" and item["host"] is None]
             if items:
@@ -5102,7 +5408,7 @@ def fleet_lines(model, width, show_all, jobs_all=False):
                     out.append(([(clean(f"  caller: {item['caller'] or 'unknown'} · expires {until}"), "dim")], None))
             continue
         if key == "needs":
-            items = [item for item in model.get("needs", []) if item["sid"] is None
+            items = [item for item in model.get("needs", []) if item["sid"] is None and item["kind"] != "later"
                      and not (item["kind"] == "approval" and item["host"] is None)]
             if items:
                 out.append((rule("a-mail" if all(n["kind"].startswith("amail_") for n in items) else "Needs you",
@@ -5123,7 +5429,11 @@ def fleet_lines(model, width, show_all, jobs_all=False):
                         out += session_lines(v, name_w, now)
                     else:
                         dot, style = GROUP_LOOK[key]
+                        h = next(h for h in model["hosts"] if h["host"] == item["host"])
+                        v = next(v for v in h["groups"][key] if v["sid"] == item["sid"])
+                        wake = wake_text(v, now)
                         out.append(([(f"{dot} {clean(item['title'])} on {item['host']}  ", style),
+                                     (wake + "   " if wake else "", "c3"),
                                      (clean(item["detail"]), "plain")], f"@{item['host']}::s::{item['sid']}"))
                         out.append(([("  " + clean(item["hint"]), "dim")], None))
             continue
@@ -5156,7 +5466,7 @@ def fleet_lines(model, width, show_all, jobs_all=False):
     if not everyone:
         out.append(([("No live Claude Code sessions found.", "dim")], None))
     for h in model.get("hosts", []):
-        out += host_lines(h, width, name_w, needs_shown=True)
+        out += host_lines(h, width, name_w, needs_shown=True, now=now)
     closed = model.get("closed", [])
     if closed:
         out.append((rule(f"Closed (resumable) ({len(closed)})", width, "R restore · D done · E exit · S save"), None))
@@ -5193,7 +5503,7 @@ def closed_row(c, name_w, now):
     return line
 
 
-def host_lines(h, width, name_w, needs_shown=False):
+def host_lines(h, width, name_w, needs_shown=False, now=None):
     """One remote machine: its Claude sessions (read-only here) and its agent processes."""
     if not h["ok"]:
         return [(rule(h["host"], width, "unreachable"), None), ([("  " + clean(h["error"] or "no answer"), "err")], None)]
@@ -5204,8 +5514,10 @@ def host_lines(h, width, name_w, needs_shown=False):
                        for v in h["groups"].get(key, [])]
     for v in remote_sessions:
         dot, dot_style = GROUP_LOOK.get(v.get("group"), ("○", "dim"))
+        wake = wake_text(v, now if now is not None else time.time())
         out.append(([(dot + " ", dot_style), (col(v.get("name"), name_w) + " ", "c3"),
-                     (col(v.get("state"), 13) + " ", "plain"), (clean(v.get("doing")), "plain")],
+                     (col(v.get("state"), 13) + " ", "plain"), (wake + "   " if wake else "", "c3"),
+                     (clean(v.get("doing")), "plain")],
                     f"@{h['host']}::s::{v.get('sid')}"))
     quiet = sum(len(h["groups"].get(k, [])) for k in ("parked", "background", "other"))
     if quiet:
@@ -5731,7 +6043,7 @@ HELP = [
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
     "tab        bottom panel: all activity, the selected session, comms",
-    "p          hide or show parked, background and other sessions, finished route swarms and idle jobs",
+    "p          hide or show Later, parked, background and other sessions, finished route swarms and idle jobs",
     "jobs       enter reads status and recent log; x x runs the selected job now",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
@@ -6427,9 +6739,10 @@ def main():
     repos = Repos(background=not one_shot)
     closed = ClosedSessions(repos=repos, background=False) if not only and not args.jump else None
     amail = AMail(background=not one_shot) if not args.jump else None
+    later = Later(background=not one_shot) if not args.jump else None
     loom = Loom(background=not one_shot) if not args.jump else None
     fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail, loom=loom,
-                  approvals=Approvals(background=not one_shot))
+                  approvals=Approvals(background=not one_shot), later=later)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
@@ -6438,6 +6751,8 @@ def main():
         workers = [threading.Thread(target=r.fetch) for r in remotes if not args.jump]
         if amail:
             workers.append(threading.Thread(target=amail.fetch))
+        if later:
+            workers.append(threading.Thread(target=later.fetch))
         if loom:
             workers.append(threading.Thread(target=loom.fetch))
         for w in workers:

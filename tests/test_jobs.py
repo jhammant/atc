@@ -401,7 +401,7 @@ print("stalled daemon poll started", flush=True)
         self.assertNotIn("jobs run", self.fx.calls())
         self.service.refresh()
         needs = self.service.model["needs"]
-        self.assertEqual(needs[0]["kind"], "approval")
+        self.assertEqual([n["kind"] for n in needs[:2]], ["blocked", "approval"])
         self.assertEqual(sum(n["kind"] == "job" for n in needs), 2)
         for model in (self.service.web_model(), json.loads(self.cli("--json", "--no-hosts"))):
             self.assertEqual((model["counts"]["needs"], model["counts"]["needs_urgent"]), (5, 2))
@@ -416,8 +416,8 @@ print("stalled daemon poll started", flush=True)
         self.assertFalse(result["isError"])
         self.assertTrue(self.service.mcp.call_tool(params, ctx, "owner-session")["isError"])
         self.assertEqual(self.fx.calls().count("loom jobs run crashed"), 1)
-        self.assertEqual(len(self.m.TOOLS), 20)
-        self.assertEqual(sum(not tool["lever"] for tool in self.m.TOOLS.values()), 8)
+        self.assertEqual(len(self.m.TOOLS), 21)
+        self.assertEqual(sum(not tool["lever"] for tool in self.m.TOOLS.values()), 9)
 
     def test_service_dry_run_reaches_shared_runner_after_approval(self):
         service = self.m.Service(self.fleet, None, [], self.m.Terminals(dry_run=True), writes=True,
