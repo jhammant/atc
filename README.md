@@ -100,13 +100,44 @@ a detached `atc` tmux session you can attach to from anywhere, including over ss
 
 ### Optional tools
 
-Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`, and `ATC_SSH`
+Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR`, `ATC_CLAUDE`, `ATC_AMAIL`, and `ATC_SSH`
 (e.g. `ssh -J bastion`).
 
 - [quotamax](https://github.com/jhammant/quotamax): quota for every provider, and the swarm cap
 - `route`: picks where a new task should run
+- `amail`: a-mail owner and inbox counts via `amail status --json`; `ATC_AMAIL=` disables it
 - [Herdr](https://herdr.dev): agents in Herdr panes, steered through Herdr. `atc` only talks to a Herdr
   server that is already running and never starts one, because starting it resumes every saved agent.
+
+### One needs-you queue
+
+The web Needs view, MCP `atc_needs_me`, `--json` (including menu-bar consumers such as Roost), and the terminal
+share `needs`. Blocked sessions from every machine come first, then a-mail approvals, requests, proposals and
+devices awaiting approval, then waiting sessions (newest first across machines), then a-mail inbox waiting.
+The terminal keeps its session sections and adds an **a-mail** section after Waiting and a short header note;
+`--once` includes both. Answer session prompts in that session, and a-mail items in **Roost or the a-mail app**.
+
+The public a-mail CLI's `status --json` returns counts without reading or acknowledging messages. atc only
+uses those counts; it does not fetch message content or retain the returned server or address. Polls run in the
+background every 60 seconds on the screen and under `--serve`, or on demand with a 60-second cache under
+`atc mcp`. `--json` and `--once` take one reading. A missing CLI or an initial offline failure is silent. If a
+reading worked and later fails, one **a-mail unreachable** item replaces the counts until a reading succeeds.
+
+`--json` adds these fields without changing existing keys:
+
+- `needs`: ordered items with `kind`, `host` (null on this machine), `sid` (null except for sessions), `title`,
+  `detail`, `since` (seconds in that state; null when unknown), and `hint` (where to answer).
+- Kinds today: `blocked`, `waiting`, `amail_approval`, `amail_request`, `amail_proposal`, `amail_device`,
+  `amail_inbox`, and `amail_unreachable`. `approval` is reserved for pending lever approvals and `later` for
+  scheduled wake-ups and reminders. Consumers should render unknown kinds using their title, detail and hint.
+- `counts.needs`: number of queue items, including the unreachable note when present. Each nonzero a-mail
+  category is one item, with its quantity in the title (`4+` means the inbox has more). `counts.needs_urgent`
+  counts blocked sessions plus a-mail approvals, requests and devices awaiting approval.
+
+These two counts cover the whole fleet; existing session counts still describe this machine. Sleeping hosts'
+cached items stay in the queue and its counts, with a last-seen hint. A host never seen has only a connection
+notice. `/api/fleet` exports only this machine's needs and matching local counts; hubs add each host's
+non-session items, and build its session items from groups, avoiding duplicates and forwarding loops.
 
 ## Talk to it from Claude (MCP)
 
@@ -123,7 +154,7 @@ claude mcp add --transport http --scope user atc https://atc.example.ts.net/mcp 
 | Tool | What it does | Same as |
 |---|---|---|
 | `atc_fleet` | Every session by state (blocked, waiting, working, parked, background, other), swarms, other agents, servers | `atc --once` |
-| `atc_needs_me` | Sessions blocked on a prompt, with what they ask, and sessions waiting for you, with what they said, on every machine | the top of the screen |
+| `atc_needs_me` | The ordered needs-you queue on every machine, including a-mail counts and where to answer | Needs you |
 | `atc_session` | One session: folder, state, what it is doing and said, git, helpers and workflow phases, worker processes, recent steps | `enter`, the bottom panel |
 | `atc_tree` | Session › workflow › phase › agent › worker process | `atc --tree`, `h` |
 | `atc_comms` | Messages between sessions, tasks to helpers and their reports, swarm a-mail; newest first | `atc --comms`, `c` |
@@ -207,9 +238,9 @@ must verify you. Once signed in, the **Passkeys** view adds further passkeys wit
 and signs out. Removing the last passkey requires explicit confirmation; recovery uses a new hub code.
 Removing a passkey revokes its web sessions. Restarting atc signs every browser out.
 
-**Needs you** comes first: prompts to answer in their own sessions, finished sessions waiting for you, and
-machines that aren't answering with their last snapshot. Its count includes each live blocked/waiting
-session and each unreachable machine. **Fleet** groups sessions, helpers, workflow phases, workers, route
+**Needs you** comes first: the shared queue of prompts, a-mail owner items, waiting sessions and inbox counts,
+including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
+**Fleet** groups sessions, helpers, workflow phases, workers, route
 swarms and other processes by machine. Open a session for its full last words, git state, recent steps and
 messages. Remote session detail uses its fleet snapshot, so it has less detail. **Comms**, **Quota** (including
 swarm cap controls), and **Closed** (including Restore) cover the hub's messages, quota and closed sessions.
@@ -396,13 +427,15 @@ loop with how long it took and which keys arrived.
 
 ## How it works
 
-Everything is read locally (or over your own ssh); nothing is sent anywhere else.
+Session data is read locally, over your own ssh, or from a configured atc's `/api/fleet`. Optional a-mail status
+uses the CLI's configured network connection for counts only.
 
 - `claude agents --json`: Claude Code's own list of active sessions, interactive and background, and whether
   one is waiting for input. Without it, `atc` falls back to `~/.claude/sessions/*.json`.
 - `~/.claude/projects/<project>/<session>.jsonl`: the transcripts, read incrementally from near the end, plus
   each session's `subagents/` (with `parentAgentId` for nesting) and workflow journals.
 - `ps`: each session's terminal, and agent processes.
+- `amail status --json`: a-mail owner and inbox counts; never message content or acknowledgements.
 
 The transcript format is Claude Code's internal format and can change between versions; `atc` skips records
 it does not understand rather than failing.

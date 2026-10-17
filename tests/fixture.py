@@ -109,6 +109,36 @@ elif args[:1] == ["override"]:
         open(level_file, "w").write(args[1])
 '''
 
+STUB_AMAIL = '''#!/usr/bin/env python3
+import os, sys
+d = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(d, "calls.log"), "a") as fh:
+    fh.write("amail " + " ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:] != ["status", "--json"]:
+    sys.exit(2)
+if os.path.exists(os.path.join(d, "amail-fail")):
+    print("offline", file=sys.stderr)
+    sys.exit(1)
+with open(os.path.join(d, "amail-status.json")) as fh:
+    print(fh.read())
+'''
+
+
+def amail_status():
+    return {"server": "https://amail.example.com", "address": "owner@amail.example.com", "health": {"ok": True},
+            "inbox": {"waiting": 4, "more": True}, "owner": {"requests": 3, "approvals": 2, "proposals": 1},
+            "device": {"awaitingApproval": 2, "approvedByOwner": False}}
+
+
+def stub_amail(directory):
+    path = os.path.join(directory, "amail")
+    with open(path, "w") as fh:
+        fh.write(STUB_AMAIL)
+    os.chmod(path, 0o755)
+    with open(os.path.join(directory, "amail-status.json"), "w") as fh:
+        json.dump(amail_status(), fh)
+
+
 STUB_ROUTE = '''#!/usr/bin/env python3
 import json, os, sys
 d = os.path.dirname(os.path.abspath(__file__))
@@ -141,6 +171,7 @@ class Fixture:
             shutil.rmtree(self.root, ignore_errors=True)
             raise unittest.SkipTest(f"live-process fixture needs ps: {probe.stderr.strip()}")
         os.makedirs(self.stub)
+        stub_amail(self.stub)
         for name, body in (("claude", STUB_CLAUDE), ("quotamax", STUB_QUOTAMAX), ("route", STUB_ROUTE)):
             path = os.path.join(self.stub, name)
             with open(path, "w") as fh:
@@ -350,6 +381,7 @@ class Fixture:
         env.update({
             "CLAUDE_CONFIG_DIR": self.claude_home, "ATC_CLAUDE": os.path.join(self.stub, "claude"),
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
+            "ATC_AMAIL": "",
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
             "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
@@ -394,6 +426,7 @@ class AmailFixture(Fixture):
     def __init__(self):
         super().__init__()
         os.makedirs(self.stub)
+        stub_amail(self.stub)
         for i, name in enumerate(NAMES):
             cwd = os.path.join(self.work, name)
             os.makedirs(cwd)
@@ -532,6 +565,7 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
         return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,
                 "ROUTE_STATE_DIR": self.state, "ATC_SWARM_HOURS": "6", "PATH": self.stub + os.pathsep + os.environ["PATH"],
                 "ATC_CLAUDE": os.path.join(self.stub, "claude"), "ATC_QUOTAMAX": "", "ATC_HERDR": "", "ATC_HOSTS": "",
+                "ATC_AMAIL": "",
                 "ATC_TERMINAL": "none", **extra}
 
     def stop(self):
