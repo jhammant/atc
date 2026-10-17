@@ -406,7 +406,8 @@ print("stalled daemon poll started", flush=True)
         for model in (self.service.web_model(), json.loads(self.cli("--json", "--no-hosts"))):
             self.assertEqual((model["counts"]["needs"], model["counts"]["needs_urgent"]), (5, 2))
         exported = self.service.get("/api/fleet")[1]
-        self.assertEqual((exported["counts"]["needs"], exported["counts"]["needs_urgent"]), (4, 2))
+        # Its own loom hosts' failing jobs are exported too (server1's as well as local's).
+        self.assertEqual((exported["counts"]["needs"], exported["counts"]["needs_urgent"]), (5, 2))
         self.fx.clear_calls()
         row = self.fleet.approvals.access()[0]
         self.fleet.approvals.decide(row["id"], "approve", "owner", "terminal")
@@ -568,12 +569,43 @@ print("stalled daemon poll started", flush=True)
         model = self.service.web_model()
         self.assertEqual(model["jobs"], self.loom.data)
         exported = self.service.get("/api/fleet")[1]
-        self.assertEqual(set(exported["jobs"]), {"local"})
-        self.assertEqual(exported["counts"]["jobs_failing"], 1)
-        self.assertNotIn("server1", json.dumps(exported))
+        self.assertEqual(set(exported["jobs"]), {"local", "server1"})  # its own loom hosts, all of them
+        self.assertTrue(all(item["kind"] != "job" or not item.get("via") for item in exported["needs"]))
         result = self.service.run_tool("web", "atc_run_job", {"arguments": {"job": "crashed", "dry_run": True}}, "Phone")
         self.assertTrue(result["ok"])
         self.assertEqual(self.fx.calls(), "")
+
+    def test_hub_shows_and_runs_another_atcs_jobs_without_re_exporting_them(self):
+        # Arrange: this fixture's atc (with loom) is "home"; a hub without loom reads it over HTTP.
+        self.service.peer_secret = "peer-secret"
+        url = self.start(self.service)
+        remote = self.m.RemoteAtc(url, "fixture-token", background=False)
+        remote.fetch()
+        remote.host = remote.data["machine"] = "home-box"
+        hub_fleet = self.m.Fleet("/nowhere/at/all", loom=None)
+        hub = self.m.Service(hub_fleet, None, [remote], self.m.Terminals(), writes=True, token="fixture-token",
+                             background=False, peer_secret="peer-secret")
+        # Act
+        hub.refresh()
+        model = hub.model
+        # Assert: home's "local" is named home-box, its other loom host keeps its name, both reached through home.
+        self.assertEqual(model["jobs"]["home-box"]["via"], "home-box")
+        self.assertEqual(model["jobs"]["server1"]["via_key"], "server1")
+        failing = [item for item in model["needs"] if item["kind"] == "job"]
+        self.assertTrue(failing and {item["host"] for item in failing} <= {"home-box", "server1"})
+        home_urgent = self.service.get("/api/fleet")[1]["counts"]["needs_urgent"]
+        self.assertEqual(model["counts"]["needs_urgent"], home_urgent)  # failing jobs add nothing urgent
+        exported = hub.get("/api/fleet")[1]
+        self.assertEqual(exported["jobs"], {})  # the hub never re-exports what it learned from home
+        self.assertFalse([item for item in exported["needs"] if item["kind"] == "job"])
+        self.fx.clear_calls()
+        dry = hub.run_tool("web", "atc_run_job", {"arguments": {"job": "crashed", "host": "home-box",
+                                                                "dry_run": True}}, "Phone")
+        self.assertTrue(dry["ok"], dry)
+        self.assertNotIn("jobs run", self.fx.calls())
+        real = hub.run_tool("web", "atc_run_job", {"arguments": {"job": "crashed", "host": "home-box"}}, "Phone")
+        self.assertTrue(real["ok"], real)
+        self.assertIn("jobs run crashed", self.fx.calls())
 
     @unittest.skipUnless(OPENSSL, "openssl is needed for the passkey fixture")
     def test_web_json_status_and_run_require_passkey(self):

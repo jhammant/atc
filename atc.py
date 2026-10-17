@@ -1644,6 +1644,7 @@ class Remote:
             "machine": data.get("machine"),
             "swarms": data.get("swarms", []),
             "needs": data.get("needs", []),
+            "jobs": data.get("jobs", {}) if isinstance(data.get("jobs"), dict) else {},
         }
 
 
@@ -1721,6 +1722,13 @@ def needs_queue(groups, hosts, items=()):
                                        host, v.get("sid"), since + age if since is not None else None, hint))
     for h in hosts:
         for item in h.get("needs", []):
+            if isinstance(item, dict) and item.get("kind") == "job" and not item.get("sid"):
+                host = h["host"] if item.get("host") in (None, "local") else item["host"]
+                if not any(n["kind"] == "job" and n["title"] == item.get("title") and n["host"] == host for n in needs):
+                    needs.append(dict(need_item("job", item.get("title", ""), item.get("detail", ""), host=host,
+                                                since=item.get("since"), hint=item.get("hint", "")),
+                                      job=item.get("job"), via=h["host"]))
+                continue
             if not isinstance(item, dict) or item.get("sid") or item.get("host") is not None:
                 continue  # sessions come from groups; another host's items must never come back around
             if item.get("kind") in ("blocked", "waiting", "job") or not isinstance(item.get("kind"), str):
@@ -1966,9 +1974,15 @@ class Fleet:
         groups["other"].sort(key=lambda v: v["name"])
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
         hosts = unique_hosts([r.view(now) for r in remotes])
-        jobs = self.loom.data if self.loom else {}
+        own_jobs = self.loom.data if self.loom else {}
+        jobs = dict(own_jobs)
+        for h in hosts:  # another atc's loom hosts, reached through it; "local" there is that machine
+            for key, entry in (h.get("jobs") or {}).items():
+                name = h["host"] if key == "local" else key
+                if isinstance(entry, dict) and name not in jobs:
+                    jobs[name] = dict(entry, via=h["host"], via_key=key)
         items = list(self.amail_poller.items if self.amail_poller else ()) + self.approvals.needs()
-        for host, entry in jobs.items():
+        for host, entry in own_jobs.items():  # another atc's failing jobs arrive through needs_queue, marked via
             for job in entry["jobs"]:
                 if job.get("failing"):
                     hint = "Open Jobs for status; run it again when ready."
@@ -1982,6 +1996,7 @@ class Fleet:
             "groups": groups,
             "needs": needs,
             "jobs": jobs,
+            "jobs_own": own_jobs,
             "counts": {
                 **needs_counts(needs),
                 "jobs_failing": sum(bool(job.get("failing")) for entry in jobs.values() for job in entry["jobs"]),
@@ -3243,8 +3258,9 @@ class Service:
             return 200, taxi_quota(self.quota)
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
             result = {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
-            result["jobs"] = {h: entry for h, entry in model["jobs"].items() if h == "local"}
-            result["needs"] = [item for item in model["needs"] if item["host"] in (None, "local")]
+            result["jobs"] = model.get("jobs_own", {})  # never re-export another atc's: no loops
+            result["needs"] = [item for item in model["needs"] if item["host"] is None
+                               or (item["kind"] == "job" and not item.get("via"))]
             result["counts"] = dict(model["counts"], **needs_counts(result["needs"]),
                                     jobs_failing=sum(item["kind"] == "job" for item in result["needs"]))
             return 200, result
@@ -3984,6 +4000,17 @@ def tool_fleet(ck, a, call):
     return fleet_text(ck, ck.model(hosts=not folder), os.path.abspath(os.path.expanduser(folder)) if folder else None)
 
 
+def via_atc(ck, h, name, arguments, call):
+    """A read on another atc: over HTTP with the peer secret when it is a RemoteAtc, else over ssh."""
+    remote = next((r for r in ck.remotes if r.host == h and isinstance(r, RemoteAtc)), None)
+    if remote:
+        token = ck.service.peer_secret if ck.service else peer_token()
+        if not token:
+            return False, "reading another atc's jobs needs the peer secret on both atc instances"
+        return remote.tool(name, arguments, token, call.caller)
+    return remote_tool(h, name, arguments)
+
+
 @mcp_tool("atc_jobs", "Jobs and apps", "Loom jobs per configured host: failing first, running, then estimated due "
           "time; plus apps listed by local loom. Optional job and host show its status and recent log.",
           {"host": {"type": "string", "description": "Loom host (local for this machine)"},
@@ -3991,6 +4018,12 @@ def tool_fleet(ck, a, call):
 def tool_jobs(ck, a, call):
     model = ck.model()
     if a.get("job"):
+        entry = model.get("jobs", {}).get(a.get("host") or "local") or {}
+        if entry.get("via"):
+            ok, text = via_atc(ck, entry["via"], "atc_jobs", {"job": a["job"], "host": entry["via_key"]}, call)
+            if not ok:
+                raise ToolError(text)
+            return text
         if ck.fleet.loom is None:
             raise ToolError("loom is not available")
         return ck.fleet.loom.status(a.get("host") or "local", a["job"])
@@ -4019,7 +4052,14 @@ def tool_jobs(ck, a, call):
           {"job": {"type": "string", "description": "Exact job name from atc_jobs"},
            "host": {"type": "string", "description": "Loom host (default local)"}}, required=("job",), lever=True)
 def tool_run_job(ck, a, call):
-    ck.model()
+    model = ck.model()
+    entry = model.get("jobs", {}).get(a.get("host") or "local") or {}
+    if entry.get("via"):
+        name = a.get("job")
+        if not isinstance(name, str) or not any(row["name"] == name for row in entry.get("jobs", [])):
+            raise ToolError(f"unknown job {name} on {a.get('host')}")
+        return on_server(ck, entry["via"], "atc_run_job", {"job": name, "host": entry["via_key"]},
+                         f"run job {name} now on {a.get('host')} (through {entry['via']})", call)
     loom, host, name = ck.fleet.loom, a.get("host") or "local", a.get("job")
     if loom is None:
         raise ToolError("loom is not available")
