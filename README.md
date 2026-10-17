@@ -76,6 +76,7 @@ atc --once           # one frame as text        atc --tree     the hierarchy
 atc --comms          # every message            atc --json     the data, for scripts and menu-bar apps
 atc --host buildbox  # add a machine for this run (or list them in ~/.config/atc/hosts)
 atc --jump <id>      # focus a session's tab    atc --cap up|down|auto   change the swarm cap
+atc --jump <id> --tty /dev/ttys003   # focus straight away when you already know the tty (Roost does)
 atc --open           # open the live view in a new terminal tab
 atc --dry-run        # levers say what they would do instead of doing it
 atc --serve          # the fleet as JSON for Orbital / Taxi (see below)

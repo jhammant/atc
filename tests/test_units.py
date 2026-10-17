@@ -661,6 +661,20 @@ class CommandLine(unittest.TestCase):
                                 capture_output=True, text=True, timeout=60)
         self.assertEqual(failed.returncode, 1, failed.stdout)
 
+    def test_jump_with_a_known_tty_skips_the_scan(self):
+        # Arrange
+        target, other = FX.sessions["gamma-33"], FX.sessions["alpha-11"]
+        self.atc("--jump", other["sid"])
+        FX.clear_calls()
+        # Act
+        fast = self.atc("--jump", target["sid"], "--tty", target["tty"])
+        stale = self.atc("--jump", other["sid"], "--tty", "/dev/ttys-gone")
+        # Assert
+        self.assertIn("focus: done", fast.stdout)
+        self.assertNotIn("quotamax", FX.calls())  # a jump never waits on quota
+        self.assertIn("focus: done", stale.stdout)  # a tab that moved is found by the full scan
+        self.assertEqual(FX.active_window(), other["window"])
+
     def test_remote_host(self):
         fake_ssh = os.path.join(FX.stub, "fake-ssh")
         with open(fake_ssh, "w") as fh:  # runs the remote half locally, then pretends to be another machine
