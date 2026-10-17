@@ -408,7 +408,7 @@ class Policy(unittest.TestCase):
         off = Client(ATC_MCP_LEVERS="off")
         try:
             names = [t["name"] for t in off.request("tools/list")["result"]["tools"]]
-            self.assertEqual(len(names), 8)
+            self.assertEqual(len(names), 9)  # read tools, including atc_jobs and atc_later
             self.assertNotIn("atc_message", names)
             self.assertIn("levers are off", text(off.call("atc_message", {"session": "beta-22", "text": "x"})))
         finally:
@@ -561,7 +561,7 @@ class Http(unittest.TestCase):
 
     def test_levers_need_serve_writes(self):
         names = [t["name"] for t in self.post(self.rpc("tools/list"), url=self.read_url)[1]["result"]["tools"]]
-        self.assertEqual(len(names), 8)
+        self.assertEqual(len(names), 9)  # read tools, including atc_jobs and atc_later
         reply = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {"session": "beta-22",
                                                                                         "text": "x"}}), url=self.read_url)
         self.assertIn("levers are off", text(reply[1]["result"]))
