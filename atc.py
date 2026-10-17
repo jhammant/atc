@@ -58,7 +58,8 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie, CookieError
 
@@ -1005,6 +1006,177 @@ class AMail:
             time.sleep(self.EVERY)
 
 
+def job_next_run(job, now):
+    """An estimate, not the scheduler's clock. last_run is loom's last log write."""
+    if job.get("expired") or job.get("running"):
+        return None
+    schedule = job.get("schedule_raw") or {}
+    if not isinstance(schedule, dict):
+        return None
+    last = parse_ts(job.get("last_run"))
+    every = schedule.get("every")
+    if type(every) in (int, float) and math.isfinite(every) and every > 0:
+        return last + every if last else None
+    if "at" in schedule:
+        at = parse_ts(schedule["at"])
+        return at if at and (last is None or last < at) else None
+    calendar = schedule.get("calendar")
+    if not isinstance(calendar, dict) or not calendar:
+        return None
+    ranges = {"Minute": (0, 59), "Hour": (0, 23), "Day": (1, 31), "Month": (1, 12), "Weekday": (0, 7)}
+    if any(k not in ranges or type(v) is not int or not ranges[k][0] <= v <= ranges[k][1]
+           for k, v in calendar.items()):
+        return None
+    start = datetime.fromtimestamp(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    for offset in range(1462):  # includes the next leap day
+        day = start + timedelta(days=offset)
+        if any(k in calendar and calendar[k] != v for k, v in (("Day", day.day), ("Month", day.month))):
+            continue
+        if "Weekday" in calendar and calendar["Weekday"] % 7 != (day.weekday() + 1) % 7:
+            continue
+        for hour in [calendar["Hour"]] if "Hour" in calendar else range(24):
+            for minute in [calendar["Minute"]] if "Minute" in calendar else range(60):
+                at = day.replace(hour=hour, minute=minute).timestamp()
+                if at > now:
+                    return at
+    return None
+
+
+def job_order(job):
+    return (0 if job.get("failing") else 1 if job.get("running") else 2 if job.get("next_run") else 3,
+            job.get("next_run") or float("inf"), job["name"])
+
+
+def job_summary(job):
+    state = "failing" if job.get("failing") else "running" if job.get("running") else job.get("state") or "idle"
+    parts = [state]
+    if job.get("last_exit") is not None:
+        parts.append("last exit " + str(job["last_exit"]))
+    if job.get("next_run"):
+        parts.append("due ~" + iso(job["next_run"]))
+    elif job.get("schedule"):
+        parts.append(str(job["schedule"]))
+    if job.get("expired"):
+        parts.append("expired")
+    if job.get("purpose"):
+        parts.append(str(job["purpose"]))
+    return clean(" · ".join(parts))
+
+
+class Loom:
+    """Optional jobs and apps, read in parallel away from the screen loop."""
+
+    EVERY = 60.0
+    TIMEOUT = 15
+
+    def __init__(self, background=True):
+        self.cmd = command_from_env("ATC_LOOM", "loom")
+        if self.cmd and not shutil.which(self.cmd[0]):
+            self.cmd = None  # a missing optional CLI is silent, including explicit overrides
+        self.hosts = ["local"] + list(dict.fromkeys(h.strip() for h in os.environ.get("ATC_LOOM_HOSTS", "").split(",")
+                                     if h.strip() != "local" and re.fullmatch(r"[\w][\w.@:-]*", h.strip())))
+        self.data, self.details = {}, {}
+        self.checked = None
+        self.lock = threading.Lock()
+        self.detail_lock = threading.Lock()
+        if self.cmd and background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def command(self, host, *args):
+        return self.cmd + (["--host", host] if host != "local" else []) + list(args)
+
+    def read(self, host, kind):
+        args = ("jobs", "list", "--json") if kind == "jobs" else ("list", "--json")
+        code, out, err = run(self.command(host, *args), timeout=self.TIMEOUT)
+        try:
+            if code != 0:
+                raise ValueError(first_line(err) or "loom exited " + str(code))
+            rows = json.loads(out)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) or not isinstance(row.get("name"), str)
+                                                 or not row["name"] for row in rows):
+                raise ValueError("invalid loom " + kind + " list")
+            if kind == "jobs":
+                rows = [dict(row, next_run=job_next_run(row, time.time())) for row in rows]
+                for row in rows:
+                    if row["next_run"] is not None:
+                        iso(row["next_run"])  # reject unusable timestamps before publishing a snapshot
+                rows.sort(key=job_order)
+            else:
+                rows.sort(key=lambda row: (row.get("status") == "running", row["name"]))
+            return rows, None
+        except (ValueError, TypeError, OverflowError) as exc:
+            return None, clean(str(exc))[:300]
+
+    def fetch(self):
+        with self.lock:
+            if not self.cmd or (self.checked is not None and time.monotonic() - self.checked < self.EVERY):
+                return
+            tasks = [(host, "jobs") for host in self.hosts] + [("local", "apps")]
+            data = {host: {"ok": True, "error": None, "jobs": self.data.get(host, {}).get("jobs", []),
+                           "apps": self.data.get(host, {}).get("apps", [])} for host in self.hosts}
+            with ThreadPoolExecutor(max_workers=min(16, len(tasks))) as pool:
+                pending = [(host, kind, pool.submit(self.read, host, kind)) for host, kind in tasks]
+                for host, kind, future in pending:
+                    rows, error = future.result()
+                    if error:
+                        data[host]["ok"] = False
+                        data[host]["error"] = "; ".join(filter(None, [data[host]["error"], kind + ": " + error]))
+                    else:
+                        data[host][kind] = rows
+            self.data, self.checked = data, time.monotonic()
+
+    def loop(self):
+        while True:
+            self.fetch()
+            time.sleep(self.EVERY)
+
+    def job(self, host, name):
+        if not isinstance(host, str) or not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+            raise ToolError("say which job: its name and loom host (atc_jobs lists them)")
+        entry = self.data.get(host)
+        if not entry or not any(row["name"] == name for row in entry["jobs"]):
+            raise ToolError(f"unknown job {name} on {host}")
+        if not entry["ok"]:
+            raise ToolError(f"loom on {host} isn't answering: {entry['error']}")
+
+    def status(self, host, name):
+        self.job(host, name)
+        code, out, err = run(self.command(host, "jobs", "status", name), timeout=self.TIMEOUT)
+        if code != 0:
+            raise ToolError(clean(first_line(err)) or "loom job status failed")
+        return "\n".join(clean(line) for line in out.splitlines())
+
+    def load_detail(self, host, name):
+        """Start one bounded read. Rendering only consumes the completed text."""
+        key = (host, name)
+        with self.detail_lock:
+            if self.details.get(key) == "Reading loom status…":
+                return
+            self.details[key] = "Reading loom status…"
+
+        def read():
+            try:
+                text = self.status(host, name)
+            except ToolError as exc:
+                text = str(exc)
+            self.details[key] = text
+        threading.Thread(target=read, daemon=True).start()
+
+
+def run_job(loom, host, name, dry_run=False):
+    if loom is None:
+        raise ToolError("loom is not available")
+    loom.job(host, name)  # recheck the latest snapshot after confirmation
+    args = loom.command(host, "jobs", "run", name)
+    if dry_run:
+        return True, "dry run: " + shlex.join(args)
+    code, out, err = run(args, timeout=loom.TIMEOUT)
+    if code is None:
+        return False, "loom stopped answering; the job may or may not have started. Check its status before retrying."
+    return code == 0, clean(first_line(out if code == 0 else err)) or (f"started {name} on {host}" if code == 0
+                                                                    else f"loom exited {code}")
+
+
 class ClosedSessions:
     """Transcripts that changed in the last 14 days but whose session isn't live: closed but resumable."""
 
@@ -1500,8 +1672,8 @@ class RemoteAtc(Remote):
 
 # New sources add typed items here; `approval` (pending levers) and `later` (wake-ups/reminders) are reserved.
 NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": 1, "amail_request": 2, "amail_proposal": 3,
-              "amail_device": 4, "amail_unreachable": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
-URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval"}
+              "amail_device": 4, "amail_unreachable": 5, "job": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
+URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval", "job"}
 
 
 def need_item(kind, title, detail="", host=None, sid=None, since=None, hint=""):
@@ -1523,11 +1695,13 @@ def needs_queue(groups, hosts, items=()):
         for item in h.get("needs", []):
             if not isinstance(item, dict) or item.get("sid") or item.get("host") is not None:
                 continue  # sessions come from groups; another host's items must never come back around
-            if item.get("kind") in ("blocked", "waiting") or not isinstance(item.get("kind"), str):
+            if item.get("kind") in ("blocked", "waiting", "job") or not isinstance(item.get("kind"), str):
                 continue
             needs.append(need_item(item["kind"], item.get("title", ""), item.get("detail", ""), host=h["host"],
                                    since=item.get("since"), hint=item.get("hint", "")))
     for item in needs:
+        if item["kind"] == "job":
+            continue  # loom has its own hosts and availability, independent of atc's agent peers
         h = next((h for h in hosts if h["host"] == item["host"]), None)
         if h and not h["ok"]:
             item["hint"] = (item["hint"] or "") + f" Last seen {human_age(h.get('age'))} ago; {h['host']} isn't answering."
@@ -1540,7 +1714,8 @@ def needs_counts(items):
 
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None, amail=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None, amail=None,
+                 loom=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
@@ -1548,6 +1723,7 @@ class Fleet:
         self.repos = repos
         self.closed = closed
         self.amail_poller = amail
+        self.loom = loom
         self.swarms = swarms or Swarms()
         self.swarm_pids = {}     # unit pid -> swarm id, unit id and display label
         self.sessions = {}       # sid -> Session
@@ -1758,13 +1934,25 @@ class Fleet:
         groups["other"].sort(key=lambda v: v["name"])
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
         hosts = unique_hosts([r.view(now) for r in remotes])
-        needs = needs_queue(groups, hosts, self.amail_poller.items if self.amail_poller else ())
+        jobs = self.loom.data if self.loom else {}
+        items = list(self.amail_poller.items) if self.amail_poller else []
+        for host, entry in jobs.items():
+            for job in entry["jobs"]:
+                if job.get("failing"):
+                    hint = "Open Jobs for status; run it again when ready."
+                    if not entry["ok"]:
+                        hint += " Last seen; loom isn't answering: " + (entry["error"] or "unknown error")
+                    items.append(dict(need_item("job", job["name"], job_summary(job), host=host, hint=hint),
+                                      job=job["name"]))
+        needs = needs_queue(groups, hosts, items)
         return {
             "now": now,
             "groups": groups,
             "needs": needs,
+            "jobs": jobs,
             "counts": {
                 **needs_counts(needs),
+                "jobs_failing": sum(bool(job.get("failing")) for entry in jobs.values() for job in entry["jobs"]),
                 "live": len(sessions),
                 "blocked": len(groups["blocked"]),
                 "waiting": len(groups["waiting"]),
@@ -2862,14 +3050,16 @@ class Service:
             return 200, taxi_quota(self.quota)
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
             result = {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
-            result["needs"] = [item for item in model["needs"] if item["host"] is None]
-            result["counts"] = dict(model["counts"], **needs_counts(result["needs"]))
+            result["jobs"] = {h: entry for h, entry in model["jobs"].items() if h == "local"}
+            result["needs"] = [item for item in model["needs"] if item["host"] in (None, "local")]
+            result["counts"] = dict(model["counts"], **needs_counts(result["needs"]),
+                                    jobs_failing=sum(item["kind"] == "job" for item in result["needs"]))
             return 200, result
         return 404, {"detail": "not found"}
 
     def web_model(self):
         model = self.cockpit.model()
-        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs")}
+        result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs", "jobs")}
         result.update(closed=model.get("closed", [])[:50], comms=list(reversed(model.get("comms", [])[-200:])),
                       quota=taxi_quota(self.quota), quota_text=tool_quota(self.cockpit, {}, Call()),
                       writes=self.writes, refreshed_at=iso(self.at), error=self.error)
@@ -3076,6 +3266,13 @@ class Handler(BaseHTTPRequestHandler):
                 sid = urllib.parse.unquote(path[len("/api/web/session/"):])
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 result = session_data(service.cockpit, {"session": sid, "host": query.get("host", ["local"])[0]})
+            elif path.startswith("/api/web/job/"):
+                name = urllib.parse.unquote(path[len("/api/web/job/"):])
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                loom = service.fleet.loom
+                if loom is None:
+                    raise ToolError("loom is not available")
+                result = {"text": loom.status(query.get("host", ["local"])[0], name)}
             else:
                 raise WebError("not found", 404)
             return self.reply(200, result, extra=extra)
@@ -3242,6 +3439,8 @@ class Cockpit:
             fleet = self.fleet
             if fleet.amail_poller:
                 fleet.amail_poller.fetch()
+            if fleet.loom:
+                fleet.loom.fetch()
             if fleet.feed:
                 fleet.feed.fetch()
             fleet.proc_watch.fetch()
@@ -3275,7 +3474,7 @@ def on_demand_cockpit(dry_run=False, hosts=(), use_hosts=True):
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), dry_run, background=False)
     repos = Repos(background=False)
     fleet = Fleet(None, feed, herdr, Procs(background=False), repos, closed=ClosedSessions(repos=repos, background=False),
-                  amail=AMail(background=False))
+                  amail=AMail(background=False), loom=Loom(background=False))
     quota = Quota(command_from_env("ATC_QUOTAMAX", "quotamax"), dry_run, background=False)
     remotes = [Remote(h, background=False) for h in configured_hosts(hosts)] if use_hosts else []
     return Cockpit(fleet, quota, remotes, Terminals(dry_run), claude_cmd, command_from_env("ATC_ROUTE", "route"),
@@ -3517,8 +3716,49 @@ def tool_fleet(ck, a, call):
     return fleet_text(ck, ck.model(hosts=not folder), os.path.abspath(os.path.expanduser(folder)) if folder else None)
 
 
+@mcp_tool("atc_jobs", "Jobs and apps", "Loom jobs per configured host: failing first, running, then estimated due "
+          "time; plus apps listed by local loom. Optional job and host show its status and recent log.",
+          {"host": {"type": "string", "description": "Loom host (local for this machine)"},
+           "job": {"type": "string", "description": "Exact job name, for status and recent log"}})
+def tool_jobs(ck, a, call):
+    model = ck.model()
+    if a.get("job"):
+        if ck.fleet.loom is None:
+            raise ToolError("loom is not available")
+        return ck.fleet.loom.status(a.get("host") or "local", a["job"])
+    entries = model.get("jobs", {})
+    if a.get("host"):
+        if a["host"] not in entries:
+            raise ToolError("unknown loom host " + a["host"])
+        entries = {a["host"]: entries[a["host"]]}
+    out = []
+    for host, entry in entries.items():
+        out.append("Jobs & apps on " + host)
+        if not entry["ok"]:
+            out.append("  Unavailable (last seen rows): " + clean(entry["error"]))
+        out += ["  " + clean(job["name"]) + " · " + job_summary(job) for job in entry["jobs"]]
+        out += ["  app " + clean(app["name"]) + " · " + clean(app.get("status")) + " · " + clean(app.get("health"))
+                for app in entry["apps"]]
+        if not entry["jobs"] and not entry["apps"]:
+            out.append("  No jobs or apps.")
+    return "\n".join(out) or "Loom is not available."
+
+
+@mcp_tool("atc_run_job", "Run a job now", "Trigger a known loom job now on its configured host. Asks for confirmation; "
+          "unknown jobs and unavailable hosts are refused.",
+          {"job": {"type": "string", "description": "Exact job name from atc_jobs"},
+           "host": {"type": "string", "description": "Loom host (default local)"}}, required=("job",), lever=True)
+def tool_run_job(ck, a, call):
+    ck.model()
+    loom, host, name = ck.fleet.loom, a.get("host") or "local", a.get("job")
+    if loom is None:
+        raise ToolError("loom is not available")
+    loom.job(host, name)
+    return Lever(f"run job {name} now on {host}", lambda: run_job(loom, host, name, call.dry_run or ck.dry_run))
+
+
 @mcp_tool("atc_needs_me", "Who needs me", "The ordered needs-you queue on every machine: blocked prompts, "
-          "a-mail owner items, waiting sessions and a-mail inbox counts. Says where to answer each item.")
+          "a-mail owner items, failing jobs, waiting sessions and a-mail inbox counts. Says where to answer each item.")
 def tool_needs_me(ck, a, call):
     model = ck.model()
     needs = model["needs"]
@@ -4445,7 +4685,41 @@ def swarm_lines(swarm, width):
     return lines
 
 
-def fleet_lines(model, width, show_all):
+def job_key(host, name):
+    return "job::" + urllib.parse.quote(host, safe="") + "::" + name
+
+
+def jobs_lines(model, width, expanded=False):
+    entries = model.get("jobs", {})
+    if not entries:
+        return []
+    out = [(rule("Jobs & apps", width, "enter status · x x run now · p folds idle jobs"), None)]
+    for host, entry in entries.items():
+        out.append(([(clean(host), "head")], None))
+        if not entry["ok"]:
+            out.append(([("  unavailable; last seen rows · " + clean(entry["error"]), "err")], None))
+        due = next((j for j in entry["jobs"] if not j.get("failing") and not j.get("running") and j.get("next_run")), None)
+        idle = []
+        for job in entry["jobs"]:
+            if not expanded and not job.get("failing") and not job.get("running") and job is not due:
+                idle.append(job)
+                continue
+            style = "err" if job.get("failing") else "busy" if job.get("running") else "dim"
+            out.append(([("  " + clean(job["name"]) + "  ", style), (job_summary(job), style)], job_key(host, job["name"])))
+        if idle:
+            expired = sum(bool(j.get("expired")) for j in idle)
+            note = f" ({expired} expired)" if expired else ""
+            out.append(([(f"  {len(idle)} idle jobs{note} · p lists them", "dim")], None))
+        for app in entry["apps"]:
+            status = clean(app.get("status"))
+            out.append(([("  app " + clean(app["name"]) + " · " + status + " · " + clean(app.get("health")),
+                          "busy" if status == "running" else "warn")], None))
+        if not entry["jobs"] and not entry["apps"]:
+            out.append(([("  No jobs or apps.", "dim")], None))
+    return out
+
+
+def fleet_lines(model, width, show_all, jobs_all=False):
     """Every session row, grouped. Returns [(line, sid or None)]."""
     now, groups = model["now"], model["groups"]
     everyone = [v for g in groups.values() for v in g]
@@ -4459,15 +4733,16 @@ def fleet_lines(model, width, show_all):
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
     }
-    for key in ("blocked", "waiting", "needs", "working", "swarms", "agents", "parked", "background", "other"):
+    for key in ("blocked", "waiting", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
         if key == "needs":
             items = [item for item in model.get("needs", []) if item["sid"] is None]
             if items:
                 out.append((rule("a-mail" if all(n["kind"].startswith("amail_") for n in items) else "Needs you",
-                                 width, "answer in Roost or the a-mail app"), None))
+                                 width, "where to answer"), None))
                 for item in items:
                     host = f" on {item['host']}" if item["host"] else ""
-                    out.append(([(clean(item["title"]) + host, "warn"), (" · " + clean(item["hint"]), "dim")], None))
+                    out.append(([(clean(item["title"]) + host, "err" if item["kind"] == "job" else "warn"),
+                                 (" · " + clean(item["hint"]), "dim")], None))
             continue
         if key in ("blocked", "waiting"):
             items = [item for item in model.get("needs", []) if item["kind"] == key]
@@ -4496,6 +4771,9 @@ def fleet_lines(model, width, show_all):
                 out.append((rule(f"Other agents ({len(model['agents'])})", width, "outside any Claude session"), None))
                 for a in model["agents"]:
                     out.append((agent_row(a, name_w), f"@local::p::{a['pid']}"))
+            continue
+        if key == "jobs":
+            out += jobs_lines(model, width, jobs_all)
             continue
         if not groups[key]:
             continue
@@ -4610,6 +4888,11 @@ def resolve(fleet, model, key):
     ("remote", host, v) | ("closed", c) | (None,)."""
     if not key:
         return (None,)
+    if key.startswith("job::"):
+        host, _, name = key[5:].partition("::")
+        host = urllib.parse.unquote(host)
+        job = next((j for j in model.get("jobs", {}).get(host, {}).get("jobs", []) if j["name"] == name), None)
+        return ("job", host, job) if job else (None,)
     if key.startswith("swarm::"):
         ident, _, unit_id = key[7:].partition("::")
         swarm = next((v for v in model.get("swarms", []) if v["id"] == ident), None)
@@ -4651,6 +4934,8 @@ def resolve(fleet, model, key):
 
 def selection_name(item):
     kind = item[0]
+    if kind == "job":
+        return item[2]["name"] + " on " + item[1]
     if kind == "swarm":
         return item[1]["name"] + ("/" + item[2]["id"] if item[2] else "")
     if kind == "session":
@@ -4669,6 +4954,12 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind == "job":
+        host, job = item[1], item[2]
+        detail = fleet.loom.details.get((host, job["name"])) if fleet.loom else None
+        text = detail or job_summary(job) + "\nEnter reads status and recent log; x x runs it now."
+        lines = [[(part, "plain")] for line in text.splitlines() for part in wrap(line, max(1, width - 2))]
+        return lines[:limit] if limit else lines
     if kind == "swarm":
         return swarm_detail_lines(item[1], item[2], limit, width)
     if kind == "session":
@@ -4820,6 +5111,8 @@ def header_line(model):
     ]
     if c["blocked"]:
         line.append((f"{c['blocked']} blocked · ", "err"))
+    if c.get("jobs_failing"):
+        line.append((f"{c['jobs_failing']} failing jobs · ", "err"))
     mail = [item for item in model.get("needs", []) if item["kind"].startswith("amail_")]
     if mail:
         note = clean(mail[0]["title"]) + (f" +{len(mail) - 1} more" if len(mail) > 1 else "")
@@ -5049,7 +5342,8 @@ HELP = [
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
     "tab        bottom panel: all activity, the selected session, comms",
-    "p          hide or show parked, background and other sessions, and finished route swarms",
+    "p          hide or show parked, background and other sessions, finished route swarms and idle jobs",
+    "jobs       enter reads status and recent log; x x runs the selected job now",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
 ]
@@ -5059,7 +5353,7 @@ def render(fleet, model, ui, width, height=None):
     """The main screen. Returns (frame, selectable session ids)."""
     ui["width"] = width
     frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
-    rows = fleet_lines(model, width, ui["show_all"] or height is None)
+    rows = fleet_lines(model, width, ui["show_all"] or height is None, ui.get("jobs_all", False))
     selectable = [sid for _l, sid in rows if sid]
     item = resolve(fleet, model, ui.get("selected"))
 
@@ -5296,7 +5590,10 @@ class App:
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] in ("helper", "process", "closed", "swarm"):
+            if item[0] == "job":
+                self.fleet.loom.load_detail(item[1], item[2]["name"])
+                self.ui.update(view="detail", view_scroll=0)
+            elif item[0] in ("helper", "process", "closed", "swarm"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.open_remote(item[1], item[2])
@@ -5304,6 +5601,7 @@ class App:
                 self.jump(v)
         elif key == "p":
             self.ui["show_all"] = not self.ui["show_all"]
+            self.ui["jobs_all"] = not self.ui.get("jobs_all", False)
         elif key in ("c", "h", "?"):
             self.ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0,
                            view_mine=False)
@@ -5327,7 +5625,9 @@ class App:
             self.start_message(peers)
         elif key == "x":
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] == "process":
+            if item[0] == "job":
+                self.run_job(item)
+            elif item[0] == "process":
                 self.stop(item)
             elif item[0] == "helper":
                 self.say("a subagent stops with its session: select the session row, x x interrupts it")
@@ -5368,6 +5668,26 @@ class App:
         where = f" on {host['host']}" if host else ""
         if self.confirm(f"x:{agent['pid']}{where}", f"stop {agent['tool']} pid {agent['pid']}{where}"):
             self.say(stop_process(host["host"] if host else None, agent["pid"], self.dry_run))
+
+    def run_job(self, item):
+        host, name = item[1], item[2]["name"]
+        try:
+            self.fleet.loom.job(host, name)
+        except ToolError as exc:
+            return self.say(str(exc))
+        if not self.confirm("x:" + job_key(host, name), f"run job {name} now on {host}"):
+            return
+
+        def work():
+            try:
+                ok, text = run_job(self.fleet.loom, host, name, self.dry_run)
+            except ToolError as exc:
+                ok, text = False, str(exc)
+            audit({"transport": "screen", "tool": "atc_run_job", "arguments": {"host": host, "job": name},
+                   "outcome": "dry run" if self.dry_run else "done" if ok else "failed", "detail": text})
+            self.say(text)
+        self.say(f"running job {name} on {host}…")
+        threading.Thread(target=work, daemon=True).start()
 
     def session_command(self, v, command, key):
         if v is None or v["kind"] not in ("interactive", "herdr"):
@@ -5690,7 +6010,8 @@ def main():
     repos = Repos(background=not one_shot)
     closed = ClosedSessions(repos=repos, background=False) if not only and not args.jump else None
     amail = AMail(background=not one_shot) if not args.jump else None
-    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail)
+    loom = Loom(background=not one_shot) if not args.jump else None
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail, loom=loom)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
@@ -5699,6 +6020,8 @@ def main():
         workers = [threading.Thread(target=r.fetch) for r in remotes if not args.jump]
         if amail:
             workers.append(threading.Thread(target=amail.fetch))
+        if loom:
+            workers.append(threading.Thread(target=loom.fetch))
         for w in workers:
             w.start()
         feed.fetch()

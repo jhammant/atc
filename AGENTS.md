@@ -10,7 +10,7 @@ agent process on this machine and on configured servers, with levers to steer th
   evaluated at runtime, no parenthesised context managers, no f-strings that reuse the outer quote inside `{}`.
 - `taxi/` is the Taxi schema for `atc --serve`. `tests/` holds the suite; `tests/fixture.py` builds a fake Claude
   home and runs dummy `claude` processes in a hidden tmux session.
-- Rough map of `atc.py`, top to bottom: readers (`Tail`, `Swarms`, `Agent`/`Helper`/`Session`, `Feed`, `Repos`,
+- Rough map of `atc.py`, top to bottom: readers (`Tail`, `Swarms`, `Agent`/`Helper`/`Session`, `Feed`, `Repos`, `AMail`, `Loom`,
   `ClosedSessions`, `Procs`, `Herdr`, `Remote`, `RemoteAtc`), `Fleet` and `Fleet.model()` (the one view model that
   the screen, `--json`, `--serve` and MCP all use), view helpers, levers (`deliver`, `interrupt_session`, `jump_to`,
   `stop_process`, `open_tab`, `Quota`), the HTTP service (`Service`, `Handler`), MCP (`@mcp_tool` registry `TOOLS`,
@@ -21,6 +21,7 @@ agent process on this machine and on configured servers, with levers to steer th
 ```bash
 python3 -m unittest discover -s tests -v                 # everything; needs tmux and ps; about 2 minutes
 python3 -m unittest discover -s tests -p test_mcp.py     # MCP and HTTP only; about 20 s
+node --test tests/test_web_ui.js                       # browser polling, rendering and levers
 ruff check --select F,E9 atc.py tests/                   # lint (errors only)
 /usr/bin/python3 -c 'import ast; ast.parse(open("atc.py").read())'   # still Python 3.9
 ```
