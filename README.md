@@ -106,6 +106,79 @@ Used when found on `PATH`; override with `ATC_QUOTAMAX`, `ATC_ROUTE`, `ATC_HERDR
 - [Herdr](https://herdr.dev): agents in Herdr panes, steered through Herdr. `atc` only talks to a Herdr
   server that is already running and never starts one, because starting it resumes every saved agent.
 
+## Talk to it from Claude (MCP)
+
+`atc mcp` is an [MCP](https://modelcontextprotocol.io) server, and `atc --serve` answers MCP at `POST /mcp` too.
+Register it once and any Claude Code session can ask who needs you, what another session is doing or what the
+agents are saying, and pull the same levers as the screen, on this machine and on your servers.
+
+```bash
+claude mcp add --scope user atc -- atc mcp     # on this machine: stdio, nothing to expose
+claude mcp add --transport http --scope user atc https://atc.example.ts.net/mcp \
+  --header "Authorization: Bearer <token>"     # from another machine, through atc --serve --serve-writes
+```
+
+| Tool | What it does | Same as |
+|---|---|---|
+| `atc_fleet` | Every session by state (blocked, waiting, working, parked, background, other), swarms, other agents, servers | `atc --once` |
+| `atc_needs_me` | Sessions blocked on a prompt, with what they ask, and sessions waiting for you, with what they said, on every machine | the top of the screen |
+| `atc_session` | One session: folder, state, what it is doing and said, git, helpers and workflow phases, worker processes, recent steps | `enter`, the bottom panel |
+| `atc_tree` | Session › workflow › phase › agent › worker process | `atc --tree`, `h` |
+| `atc_comms` | Messages between sessions, tasks to helpers and their reports, swarm a-mail; newest first | `atc --comms`, `c` |
+| `atc_quota` | Claude, Codex, Kimi, DeepSeek quota and the swarm cap | the quota line |
+| `atc_closed` | Closed sessions you can resume, with their last words and next step | the Closed section |
+| `atc_message` | Type a message into a session, as if you typed it there | `m` |
+| `atc_broadcast` | The same message to every session in a folder | `M` |
+| `atc_interrupt` | Interrupt a session (Esc), or stop a background one | `x x` |
+| `atc_stop_process` | Stop an agent process (SIGTERM), here or on a server | `x x` on a process |
+| `atc_close` | Wrap a session up with `/closecode`, or `/exit` it when nothing is unsaved | `S S`, `E E` |
+| `atc_fork` | Type `/forkcode` into a session | `F F` |
+| `atc_rename` | Rename a session (`/rename`) | `N N` |
+| `atc_restore` | Reopen a closed session (`claude --resume`) in a new tab | `R R` |
+| `atc_cap` | Raise, lower or reset the swarm cap | `+` `-` `0`, `--cap` |
+| `atc_new_task` | Where a task should run (`route`); with `pool`, start it there in a new tab | `n` |
+| `atc_jump` | Bring a session's terminal tab to the front | `enter`, `--jump` |
+
+A session is named by its id (or the start of it), its name or its title. One on a server takes `host`, or is
+written `name@host`.
+
+**Levers keep the screen's rules, and add some for being called by a model:**
+
+- **Never into a session blocked on a prompt.** Its default answer is "Yes"; the message is refused, not typed.
+- **You confirm steering.** `message`, `broadcast`, `interrupt`, `stop_process`, `close`, `fork`, `rename`,
+  `restore` and a `new_task` with a `pool` ask you first, in the calling session (an MCP elicitation). A client that
+  can't ask, or a session nobody is watching, gets a refusal. `jump`, `cap` and a `new_task` plan just run.
+  `ATC_MCP_LEVERS=auto` drops the question; `ATC_MCP_LEVERS=off` makes MCP read-only.
+- **Not into itself.** A lever aimed at the session that called it is refused unless the call says
+  `allow_self: true`. Over stdio atc knows the caller from Claude Code's environment; over HTTP, from an
+  `X-Atc-Caller: <session id>` header when the client sends one.
+- **`dry_run: true`** on any lever says what it would do.
+- **Every lever call is logged** to `~/.config/atc/audit.jsonl` (`0600`): when, who called, what, and what
+  happened.
+- **Servers too.** A lever on a session or process on a server in `~/.config/atc/hosts` runs there over ssh, the
+  way atc reads it, so nothing is installed there. Typing needs the session in tmux or Herdr on that machine.
+- **Over HTTP the token is always required at `/mcp`**, on this machine too, and levers are listed only with
+  `--serve-writes`. A request that arrives through a reverse proxy (`X-Forwarded-For`) counts as off this
+  machine for every endpoint.
+
+**A laptop that sleeps.** Run a second atc on an always-on server and point it at the laptop's:
+
+```bash
+atc --serve 100.64.0.1:7070 --serve-writes                  # the laptop, on its tailnet address
+atc --serve 100.64.0.2:7070 --serve-writes \
+    --serve-prefer http://100.64.0.1:7070                   # the server: register this one everywhere else
+```
+
+The server passes `/mcp` through to the laptop's atc while it answers, so you see everything the laptop sees. When
+the laptop sleeps, the server answers itself: its own sessions and servers live, and the laptop as last seen
+(read from the laptop's `/api/fleet` while it was awake), with a note saying so. Both read the same token: copy
+`~/.config/atc/serve-token` across (`0600`). A tool call that was passed through but got no answer is reported,
+never run a second time on the server.
+
+atc speaks protocol `2026-07-28` (stateless; `server/discover`; confirmation by returning `input_required`) and
+the handshake revisions `2025-11-25`, `2025-06-18` and `2025-03-26` (`initialize`; confirmation as an
+`elicitation/create` request over stdio). Results are plain text, written for a model to read.
+
 ## Route swarms
 
 Run `route swarm` as usual, then watch it in atc:
@@ -181,6 +254,8 @@ the same guard as the screen: a session blocked on a prompt is never typed into 
 | `POST /api/taxi/messages` | `write operation messageSession(SessionMessage): MessageResult` |
 | `POST /api/taxi/swarm-cap` | `write operation changeSwarmCap(SwarmCapChange): SwarmCapResult` |
 | `GET /api/taxi/schema` | the schema itself |
+| `GET /api/fleet` | sessions, counts and agent processes, for another atc (token required) |
+| `POST /mcp` | MCP (see above; token required) |
 
 **Point Orbital at it.** Straight from this repo (Orbital polls it, so schema updates arrive on their own), in
 your `workspace.conf`:

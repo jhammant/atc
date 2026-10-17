@@ -296,7 +296,7 @@ class Fixture:
         closed_dir = os.path.join(self.claude_home, "projects", slug_name)
         closed_sid = "cccccccc-0000-4000-8000-000000000001"
         write_jsonl(os.path.join(closed_dir, f"{closed_sid}.jsonl"), [
-            user(7200, "Build the API client for the new service"),
+            dict(user(7200, "Build the API client for the new service"), cwd=closed_cwd),  # as real transcripts do
             {"type": "ai-title", "aiTitle": "API client build"},
             {"type": "custom-title", "customTitle": "api-client"},
             assistant(3600, text("Done. The API client is ready and all tests pass."), stop="end_turn"),
