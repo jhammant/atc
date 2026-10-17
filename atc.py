@@ -4441,6 +4441,15 @@ class McpServer:
                "detail": first_line(str(detail))[:300]})
 
 
+def stdio_attended(env):
+    """Whether someone can answer a question in the session that started `atc mcp`. Claude Code says so with
+    CLAUDE_CODE_SESSION_ATTENDED, but a headless run (`claude -p`, the SDK: entrypoint sdk-*) still reports itself
+    attended and advertises forms it can't show, then cancels them: treat it as unattended, so a lever waits for
+    the owner's approval instead of being refused."""
+    entry = env.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
+    return env.get("CLAUDE_CODE_SESSION_ATTENDED") != "0" and not entry.startswith("sdk")
+
+
 def mcp_stdio(cockpit, instream=None, outstream=None):
     """`atc mcp`: MCP over stdin and stdout, one JSON-RPC message per line, and nothing else ever on stdout."""
     instream, outstream = instream or sys.stdin, outstream or sys.stdout
@@ -4478,7 +4487,7 @@ def mcp_stdio(cockpit, instream=None, outstream=None):
         return None
 
     server = McpServer(cockpit, "stdio", caller=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
-                       attended=os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") != "0", ask=ask)
+                       attended=stdio_attended(os.environ), ask=ask)
     threading.Thread(target=read, daemon=True).start()
     while True:
         line = backlog.popleft() if backlog else inbox.get()

@@ -77,7 +77,8 @@ class Client:
     """A fake MCP client: starts `atc mcp`, writes JSON-RPC lines, reads them back."""
 
     def __init__(self, **env):
-        base = {"CLAUDE_CODE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ATTENDED": "1", "ATC_MCP_LEVERS": ""}
+        base = {"CLAUDE_CODE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+                "ATC_MCP_LEVERS": ""}
         self.proc = subprocess.Popen([sys.executable, fixture.ATC, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=FX.env(**dict(base, **env)))
         self.lines = queue.Queue()
@@ -387,6 +388,16 @@ class Policy(unittest.TestCase):
             self.assertIn("Waiting for approval", text(pending))
             self.assertNotIn("nobody watching", FX.pane("beta-22"))
             self.assertFalse(c.call("atc_jump", {"session": "beta-22", "dry_run": True})["isError"])
+        finally:
+            c.close()
+
+    def test_headless_run_requests_owner_approval(self):
+        c = Client(CLAUDE_CODE_ENTRYPOINT="sdk-cli")  # claude -p: says attended, can't show a form
+        try:
+            pending = c.call("atc_message", {"session": "beta-22", "text": "from a headless run"})
+            self.assertFalse(pending["isError"])
+            self.assertIn("Waiting for approval", text(pending))
+            self.assertNotIn("from a headless run", FX.pane("beta-22"))
         finally:
             c.close()
 
