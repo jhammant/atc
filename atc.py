@@ -1429,15 +1429,21 @@ class RemoteAtc(Remote):
         req = urllib.request.Request(self.url + "/api/peer/tools/" + name,
                                      data=json.dumps({"arguments": arguments, "caller": caller}).encode(),
                                      headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+        uncertain = (False, f"{self.host} stopped answering; the call may or may not have run there. "
+                           "Check the session before trying again.")
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
-                result = json.loads(response.read())
-            return result.get("ok") is True, str(result.get("text") or "")
+            response = urllib.request.urlopen(req, timeout=120)
         except urllib.error.HTTPError as exc:
             exc.close()
             return False, f"{self.host} refused the peer call (HTTP {exc.code}); check its peer secret and --serve-writes"
-        except (OSError, ValueError, AttributeError):
-            return False, f"{self.host} stopped answering; the call may have run. Check the session before trying again."
+        except Exception:  # once sent, a call must never be retried because its response failed
+            return uncertain
+        try:
+            with response:
+                result = json.loads(response.read())
+            return result.get("ok") is True, str(result.get("text") or "")
+        except Exception:  # includes truncated bodies and errors raised by response readers/decoders
+            return uncertain
 
 
 # ---------------------------------------------------------------- the fleet
@@ -2408,17 +2414,21 @@ def openssl_run(args, data=None):
 
 
 def cose_pem(key):
-    if not isinstance(key, dict) or key.get(1) != 2 or key.get(3) != -7 or key.get(-1) != 1:
+    if not isinstance(key, dict) or any(type(key.get(k)) is not int or key[k] != v
+                                        for k, v in ((1, 2), (3, -7), (-1, 1))):
         raise WebError("Only ES256 P-256 passkeys are supported")
     x, y = key.get(-2), key.get(-3)
     if not isinstance(x, bytes) or not isinstance(y, bytes) or len(x) != 32 or len(y) != 32:
         raise WebError("Invalid P-256 public key")
-    # SubjectPublicKeyInfo: id-ecPublicKey, prime256v1, uncompressed point. OpenSSL checks the curve.
+    # P-256 affine point membership; signature verification remains OpenSSL's job.
+    p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+    b = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+    px, py = int.from_bytes(x, "big"), int.from_bytes(y, "big")
+    if px >= p or py >= p or (py * py - (pow(px, 3, p) - 3 * px + b)) % p:
+        raise WebError("Invalid P-256 public key")
+    # SubjectPublicKeyInfo: id-ecPublicKey, prime256v1, uncompressed point.
     der = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d03010703420004") + x + y
     pem = "-----BEGIN PUBLIC KEY-----\n" + "\n".join(textwrap.wrap(base64.b64encode(der).decode(), 64)) + "\n-----END PUBLIC KEY-----\n"
-    checked = openssl_run(["ec", "-pubin", "-check", "-noout"], pem.encode())
-    if checked.returncode:
-        raise WebError("Invalid P-256 public key")
     return pem
 
 

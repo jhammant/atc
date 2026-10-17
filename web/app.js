@@ -29,7 +29,9 @@ async function api(path, body) {
   const result = await response.json();
   if (!response.ok) {
     if (response.status === 401 && !path.startsWith("auth/")) showSignin();
-    throw new Error(result.text || result.detail || `Request failed (${response.status})`);
+    const error = new Error(result.text || result.detail || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
   }
   return result;
 }
@@ -144,8 +146,11 @@ function fleetView(needs) {
   const fragment = document.createDocumentFragment(); let total = 0;
   for (const machine of machines()) {
     const box = node("section", null, "machine");
-    box.append(node("h2", machine.local ? `${machine.host} · hub` : machine.host));
-    if (!machine.ok) box.append(node("p", `Not answering. Last seen: ${age(machine.age)}. ${machine.error || ""}`, "notice"));
+    box.append(node("h2", machine.host));
+    if (!machine.ok) {
+      const error = String(machine.error || "Not answering").trim().replace(/[.!]+$/, "");
+      box.append(node("p", `${error}. Last seen: ${age(machine.age)}.`, "notice"));
+    }
     let count = 0;
     for (const group of needs ? ["blocked", "waiting"] : groups) {
       const sessions = (machine.groups || {})[group] || [];
@@ -288,6 +293,7 @@ function refresh() {
       disableActions(busy);
     } catch (error) {
       if (signedIn) { $("connection").textContent = "Connection lost · showing last snapshot"; status(error.message, true); }
+      else if (error.status !== 401) $("connection").textContent = "Can't reach atc, retrying…";
     }
   })().finally(() => { refreshing = null; if (current !== generation && signedIn) refresh(); });
   return refreshing;
@@ -310,5 +316,5 @@ $("filter").addEventListener("input", () => { if (model) drawModel(); });
 $("refresh").addEventListener("click", () => refresh());
 window.addEventListener("hashchange", navigate);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
-setInterval(() => { if (signedIn) refresh(); }, 5000);
+setInterval(refresh, 5000);
 navigate();

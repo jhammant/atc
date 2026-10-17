@@ -214,6 +214,7 @@ swarms and other processes by machine. Open a session for its full last words, g
 messages. Remote session detail uses its fleet snapshot, so it has less detail. **Comms**, **Quota** (including
 swarm cap controls), and **Closed** (including Restore) cover the hub's messages, quota and closed sessions.
 The page refreshes every five seconds while visible, works on phones, and follows the system color scheme.
+If the first connection fails, it shows a retry message and keeps polling, even before sign-in.
 
 Message, Interrupt, Save & close, Exit, Fork, Rename, Jump, Restore and swarm cap changes first run a dry
 run. The page shows the tool's own summary and runs it only after you confirm. Existing refusals still
@@ -229,7 +230,8 @@ and SameSite=Strict. Every web POST also checks the configured Origin and `X-Atc
 `/api/web/auth/{register,login}/{options,finish}` bootstrap endpoints allow unsigned requests; registration
 still needs a hub enrollment code or an existing web session. WebAuthn challenges expire after two minutes
 and can be used once. Only ES256/P-256 keys are accepted, with user presence and verification required.
-OpenSSL verifies signatures; if it is missing, sign-in fails closed. Passkeys, hashed enrollment codes and
+OpenSSL (including macOS LibreSSL) verifies signatures; atc checks P-256 public-key points locally. If
+OpenSSL is missing, sign-in fails closed. Passkeys, hashed enrollment codes and
 identity files live in `~/.config/atc/web/` (0700 directory, 0600 files). Cookies are never stored on disk or
 written to the audit log. Sign-in, enrollment, passkey removal and web levers are audited with the passkey
 name. Session text is rendered as text, under a policy that allows only same-origin assets and no inline scripts.

@@ -4,6 +4,8 @@ The passkey vectors are built independently with OpenSSL, not a mock signature v
 """
 import base64
 import hashlib
+import http.client
+import io
 import json
 import os
 import secrets
@@ -81,7 +83,10 @@ class Passkey:
 
 class HTTP:
     def start(self, service):
-        server = self.m.make_server(service, "127.0.0.1:0")
+        try:
+            server = self.m.make_server(service, "127.0.0.1:0")
+        except PermissionError as exc:
+            self.skipTest(f"web HTTP fixture needs loopback sockets; sandbox denied them: {exc}")
         threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -122,6 +127,87 @@ class HTTP:
         status, data, headers = self.finish(key, options, register=True)
         self.assertEqual(status, 200, data)
         return key, headers["Set-Cookie"].split(";", 1)[0]
+
+
+class WebChecks(unittest.TestCase):
+    """Crypto and peer failure regressions that do not need a listening socket or live processes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="atc-web-check-")
+        self.addCleanup(self.tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "ATC_PEER_TOKEN": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        self.m = load_atc({})
+
+    def test_registration_and_signature_with_first_openssl_on_path(self):
+        if not OPENSSL:
+            self.skipTest("openssl is needed to build and verify P-256 passkey vectors")
+        self.assertEqual(OPENSSL, shutil.which("openssl"))
+        web = self.m.WebAuth(ORIGIN, os.path.join(self.tmp.name, "web"))
+        key = Passkey(self.tmp.name)
+        code = self.m.web_enroll(web.directory, is_tty=lambda: True)
+
+        with mock.patch.object(self.m, "openssl_run", wraps=self.m.openssl_run) as openssl:
+            options = web.begin("register", {"code": code, "name": "Phone"})
+            web.finish("register", key.response(options["challenge"], register=True))
+            options = web.begin("login", {})
+            token = web.finish("login", key.response(options["challenge"], count=1))
+
+        self.assertEqual(web.identity("atc_session=" + token)["name"], "Phone")
+        openssl.assert_called_once()
+        self.assertEqual(openssl.call_args[0][0][:3], ["dgst", "-sha256", "-verify"])
+
+    def test_off_curve_and_out_of_range_cose_points_are_rejected(self):
+        p = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+        for x, y in ((0, 0), (1, 1), (p, 1), (1, p)):
+            key = {1: 2, 3: -7, -1: 1, -2: x.to_bytes(32, "big"), -3: y.to_bytes(32, "big")}
+
+            with self.subTest(x=x, y=y):
+                with mock.patch.object(self.m, "openssl_run") as openssl:
+                    with self.assertRaisesRegex(self.m.WebError, "Invalid P-256"):
+                        self.m.cose_pem(key)
+
+                openssl.assert_not_called()
+
+    def test_peer_body_failures_are_indeterminate_and_audited_on_hub(self):
+        service = self.m.Service(self.m.Fleet(), None, [], self.m.Terminals(), writes=True,
+                                 token=TOKEN, peer_secret=PEER, background=False)
+        remote = self.m.RemoteAtc("http://laptop.example.com", TOKEN, background=False)
+        remote.host = "laptop"
+        remote.data = {"groups": {"waiting": [{"sid": "session-beta", "name": "beta", "kind": "interactive",
+                                              "group": "waiting", "status": "idle", "cwd": "/workspace/example"}]}}
+        service.remotes.append(remote)
+        service.model = {"groups": {}, "hosts": [remote.view(time.time())]}
+        arguments = {"session": "session-beta", "host": "laptop", "text": "one peer call"}
+        # A real HTTPResponse parser reading a truncated body, without opening a socket.
+        stream = mock.Mock()
+        stream.makefile.return_value = io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"ok":')
+        truncated = http.client.HTTPResponse(stream)
+        truncated.begin()
+        responses = [truncated]
+        http_error = urllib.error.HTTPError(remote.url, 500, "reader failed", {}, io.BytesIO())
+        self.addCleanup(http_error.close)
+        for error in (RuntimeError("reader failed"), http_error):
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.side_effect = error
+            responses.append(response)
+
+        for response in responses:
+            with mock.patch.object(self.m.urllib.request, "urlopen", return_value=response) as request:
+                result = service.run_tool("web", "atc_message", {"arguments": arguments}, "Phone")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("may or may not have run there", result["text"])
+            request.assert_called_once()
+        self.assertTrue(truncated.isclosed())
+        with open(self.m.AUDIT_LOG) as fh:
+            rows = [json.loads(line) for line in fh]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            self.assertEqual((row["transport"], row["caller"], row["outcome"]), ("web", "Phone", "failed"))
+            self.assertIn("may or may not have run there", row["detail"])
 
 
 class WebHTTP(HTTP, unittest.TestCase):
@@ -328,9 +414,8 @@ class WebHTTP(HTTP, unittest.TestCase):
                     self.m.cbor_read(data)
         with self.assertRaises(self.m.WebError):
             self.m.cose_pem({1: 2, 3: -257, -1: 1, -2: bytes(32), -3: bytes(32)})
-        if OPENSSL:
-            with self.assertRaises(self.m.WebError):
-                self.m.cose_pem({1: 2, 3: -7, -1: 1, -2: bytes(32), -3: bytes(32)})
+        with self.assertRaises(self.m.WebError):
+            self.m.cose_pem({1: 2, 3: -7, -1: 1, -2: bytes(32), -3: bytes(32)})
 
     def test_peer_auth_separate_token_and_read_only(self):
         path = "/api/peer/tools/atc_cap"
