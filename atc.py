@@ -89,6 +89,7 @@ WORKER_NAMES = {"codex", "kimi", "claude", "aider", "gemini", "opencode", "goose
                 "hermes"}
 STALE_AGENT_SECONDS = 24 * 3600  # an agent process running longer than this is probably stuck or forgotten
 REMOTE_EVERY = 15.0
+SERVE_POLL = {"feed": 10.0, "procs": 15.0, "remote": 60.0}  # --serve runs all day: poll less than the screen does
 HOSTS_FILE = os.path.expanduser("~/.config/atc/hosts")
 CLOSED_CONFIG = os.path.expanduser("~/.config/atc/closed.json")
 CLOSED_DAYS = 14
@@ -796,6 +797,7 @@ class Feed:
         self.cmd = claude_cmd
         self.entries = None
         self.error = None
+        self.every = FEED_EVERY
         if claude_cmd and background:
             threading.Thread(target=self.loop, daemon=True).start()
 
@@ -813,7 +815,7 @@ class Feed:
     def loop(self):
         while True:
             self.fetch()
-            time.sleep(FEED_EVERY)
+            time.sleep(self.every)
 
     def status_now(self, sid):
         """A fresh status for one session, read right before typing into it."""
@@ -975,7 +977,7 @@ class ClosedSessions:
         except OSError:
             return info
         custom_title = ai_title = last_text = ""
-        last_ts = None
+        last_ts, recorded_cwd = None, None
         for raw in data.split(b"\n"):
             try:
                 rec = json.loads(raw)
@@ -986,6 +988,8 @@ class ClosedSessions:
             ts = parse_ts(rec.get("timestamp"))
             if ts and (last_ts is None or ts > last_ts):
                 last_ts = ts
+            if isinstance(rec.get("cwd"), str) and rec["cwd"].startswith("/"):
+                recorded_cwd = rec["cwd"]  # where it really ran: the folder slug can't tell a-b from a/b
             kind = rec.get("type")
             if kind == "ai-title" and rec.get("aiTitle"):
                 ai_title = squash(rec["aiTitle"])
@@ -1002,6 +1006,8 @@ class ClosedSessions:
         info["title"] = custom_title or ai_title
         info["last_words"] = last_text
         info["last_ts"] = last_ts
+        if recorded_cwd:
+            info["cwd"] = cwd = recorded_cwd
         # Read STATE.md next steps if the repo has one
         state_md = os.path.join(cwd, "STATE.md") if os.path.isdir(cwd) else ""
         if state_md and os.path.isfile(state_md):
@@ -1055,6 +1061,7 @@ class Procs:
 
     def __init__(self, background=True):
         self.snapshot = None  # (table, children, taken_at), replaced in one go
+        self.every = PROC_EVERY
         if background:
             threading.Thread(target=self.loop, daemon=True).start()
 
@@ -1069,7 +1076,7 @@ class Procs:
     def loop(self):
         while True:
             self.fetch()
-            time.sleep(PROC_EVERY)
+            time.sleep(self.every)
 
     def get(self):
         return self.snapshot or self.fetch()  # only the very first refresh waits for ps
@@ -1299,6 +1306,7 @@ class Remote:
         self.error = None
         self.ok_at = None
         self.latency = None
+        self.every = REMOTE_EVERY
         if background:
             threading.Thread(target=self.loop, daemon=True).start()
 
@@ -1325,7 +1333,7 @@ class Remote:
     def loop(self):
         while True:
             self.fetch()
-            time.sleep(REMOTE_EVERY)
+            time.sleep(self.every)
 
     def view(self, now):
         data = self.data or {}
@@ -1343,7 +1351,7 @@ class RemoteAtc(Remote):
 
     def __init__(self, url, token, background=True):
         self.url, self.token = url.rstrip("/"), token
-        super().__init__((urllib.parse.urlsplit(self.url).hostname or self.url).split(".")[0], background)
+        super().__init__(url_host(self.url), background)
 
     def fetch(self):
         start = time.time()
@@ -1358,6 +1366,7 @@ class RemoteAtc(Remote):
             self.error = "its atc sent something odd"
             return
         self.data, self.error, self.ok_at, self.latency = data, None, time.time(), time.time() - start
+        self.host = str(data.get("machine") or self.host).split(".")[0]  # its own name, not its address
 
 
 # ---------------------------------------------------------------- the fleet
@@ -2140,7 +2149,7 @@ class Service:
         self.cockpit = Cockpit(fleet, quota, remotes, terminals, claude_cmd or ["claude"], route_cmd, service=self)
         self.mcp = McpServer(self.cockpit, "http", levers=writes)
         self.prefer = prefer.rstrip("/") if prefer else None
-        self.prefer_name = (urllib.parse.urlsplit(self.prefer).hostname or self.prefer).split(".")[0] if prefer else None
+        self.prefer_name = url_host(self.prefer) if prefer else None   # until its atc says its own name
         self.prefer_ok, self.prefer_checked, self.prefer_down_since = False, 0.0, None
         self.prefer_lock = threading.Lock()
         if background:
@@ -2155,8 +2164,10 @@ class Service:
         req = urllib.request.Request(self.prefer + "/api/health", headers={"Authorization": f"Bearer {self.token}"})
         try:
             with urllib.request.urlopen(req, timeout=2) as r:
-                ok = r.status == 200 and bool(json.loads(r.read() or b"{}").get("ok"))
-        except (OSError, ValueError):
+                health = json.loads(r.read() or b"{}")
+            ok = bool(health.get("ok"))
+            self.prefer_name = str(health.get("machine") or self.prefer_name).split(".")[0]
+        except (OSError, ValueError, AttributeError):
             ok = False
         self.prefer_seen(ok)
         return ok
@@ -2214,7 +2225,8 @@ class Service:
         """(status, body) for a GET."""
         model = self.model
         if path == "/api/health":
-            return 200, {"ok": model is not None, "refreshedAt": iso(self.at), "error": self.error}
+            return 200, {"ok": model is not None, "refreshedAt": iso(self.at), "error": self.error,
+                         "machine": socket.gethostname().split(".")[0]}
         if model is None:
             return 503, {"detail": "atc is still reading sessions; try again in a moment"}
         if path == "/api/taxi/sessions":
@@ -2515,6 +2527,12 @@ def session_ref(v, host=None):
     return display + (f" ({', '.join(bits)})" if bits else "") + (f" on {host}" if host else "")
 
 
+def url_host(url):
+    """A short name for the machine at a URL: ghost for ghost.tail1234.ts.net, the whole address for an IP."""
+    host = urllib.parse.urlsplit(url).hostname or url
+    return host if re.match(r"^[\d.]+$|:", host) else host.split(".")[0]
+
+
 def host_sessions(h):
     return [v for key in GROUP_ORDER for v in h.get("groups", {}).get(key, [])]
 
@@ -2726,9 +2744,17 @@ def tool_needs_me(ck, a, call):
     for h in model.get("hosts", []):
         for key in found:
             found[key] += [(h["host"], v) for v in h.get("groups", {}).get(key, [])] if h["ok"] else []
-        if not h["ok"]:
-            down.append(f"{h['host']} isn't answering ({clean(h.get('error') or 'no answer yet')}): its sessions "
-                        "aren't included")
+        if h["ok"]:
+            continue
+        stale = [(key, v) for key in ("blocked", "waiting") for v in h.get("groups", {}).get(key, [])]
+        if h.get("age") is None:
+            down.append(f"\n{h['host']} isn't answering ({clean(h.get('error') or 'no answer yet')}), and atc hasn't "
+                        "seen it yet")
+            continue
+        down.append(f"\n{h['host']} isn't answering ({clean(h.get('error') or 'no answer')}). As last seen "
+                    f"{human_age(h['age'])} ago, " + (f"{len(stale)} needed you:" if stale else "nothing there needed you."))
+        down += [f"  {session_ref(v, h['host'])} · {'blocked' if key == 'blocked' else 'waiting'}: "
+                 f"{clean(v.get('doing') if key == 'blocked' else (v.get('said') or v.get('doing')))}" for key, v in stale]
     out = []
     if found["blocked"]:
         out.append(f"Blocked on a prompt ({len(found['blocked'])}). Answer these in the session; typing into one "
@@ -4863,6 +4889,9 @@ def main():
     if args.serve:
         address = args.serve if ":" in args.serve else f"127.0.0.1:{args.serve}"
         token = serve_token(create=True)  # /mcp always needs one, and so does any read off this machine
+        feed.every, fleet.proc_watch.every = SERVE_POLL["feed"], SERVE_POLL["procs"]
+        for r in remotes:
+            r.every = SERVE_POLL["remote"]
         if args.serve_prefer:  # keep the preferred atc's machine on show, as last seen once it sleeps
             remotes.append(RemoteAtc(args.serve_prefer, token))
         service = Service(fleet, quota, remotes, Terminals(args.dry_run), writes=args.serve_writes, token=token,
