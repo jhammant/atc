@@ -21,6 +21,11 @@ from datetime import datetime, timezone
 ATC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "atc.py")
 TMUX = shutil.which("tmux")
 NAMES = ("alpha-11", "beta-22", "gamma-33", "delta-44")
+AMAIL_ALPHA = "alpha-1111@owner.amail.example.com"
+AMAIL_BETA = "beta-2222@owner.amail.example.com"
+AMAIL_HELPER = "helper-3333@owner.amail.example.com"
+AMAIL_OTHER = "reviewer-4444@other.amail.example.com"
+AMAIL_BODY = "API review by a-mail\nCheck the error paths."
 
 
 def iso(seconds_ago):
@@ -46,9 +51,9 @@ def tool(tid, name, **inp):
     return {"type": "tool_use", "id": tid, "name": name, "input": inp}
 
 
-def result(ago, tid):
+def result(ago, tid, content="ok"):
     return {"type": "user", "timestamp": iso(ago),
-            "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": "ok"}]}}
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid, "content": content}]}}
 
 
 def text(t):
@@ -57,6 +62,17 @@ def text(t):
 
 def user(ago, t):
     return {"type": "user", "timestamp": iso(ago), "message": {"content": t}}
+
+
+def amail_item(mid="mail-api", frm=AMAIL_ALPHA, to=AMAIL_BETA, body=AMAIL_BODY):
+    return {"delivery_id": 1, "kind": "message", "message": {
+        "id": mid, "thread_id": "thread-api", "thread_kind": "direct", "seq": 1,
+        "from": frm, "via": "direct", "sender_kind": "agent", "parts": [text(body)], "encrypted": False},
+        "policy": {}, "provenance": {"to": to, "verified_sender": True}, "status": "delivered"}
+
+
+def amail_inbox(*items):
+    return json.dumps({"count": len(items), "items": list(items), "owner_decisions": []})
 
 
 STUB_CLAUDE = '''#!/usr/bin/env python3
@@ -220,11 +236,19 @@ class Fixture:
         write_jsonl(os.path.join(adir, f"{a['sid']}.jsonl"), [
             user(900, "Build the release train for the API"),
             {"type": "ai-title", "aiTitle": "Alpha feature work"},
+            assistant(850, tool("mail-who", "mcp__amail__amail_whoami")),
+            result(849, "mail-who", json.dumps({"default_address": AMAIL_ALPHA,
+                   "addresses": [{"address": AMAIL_ALPHA, "kind": "session"},
+                                 {"address": "alias-1111@owner.amail.example.com", "kind": "alias"}],
+                   "agent": {"name": "fixture-alpha"}})),
             assistant(800, tool("t1", "Edit", file_path=os.path.join(a["cwd"], "src", "app.py"))),
             result(799, "t1"),
             assistant(700, tool("t2", "SendMessage", to="beta-22", summary="Ask beta to review the API",
                                 message="Please review the API before we ship")),
             result(699, "t2"),
+            assistant(680, tool("mail-send", "mcp__amail__amail_send", to=AMAIL_BETA, text=AMAIL_BODY,
+                                thread="thread-api", subject="Review")),
+            result(679, "mail-send"),
             assistant(5, tool("t3", "Bash", command="pytest -q", description="Run the test suite")),
         ])
         sub = os.path.join(adir, a["sid"], "subagents")
@@ -233,6 +257,11 @@ class Fixture:
              [user(600, "Write unit tests for app.py and report the pass count"),
               assistant(500, tool("h1", "Write", file_path=os.path.join(a["cwd"], "tests", "test_app.py"))),
               result(499, "h1"),
+              assistant(490, tool("helper-who", "mcp__amail__amail_whoami")),
+              result(489, "helper-who", [text(json.dumps({"default_address": AMAIL_HELPER}))]),
+              assistant(480, tool("helper-send", "mcp__amail__amail_send", to=AMAIL_OTHER,
+                                  text="Helper review by a-mail")),
+              result(479, "helper-send"),
               assistant(400, text("All 12 tests pass"), stop="end_turn")], sub),
             ("a222222222222222", {"agentType": "general-purpose", "description": "Lint fixer", "spawnDepth": 2,
                                   "parentAgentId": "a111111111111111", "model": "haiku"},
@@ -271,9 +300,16 @@ class Fixture:
             user(1200, "Draft the changelog"),
             {"type": "ai-title", "aiTitle": "Changelog"},
             {"type": "custom-title", "customTitle": "changelog-drafter"},
+            assistant(800, tool("mail-session", "mcp__amail__amail_session")),
+            result(799, "mail-session", [text(json.dumps({"address": AMAIL_BETA}))]),
             {"type": "queue-operation", "operation": "enqueue", "timestamp": iso(690),
              "content": f'<cross-session-message from="uds:/tmp/cc-socks-test/{a["pid"]}.sock" from-name="alpha-11">'
                         "Please review the API before we ship</cross-session-message>"},
+            assistant(650, tool("mail-inbox", "mcp__amail__amail_inbox", wait_seconds=5)),
+            result(645, "mail-inbox", amail_inbox(amail_item())),
+            assistant(630, tool("mail-inbox-again", "mcp__amail__amail_inbox", wait_seconds=5)),
+            result(625, "mail-inbox-again", [text(amail_inbox(amail_item(), amail_item(
+                "mail-notes", AMAIL_OTHER, AMAIL_BETA, "Review notes by a-mail\nThe error paths look good.")))]),
             assistant(610, text("Done. Want me to ship it?"), stop="end_turn"),
         ])
         d = self.sessions["delta-44"]
@@ -349,6 +385,39 @@ class Fixture:
             except OSError:
                 pass
         subprocess.run([TMUX, "kill-session", "-t", self.tmux_session], capture_output=True)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class AmailFixture(Fixture):
+    """The same transcripts with a fixed process table, for comms tests without ps or tmux access."""
+
+    def __init__(self):
+        super().__init__()
+        os.makedirs(self.stub)
+        for i, name in enumerate(NAMES):
+            cwd = os.path.join(self.work, name)
+            os.makedirs(cwd)
+            self.sessions[name] = {"sid": self.sid(name), "pid": 100 + i, "tty": "", "window": str(i), "cwd": cwd}
+        self.write_registry()
+        self.write_transcripts()
+        self.write_agents_json()
+        processes = "".join(f"{s['pid']} 1 ? 02:00 claude --resume {s['sid']}\n" for s in self.sessions.values())
+        for name, body in (("claude", STUB_CLAUDE), ("ps", '''#!/usr/bin/env python3
+import os
+with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
+    print(fh.read(), end="")
+''')):
+            path = os.path.join(self.stub, name)
+            with open(path, "w") as fh:
+                fh.write(body)
+            os.chmod(path, 0o755)
+        with open(os.path.join(self.stub, "processes.txt"), "w") as fh:
+            fh.write(processes)
+
+    def env(self, **extra):
+        return super().env(PATH=self.stub + os.pathsep + os.environ["PATH"], ATC_QUOTAMAX="", ATC_ROUTE="", **extra)
+
+    def stop(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
 

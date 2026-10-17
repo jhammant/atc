@@ -286,7 +286,7 @@ class Model(unittest.TestCase):
         self.assertIn("workflow release-train", text)
         self.assertIn("phase Build", text)
         self.assertIn("phase Verify", text)
-        self.assertIn("talks with beta-22 ×1", text)
+        self.assertIn("talks with beta-22 ×2", text)
         lines = text.splitlines()
         parent = next(i for i, ln in enumerate(lines) if "Write the tests" in ln)
         child = next(i for i, ln in enumerate(lines) if "Lint fixer" in ln)
@@ -624,6 +624,9 @@ class CommandLine(unittest.TestCase):
 
     def test_json(self):
         data = json.loads(self.atc("--json").stdout)
+        mail = [c for c in data["comms"] if c["kind"] == "amail"]
+        self.assertEqual(len(mail), 3)
+        self.assertEqual(mail[0]["body"], fixture.AMAIL_BODY)
         self.assertEqual(data["counts"]["blocked"], 1)
         self.assertEqual(data["quota"]["headroom"], "comfortable")
         self.assertEqual(data["hosts"], [])
@@ -635,7 +638,9 @@ class CommandLine(unittest.TestCase):
         for text in ("Blocked on you (1)", "Waiting on you (1)", "Working (1)", "release-train", "Codex weekly 19%"):
             self.assertIn(text, once)
         self.assertIn("workflow release-train", self.atc("--tree").stdout)
-        self.assertIn("alpha-11 → beta-22", self.atc("--comms").stdout)
+        comms = self.atc("--comms").stdout
+        self.assertIn("✉@ alpha-11 → beta-22", comms)
+        self.assertEqual(comms.count("API review by a-mail"), 1)
 
     def test_here_limits_to_a_folder(self):
         data = json.loads(self.atc("--json", "--only", os.path.join(FX.work, "alpha")).stdout)
