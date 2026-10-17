@@ -528,6 +528,10 @@ class Agent:
         self.custom_title = None
         self.sent = []
         self.received = []
+        self.amail_sent = []
+        self.amail_received = []
+        self.amail_addresses = set()
+        self.amail_calls = {}     # tool_use_id -> tool name, kept until its result arrives
 
     @property
     def base(self):
@@ -595,6 +599,13 @@ class Agent:
                 if name == "SendMessage" and inp.get("message"):
                     self.sent.append({"ts": ts, "to": str(inp.get("to") or ""), "body": str(inp["message"]),
                                       "summary": str(inp.get("summary") or "")})
+                elif name == "mcp__amail__amail_send":
+                    to, body = inp.get("to"), inp.get("text")
+                    if isinstance(to, str) and to.strip() and isinstance(body, str) and body.strip():
+                        self.amail_sent.append({"ts": ts, "to": to.strip(), "body": body})
+                elif name in ("mcp__amail__amail_inbox", "mcp__amail__amail_whoami", "mcp__amail__amail_session"):
+                    if isinstance(block.get("id"), str):
+                        self.amail_calls[block["id"]] = name
             elif btype == "text" and str(block.get("text") or "").strip():
                 self.last_kind = "text"
                 self.last_text_full = str(block["text"]).strip()
@@ -607,8 +618,45 @@ class Agent:
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
-                    self.pending.pop(block.get("tool_use_id"), None)
+                    tid = block.get("tool_use_id")
+                    if isinstance(tid, str):
+                        self.pending.pop(tid, None)
+                        name = self.amail_calls.pop(tid, None)
+                        if name and not block.get("is_error"):
+                            self.ingest_amail_result(name, block.get("content"), ts)
         self.scan_incoming(text_of(content), ts)
+
+    def ingest_amail_result(self, name, content, ts):
+        try:
+            data = json.loads(text_of(content))
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if name in ("mcp__amail__amail_whoami", "mcp__amail__amail_session"):
+            addresses = [data.get("default_address"), data.get("address")]
+            if isinstance(data.get("addresses"), list):
+                addresses += [a.get("address") for a in data["addresses"] if isinstance(a, dict)]
+            self.amail_addresses.update(a.strip() for a in addresses if isinstance(a, str) and a.strip())
+            return
+        items = data.get("items")
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("message"), dict):
+                continue
+            message, provenance = item["message"], item.get("provenance", {})
+            if not isinstance(provenance, dict) or not isinstance(message.get("parts"), list):
+                continue
+            frm, to = message.get("from"), provenance.get("to", "")
+            body = text_of(message["parts"])
+            mid, thread = message.get("id"), message.get("thread_id")
+            if not isinstance(frm, str) or not frm.strip() or not isinstance(to, str) or not body.strip():
+                continue
+            if any(value is not None and not isinstance(value, str) for value in (mid, thread)):
+                continue
+            self.amail_received.append({"ts": ts, "from": frm.strip(), "to": to.strip(), "body": body,
+                                        "message_id": mid or None, "thread_id": thread or None})
 
     def ingest_attachment(self, att, ts):
         if not isinstance(att, dict):
@@ -1407,6 +1455,7 @@ class Fleet:
         self.sessions = {}       # sid -> Session
         self.activity = []       # (ts, agent, tool, detail)
         self.addresses = {}      # messaging address -> session name
+        self.amail_addresses = {}
         self.procs = {}
         self.children = {}
         self.procs_at = 0.0
@@ -1468,6 +1517,8 @@ class Fleet:
         for sid in list(self.sessions):
             if sid not in seen:
                 del self.sessions[sid]
+        self.amail_addresses = {address: s.name for s in self.sessions.values()
+                                for agent in [s] + list(s.helpers.values()) for address in agent.amail_addresses}
         self.swarms.refresh(now, self.only)
         self.swarm_pids = {
             u["pid"]: {"swarm": entry["status"]["swarm_id"], "unit": u["id"], "label": f"{entry['status']['name']}/{u['id']}"}
@@ -1490,6 +1541,8 @@ class Fleet:
         address = REF_SUFFIX_RE.sub("", str(address or "").strip())
         if address in self.addresses:
             return self.addresses[address]
+        if address in self.amail_addresses:
+            return self.amail_addresses[address]
         match = re.match(r"uds:.*/(\d+)\.sock$", address)
         return f"closed session pid {match.group(1)}" if match else address
 
@@ -1519,9 +1572,37 @@ class Fleet:
                 add(self.resolve(m["from"]), s.name, m["body"], "", m["ts"])
         return sorted(found.values(), key=lambda x: x["ts"] or 0)
 
+    def amail(self):
+        """Transcript a-mail, preferring message ids over matching send/receipt bodies."""
+        messages = []
+        for s in self.sessions.values():
+            for agent in [s] + list(s.helpers.values()):
+                for m in agent.amail_received:
+                    messages.append({**m, "kind": "amail", "from": self.resolve(m["from"]),
+                                     "to": self.resolve(m["to"]) if m["to"] else s.name})
+                for m in agent.amail_sent:
+                    messages.append({**m, "kind": "amail", "message_id": None, "thread_id": None,
+                                     "from": s.name, "to": self.resolve(m["to"])})
+        found, by_id, by_body = [], {}, {}
+        # Match receipts first: distinct ids remain distinct even when their bodies are identical.
+        for m in sorted(messages, key=lambda m: not bool(m["message_id"])):
+            mid = m["message_id"]
+            key = (m["from"], m["to"], m["body"])
+            cur = by_id.get(mid) if mid else by_body.get(key)
+            if cur is None:
+                m["summary"] = first_line(m["body"])
+                found.append(m)
+                cur = m
+                if mid:
+                    by_id[mid] = cur
+            elif m["ts"] and (not cur["ts"] or m["ts"] < cur["ts"]):
+                cur["ts"] = m["ts"]
+            by_body.setdefault(key, cur)
+        return sorted(found, key=lambda m: m["ts"] or 0)
+
     def comms(self):
         """Every message: between sessions, a session's task to a helper, and the helper's report back."""
-        items = self.letters()
+        items = self.letters() + self.amail()
         for s in self.sessions.values():
             helpers = s.by_hid()
             for h in s.helpers.values():
@@ -3432,7 +3513,7 @@ def tool_tree(ck, a, call):
 
 
 @mcp_tool("atc_comms", "Messages", "Messages, newest first: session to session (✉), the task a session gave a helper "
-          "(→), the helper's report back (←), and route swarm a-mail (⇄).",
+          "(→), the helper's report back (←), transcript a-mail (✉@), and route swarm a-mail (⇄).",
           {"session": {"type": "string", "description": "Only messages to or from this session (id, name or title)"},
            "limit": {"type": "integer", "description": "How many (default 30)", "default": 30},
            "full": {"type": "boolean", "description": "Whole message bodies, not just the first line", "default": False}})
@@ -4380,15 +4461,18 @@ def activity_lines(items, limit, scroll=0):
 
 
 KIND_LOOK = {"letter": ("✉", "c1"), "task": ("→", "c0"), "report": ("←", "ok"), "note": ("·", "dim"),
-             "swarm": ("⇄", "c3")}
+             "swarm": ("⇄", "c3"), "amail": ("✉@", "c2")}
 
 
 def comm_line(item):
     when = datetime.fromtimestamp(item["ts"]).strftime("%H:%M") if item.get("ts") else "--:--"
     sym, style = KIND_LOOK.get(item["kind"], ("?", "dim"))
+    frm, to = clean(item["from"]), clean(item["to"])
+    if item["kind"] != "amail":
+        frm, to = frm[:24], to[:24]
     return [
-        (when + " ", "dim"), (sym + " ", style), (clean(item["from"])[:24], style), (" → ", "dim"),
-        (clean(item["to"])[:24], style), ("  " + clean(item.get("summary")), "plain"),
+        (when + " ", "dim"), (sym + " ", style), (frm, style), (" → ", "dim"),
+        (to, style), ("  " + clean(item.get("summary")), "plain"),
     ]
 
 
@@ -4679,7 +4763,7 @@ def pct_style(percent):
 def tree_lines(fleet, model, only_sid=None):
     """Session > workflow > phase > agent > nested agent, plus worker processes and who it talks to."""
     now = model["now"]
-    letters = [c for c in model["comms"] if c["kind"] == "letter"]
+    letters = [c for c in model["comms"] if c["kind"] in ("letter", "amail")]
     out = []
     for v in ordered_sessions(model, True):
         if only_sid and v["sid"] != only_sid:
@@ -4830,7 +4914,7 @@ HELP = [
     "S S        save and close a session (/closecode): STATE.md, commit, push, close",
     "D D        hide a closed session from the list (reversible)",
     "N N        rename the selected session (/rename); names are also SendMessage addresses",
-    "c          comms: session to session (✉), task to a helper (→), report back (←), swarm a-mail (⇄)",
+    "c          comms: letter (✉), task (→), report (←), transcript a-mail (✉@), swarm a-mail (⇄)",
     "h          the hierarchy: session > workflow > phase > agent > nested agent, worker processes",
     "           in comms and the tree, s switches between all sessions and the selected one",
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
@@ -4946,7 +5030,7 @@ def render_view(fleet, model, ui, width, height):
         list_h = max(3, room // 2)
         top = max(0, ui["view_pick"] - list_h + 1)
         frame.append(rule(f"Comms: {name if mine else 'all sessions'} ({len(items)})", width,
-                          "✉ letter → task ← report ⇄ swarm · s: all / selected · ↑↓ pick · esc closes"))
+                          "✉ letter ✉@ a-mail → task ← report ⇄ swarm · s: all / selected · ↑↓ pick · esc closes"))
         for i, item in enumerate(items[top: top + list_h], start=top):
             line = fit(comm_line(item), width - 2)
             if i == ui["view_pick"]:

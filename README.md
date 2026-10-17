@@ -35,7 +35,9 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 
   ![The hierarchy view](docs/atc-tree.png)
 - **Comms** (`c`): every message, in full: session to session (✉), the task a session gave each helper (→),
-  and the helper's report back (←)
+  the helper's report back (←), transcript a-mail (✉@), and swarm traffic (⇄).
+  A-mail is read only from session and helper transcripts, with known addresses resolved to session names and
+  matching sends and receipts counted once; no a-mail network access, credentials or CLI are needed.
 - **Activity**: one merged log of every tool call across every session and helper
 - **Quota** (with [quotamax](https://github.com/jhammant/quotamax)): Claude, Codex, Kimi, DeepSeek, and the
   swarm cap that sessions check before fanning out
