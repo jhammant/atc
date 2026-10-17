@@ -11,13 +11,13 @@ function element(tag = "div") {
   const listeners = new Map();
   return {tag, textContent: "", childNodes: [], hidden: false, value: "", dataset: {},
     classList: {toggle() {}}, addEventListener(type, fn) { listeners.set(type, fn); }, querySelectorAll: () => [],
-    trigger(type) { return listeners.get(type)?.(); }, closest() { return null; },
+    fire(type) { return listeners.get(type)?.(); }, closest() { return null; },
     hasAttribute(name) { return name === "data-lever" && Boolean(this.dataset.lever); },
     showModal() { this.open = true; },
     append(...children) { this.childNodes.push(...children); },
     replaceChildren(...children) { this.childNodes = children; }};
 }
-function page(fetch, hash = "") {
+function page(fetch, credentials = {}, hash = "") {
   const elements = new Map();
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
@@ -31,12 +31,13 @@ function page(fetch, hash = "") {
   let tick;
   const location = {hash};
   const context = vm.createContext({document, fetch, URLSearchParams, location,
-    window: {addEventListener() {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
+    navigator: {credentials}, atob, btoa,
+    window: {addEventListener() {}, isSecureContext: true, PublicKeyCredential: function () {}}, setInterval(fn, ms) { assert.equal(ms, 5000); tick = fn; }});
   vm.runInContext(source, context);
   return {get, document, tick: () => tick(), settled: () => vm.runInContext("refreshing", context),
     navigate(hash) { location.hash = hash; vm.runInContext("navigate()", context); },
     confirm(accepted) { const dialog = get("confirm-dialog"); dialog.returnValue = accepted ? "confirm" : "cancel";
-      dialog.open = false; dialog.trigger("close"); }};
+      dialog.open = false; dialog.fire("close"); }};
 }
 function response(status, body) {
   return {ok: status === 200, status, json: async () => body};
@@ -143,7 +144,7 @@ function jobsModel() {
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test("Jobs view renders per host in model order, treats content as text, and labels expired and stale rows", async () => {
-  const p = page(async () => response(200, jobsModel()), "#jobs");
+  const p = page(async () => response(200, jobsModel()), {}, "#jobs");
   await p.settled();
   const content = descendants(p.get("content"));
   assert.equal(p.get("jobs-link").hidden, false);
@@ -153,9 +154,45 @@ test("Jobs view renders per host in model order, treats content as text, and lab
   assert.ok(content.some((n) => n.textContent === "<script>job output</script>" && n.tag === "p"));
   assert.ok(content.some((n) => n.textContent === "Expired"));
   assert.ok(content.some((n) => n.textContent === "App · dashboard"));
-  assert.ok(content.some((n) => n.textContent.startsWith("Due approximately")));
+  assert.ok(content.some((n) => n.textContent.includes("(estimated)")));
   assert.ok(content.some((n) => n.textContent.includes("Unavailable: jobs: host unavailable")));
   assert.equal(content.filter((n) => n.tag === "button").length, 4); // stale remote cannot run
+});
+
+test("Jobs view renders relative, same-day and tomorrow due times without exposing ISO timestamps", async () => {
+  const timestamp = (day, hour, minute) => new Date(2026, 9, day, hour, minute).getTime() / 1000;
+  const data = model();
+  data.now = timestamp(17, 7, 0);
+  data.jobs = {local: {ok: true, jobs: [
+    {name: "soon", next_run: timestamp(17, 7, 12)},
+    {name: "today", next_run: timestamp(17, 8, 5)},
+    {name: "tomorrow", next_run: timestamp(18, 1, 30)},
+    {name: "late", next_run: timestamp(17, 6, 48)},
+  ].map((job) => ({...job, next_run_iso: new Date(job.next_run * 1000).toISOString()}))}};
+  const p = page(async () => response(200, data), {}, "#jobs");
+
+  await p.settled();
+  const text = descendants(p.get("content")).map((n) => n.textContent).join("\n");
+
+  for (const due of ["Due in 12m", "Due at 08:05", "Due tomorrow 01:30", "overdue by 12m"]) {
+    assert.ok(text.includes(due + " (estimated)"), text);
+  }
+  assert.ok(!text.includes("2026-10-"));
+});
+
+test("an app-list failure leaves job status links and Run buttons available", async () => {
+  const data = jobsModel();
+  data.jobs.local.apps_ok = false;
+  data.jobs.local.apps_error = "apps: app registry unavailable";
+  const p = page(async () => response(200, data), {}, "#jobs");
+
+  await p.settled();
+  const content = descendants(p.get("content"));
+
+  assert.ok(content.some((n) => n.textContent.includes("Apps unavailable: apps: app registry unavailable")));
+  assert.ok(content.some((n) => n.tag === "a" && n.href === "#job?job=failed&host=local"));
+  assert.equal(content.filter((n) => n.tag === "button" && !n.disabled).length, 4);
+  assert.ok(content.some((n) => n.textContent === "App · dashboard"));
 });
 
 test("Run now previews, cancels without mutation, and only executes after the existing confirm dialog", async () => {
@@ -166,9 +203,9 @@ test("Run now previews, cancels without mutation, and only executes after the ex
     const args = JSON.parse(options.body).arguments;
     calls.push({path, args});
     return response(200, {ok: true, text: args.dry_run ? "run job remote-failure now on server1" : "triggered remote-failure on server1"});
-  }, "#jobs");
+  }, {}, "#jobs");
   await p.settled();
-  const run = () => descendants(p.get("content")).filter((n) => n.tag === "button").at(-1).trigger("click");
+  const run = () => descendants(p.get("content")).filter((n) => n.tag === "button").at(-1).fire("click");
   let pending = run();
   await flush();
   assert.equal(calls.length, 1);
@@ -215,4 +252,100 @@ test("missing loom hides the Jobs navigation entry", async () => {
   const p = page(async () => response(200, model()));
   await p.settled();
   assert.equal(p.get("jobs-link").hidden, true);
+});
+
+function approvalItem(host = null) {
+  return {kind: "approval", id: "Abcdef1234567890_", host, sid: null, title: "Approval Abcdef1234567890_",
+    summary: "Type <script>example</script> into beta", detail: "Type <script>example</script> into beta",
+    caller: "alpha-11", client: "autonomous-client", expires: 1800000000, hint: "Approve with a passkey."};
+}
+function acceptDialog(p) {
+  const dialog = p.get("confirm-dialog");
+  dialog.showModal = () => { dialog.returnValue = "confirm"; dialog.fire("close"); };
+}
+function credential() {
+  const bytes = () => new Uint8Array([1, 2, 3]).buffer;
+  return {id: "AQID", rawId: bytes(), type: "public-key", response: {
+    clientDataJSON: bytes(), authenticatorData: bytes(), signature: bytes(), userHandle: null}};
+}
+
+test("approval cards show owner, machine and expiry, then request a fresh assertion for that action", async () => {
+  const data = model(), item = approvalItem("laptop"), calls = [];
+  data.needs = [item]; data.counts = {needs: 1, needs_urgent: 1};
+  const path = "/api/web/approvals/" + item.id + "/";
+  const p = page(async (url, options) => {
+    const body = options.body ? JSON.parse(options.body) : undefined;
+    calls.push({url, body});
+    if (url.endsWith("/model")) return response(200, data);
+    if (url === path + "options") return response(200, {challenge: "bm9uY2U", userVerification: "required",
+      allowCredentials: [{type: "public-key", id: "AQID"}], rpId: "atc.example.com"});
+    assert.equal(url, path + "approve");
+    assert.equal(body.challenge, "bm9uY2U"); assert.equal(body.host, "laptop");
+    assert.equal(body.response.signature, "AQID");
+    assert.equal(body.id, "AQID"); assert.equal(body.rawId, "AQID");
+    return response(200, {ok: true, text: "Approval approved."});
+  }, {async get({publicKey}) {
+    calls.push({url: "passkey"});
+    assert.equal(publicKey.userVerification, "required");
+    assert.equal(Buffer.from(publicKey.challenge).toString(), "nonce");
+    assert.equal(Buffer.from(publicKey.allowCredentials[0].id).toString("hex"), "010203");
+    return credential();
+  }});
+  await p.settled();
+  acceptDialog(p);
+  const cards = descendants(p.get("content"));
+  assert.ok(cards.some((n) => n.textContent === item.summary));
+  assert.ok(cards.some((n) => n.textContent === "laptop"));
+  assert.ok(cards.some((n) => /Caller: alpha-11 · autonomous-client · Expires/.test(n.textContent)));
+
+  await cards.find((n) => n.textContent === "Approve with passkey").fire("click");
+
+  assert.deepEqual(calls.filter((c) => !c.url.endsWith("/model")).map((c) => c.url),
+    [path + "options", "passkey", path + "approve"]);
+  assert.deepEqual(calls.find((c) => c.url === path + "options").body, {host: "laptop"});
+  assert.equal(p.get("result").textContent, "Approval approved.");
+  assert.match(p.get("confirm-summary").textContent, /Caller: alpha-11 · laptop · Expires/);
+});
+
+test("denying an approval only uses the signed-in session", async () => {
+  const data = model(), item = approvalItem(), calls = [];
+  data.needs = [item];
+  const p = page(async (url, options) => {
+    if (url.endsWith("/model")) return response(200, data);
+    calls.push({url, body: JSON.parse(options.body)});
+    return response(200, {ok: true, text: "Approval denied."});
+  }, {get() { assert.fail("deny must not request a passkey"); }});
+  await p.settled();
+  acceptDialog(p);
+
+  await descendants(p.get("content")).find((n) => n.textContent === "Deny").fire("click");
+
+  assert.deepEqual(calls, [{url: "/api/web/approvals/" + item.id + "/deny", body: {host: "local"}}]);
+  assert.equal(p.get("result").textContent, "Approval denied.");
+});
+
+test("cancelled passkey and failed approval request never send a decision or retry it", async () => {
+  for (const fault of ["cancel", "options", "lost decision"]) {
+    const data = model(), item = approvalItem(), calls = [];
+    data.needs = [item];
+    const p = page(async (url) => {
+      if (url.endsWith("/model")) return response(200, data);
+      calls.push(url);
+      if (fault === "options") return response(409, {text: "Approval expired"});
+      if (url.endsWith("/options")) return response(200, {challenge: "bm9uY2U", userVerification: "required"});
+      throw new TypeError("Connection lost");
+    }, {async get() {
+      if (fault === "cancel") throw new Error("Passkey cancelled");
+      return credential();
+    }});
+    await p.settled();
+    acceptDialog(p);
+
+    await descendants(p.get("content")).find((n) => n.textContent === "Approve with passkey").fire("click");
+    await p.tick();
+
+    assert.equal(calls.filter((url) => url.endsWith("/approve")).length, fault === "lost decision" ? 1 : 0);
+    assert.equal(calls.filter((url) => url.endsWith("/options")).length, 1);
+    assert.match(p.get("result").textContent, /cancelled|expired|Connection lost/);
+  }
 });

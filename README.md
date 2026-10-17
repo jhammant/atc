@@ -154,19 +154,26 @@ Jobs view shows all jobs, links to status, and has **Run now** buttons using the
 dialog. MCP `atc_jobs` reads the same list; pass `job` and optionally `host` for status. `atc_run_job` accepts the
 exact `job` name and an optional `host` (default `local`), and supports confirmation, `dry_run`, and the audit log.
 Manual runs are allowed for known expired jobs; expiration excludes them from due estimates.
+`--serve --serve-writes --dry-run` keeps web and MCP runs dry, including confirmed or approved requests.
 
 Lists poll every 60 seconds in background threads under the screen and `--serve`, and on demand with a 60-second
 cache under `atc mcp`. `--json` and `--once` read once. Hosts and the local app list are read concurrently with
-15-second command timeouts. An unavailable host keeps its last rows, marked as last seen; runs are refused
-until it answers again. Status and run commands also have a timeout; an uncertain run is never retried.
+15-second command timeouts. Poll workers are daemon threads, so quitting does not wait for a stalled poll.
+An unavailable job list keeps its last rows, marked as last seen; runs are refused until it answers again.
+App-list failures are reported separately and leave job status and runs available. Status and run commands also
+have a timeout; an uncertain run is never retried.
 
 `jobs` in `--json` and the web model is a map from `local` or a configured loom host to
-`{ok, error, jobs, apps}`. Job fields come from loom, plus nullable `next_run` (Unix seconds). `counts.jobs_failing`
+`{ok, error, jobs, apps, apps_ok, apps_error}`. `ok` and `error` describe the job list; `apps_ok` and `apps_error`
+describe the local app list (`apps_ok` is null for remote hosts, where apps are not queried). Job fields come
+from loom, plus nullable `next_run` (Unix seconds) and `next_run_iso` (ISO UTC). `counts.jobs_failing`
 counts failed jobs across those hosts, including stale rows; each gets a `kind: job` needs item. `/api/fleet`
 exports only local loom data. Configure `ATC_LOOM_HOSTS` on the atc doing the reading to include other machines;
 loom lists are not merged again from atc agent peers.
 
-Due times are estimates: intervals use loom's last-log-write timestamp plus the interval, one-shot schedules use
+Due times read as `in 12m`, `at 08:05` or `tomorrow 01:30` in the terminal, MCP list and web view; JSON keeps machine
+timestamps. Clock times use the reading machine's timezone for terminal/MCP and the browser's timezone for web.
+These are estimates: intervals use loom's last-log-write timestamp plus the interval, one-shot schedules use
 their timestamp, and calendar schedules use the reading machine's timezone. Expired, running and already-run
 one-shot jobs have no due estimate. Unknown schedules or intervals with no last run remain idle. Check loom's
 status for scheduler details, especially when machines use different timezones.
@@ -214,7 +221,8 @@ written `name@host`.
 - **Never into a session blocked on a prompt.** Its default answer is "Yes"; the message is refused, not typed.
 - **You confirm steering.** `message`, `broadcast`, `interrupt`, `stop_process`, `close`, `fork`, `rename`,
   `restore` and a `new_task` with a `pool` ask you first, in the calling session (an MCP elicitation). A client that
-  can't ask, or a session nobody is watching, gets a refusal. `jump`, `cap` and a `new_task` plan just run.
+  can't ask, or a session nobody is watching, creates a pending owner approval (see below).
+  `jump`, `cap` and a `new_task` plan just run.
   `ATC_MCP_LEVERS=auto` drops the question; `ATC_MCP_LEVERS=off` makes MCP read-only.
 - **Not into itself.** A lever aimed at the session that called it is refused unless the call says
   `allow_self: true`. Over stdio atc knows the caller from Claude Code's environment; over HTTP, from an
@@ -227,6 +235,44 @@ written `name@host`.
 - **Over HTTP the token is always required at `/mcp`**, on this machine too, and levers are listed only with
   `--serve-writes`. A request that arrives through a reverse proxy (`X-Forwarded-For`) counts as off this
   machine for every endpoint.
+
+### Pending approvals
+
+When a steering call cannot ask you in-session (no MCP elicitation, a handshake-era HTTP client, or an
+unattended session), atc creates an approval on the machine handling the call. It waits up to 45 seconds:
+your approval runs the lever once, and denial refuses it. Set `ATC_APPROVAL_WAIT` to a finite, non-negative
+number of seconds to change the wait (default `45`; `0` returns immediately with the pending approval).
+If you have not decided yet, the tool returns a non-error **Waiting for approval** result with an ID and expiry.
+The approval lasts ten minutes from creation.
+After approving, retry the same tool with exactly the same arguments and caller, adding `approval: "<id>"`.
+Every lever documents this argument. Before using a grant, atc rebuilds the lever and checks its resolved
+summary against the action the owner saw, as well as its tool, arguments and caller. A changed target or folder
+(including a different default folder on another transport) requires a new approval: call again without the
+`approval` argument. Pending, denied, expired or already-used grants are refused. Calls that can ask you
+in-session keep their existing prompts. Dry runs and refusals before a lever is ready do not create approvals.
+
+Grant or deny an approval in any of these places:
+
+- **Web UI, on a phone or laptop:** Needs you shows each approval's summary, caller, machine and expiry.
+  **Approve with passkey** needs a fresh passkey assertion with user verification; signing in alone is
+  insufficient. **Deny** needs your signed-in session.
+- **atc screen on the owning machine:** approvals appear first. Press Enter or `f` on one to read its entire
+  summary, caller, target and expiry; arrows and Page Up/Down scroll the wrapped detail. Press `y y` to approve
+  or `n n` to deny, on the row or in the detail view. The first press names the target.
+- **A terminal on the owning machine:** `atc approvals` lists pending and approved grants;
+  `atc approve <id>` and `atc deny <id>` decide pending ones. Both decisions require stdin to be a TTY.
+
+The file `~/.config/atc/approvals.json` has mode `0600`. File locks and an atomic claim before executing make
+approvals single-use across processes and concurrent requests. A failed or interrupted lever attempt still
+spends its grant; check the target before requesting another. Finished and expired entries are removed ten
+minutes after their original expiry; the audit log retains creation, decisions and use. The digest binds the
+exact original arguments without storing a second copy of them; the stored summary may contain message text.
+A missing caller is bound as missing, so clients should consistently send their session ID.
+
+Optional notifications: set `ATC_NOTIFY_CMD` to a command. atc splits it with `shlex` (no shell) and appends one
+argument: `atc: approval waiting: <tool> on <target> (<id>)`. It contains no message body. Command output is
+discarded, failures are ignored and execution times out after five seconds. Approvals are urgent items of
+kind `approval` in the shared needs queue, `counts.needs_urgent`, `/api/fleet` and `--json` for Roost.
 
 **A laptop that sleeps.** Run a second atc on an always-on server and point it at the laptop's:
 
@@ -272,8 +318,8 @@ must verify you. Once signed in, the **Passkeys** view adds further passkeys wit
 and signs out. Removing the last passkey requires explicit confirmation; recovery uses a new hub code.
 Removing a passkey revokes its web sessions. Restarting atc signs every browser out.
 
-**Needs you** comes first: the shared queue of prompts, a-mail owner items, waiting sessions and inbox counts,
-including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
+**Needs you** comes first: the shared queue of pending approvals, prompts, a-mail owner items, waiting sessions
+and inbox counts, including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
 Unavailable machines keep one connection notice with their specific error and last-seen time, even when
 their cached items are in the queue. Each queue item names its machine.
 **Fleet** groups sessions, helpers, workflow phases, workers, route
@@ -318,6 +364,15 @@ host's levers to `/api/peer/tools/<tool>` using the peer secret, after confirmat
 still use SSH. Peer calls run the same tools and refusals, with transport `peer`, and are audited on both
 sides. A lost response is not retried automatically because the action may already have run. HTTP hosts
 poll every five seconds while reachable and every thirty seconds while offline.
+
+Approval assertions use a fresh random challenge bound to the approval ID, argument digest, owning machine
+and browser session. A login assertion cannot approve an action, and an action assertion cannot approve
+another action. Neither MCP nor the bearer token can grant or deny approvals; there is no approval MCP tool.
+For approvals owned by another HTTP atc, the hub relays the verified decision to
+`POST /api/peer/approvals/<id>` with the separate peer secret. The body is
+`{"decision":"approve","by":{"name":"Phone","hub":"server1"}}` (or `"deny"`). The owning atc makes the
+locked transition and audits `via: "web passkey via server1"` for approval, or `web session via server1` for
+denial. The owning machine must be reachable; cached approvals cannot be granted while it sleeps.
 
 Bearer tokens are for machines, passkeys are for people, and the peer secret is between atc instances.
 The web UI needs HTTPS: WebAuthn requires a secure context and the session cookie is Secure. The backend
@@ -460,8 +515,9 @@ These run without live processes; only the real-pane web tests need the live fix
 round trips skip with a reason when OpenSSL is missing.
 
 Loom tests use a stub CLI with local and remote jobs, a failed job, a running job, an expired job and an app.
-They cover caching, missing loom, host failures, timeouts, needs ordering, text/JSON output, status, MCP and web
-confirmation/dry-run/audit paths, and screen controls. They never trigger real loom jobs.
+They cover caching, missing loom, independent job/app failures, timeouts, shutdown during stalled polls, readable
+due times, needs ordering, text/JSON output, status, MCP and web confirmation/approval/dry-run/audit paths, and
+screen controls. They never trigger real loom jobs.
 
 If keys ever seem ignored, `ATC_DEBUG_LOG=/tmp/atc.log atc` logs every refresh and every pass of the screen
 loop with how long it took and which keys arrived.

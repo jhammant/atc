@@ -156,6 +156,9 @@ if os.path.exists(os.path.join(d, "loom-fail-" + host)):
 if args == ["jobs", "list", "--json"]:
     print(open(os.path.join(d, "loom-jobs-" + host + ".json")).read())
 elif args == ["list", "--json"]:
+    if os.path.exists(os.path.join(d, "loom-fail-apps")):
+        print("app registry unavailable", file=sys.stderr)
+        sys.exit(1)
     print(open(os.path.join(d, "loom-apps.json")).read())
 elif args[:2] == ["jobs", "status"]:
     print(args[2] + " on " + host + "\\nRecent log: fixture job output")
@@ -427,7 +430,7 @@ class Fixture:
         env.update({
             "CLAUDE_CONFIG_DIR": self.claude_home, "ATC_CLAUDE": os.path.join(self.stub, "claude"),
             "ATC_QUOTAMAX": os.path.join(self.stub, "quotamax"), "ATC_ROUTE": os.path.join(self.stub, "route"),
-            "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "",
+            "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "", "ATC_APPROVAL_WAIT": "0",
             "ATC_HERDR": "", "ATC_HOSTS": "", "ATC_TERMINAL": "none", "TERM": "xterm-256color",
             "HOME": os.path.join(self.root, "home"),
             "ROUTE_STATE_DIR": os.path.join(self.root, "route"), "ATC_SWARM_HOURS": "6",
@@ -612,7 +615,7 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
         return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,
                 "ROUTE_STATE_DIR": self.state, "ATC_SWARM_HOURS": "6", "PATH": self.stub + os.pathsep + os.environ["PATH"],
                 "ATC_CLAUDE": os.path.join(self.stub, "claude"), "ATC_QUOTAMAX": "", "ATC_HERDR": "", "ATC_HOSTS": "",
-                "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "",
+                "ATC_AMAIL": "", "ATC_LOOM": "", "ATC_LOOM_HOSTS": "", "ATC_APPROVAL_WAIT": "0",
                 "ATC_TERMINAL": "none", **extra}
 
     def stop(self):

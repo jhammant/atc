@@ -43,11 +43,17 @@ function encode(value) {
   return btoa(String.fromCharCode(...new Uint8Array(value))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 async function authenticate(kind, form) {
+  const fields = form ? Object.fromEntries(new FormData(form)) : {};
+  const options = await api(`auth/${kind}/options`, fields);
+  await api(`auth/${kind}/finish`, await assertion(options, kind));
+  if (form) form.reset();
+  signedIn = true; $("signin").hidden = true; $("workspace").hidden = false;
+  status(kind === "register" ? "Passkey added." : "Signed in.");
+}
+async function assertion(options, kind = "approval") {
   if (!window.isSecureContext || !navigator.credentials || !window.PublicKeyCredential) {
     throw new Error("Passkeys need HTTPS and a browser that supports WebAuthn.");
   }
-  const fields = form ? Object.fromEntries(new FormData(form)) : {};
-  const options = await api(`auth/${kind}/options`, fields);
   const challenge = options.challenge;
   options.challenge = decode(challenge);
   for (const key of ["allowCredentials", "excludeCredentials"]) {
@@ -60,10 +66,19 @@ async function authenticate(kind, form) {
   for (const field of ["attestationObject", "authenticatorData", "signature", "userHandle"]) {
     if (credential.response[field]) response[field] = encode(credential.response[field]);
   }
-  await api(`auth/${kind}/finish`, {challenge, id: credential.id, rawId: encode(credential.rawId), type: credential.type, response});
-  if (form) form.reset();
-  signedIn = true; $("signin").hidden = true; $("workspace").hidden = false;
-  status(kind === "register" ? "Passkey added." : "Signed in.");
+  return {challenge, id: credential.id, rawId: encode(credential.rawId), type: credential.type, response};
+}
+async function decideApproval(item, decision) {
+  const path = "approvals/" + encodeURIComponent(item.id) + "/";
+  const host = item.host || "local";
+  if (!await confirmAction(`${decision === "approve" ? "Approve" : "Deny"} ${item.summary}\nCaller: ${item.caller || "unknown"} · ${item.host || model.machine} · Expires ${when(item.expires)}`)) return;
+  let body = {host};
+  if (decision === "approve") {
+    const options = await api(path + "options", {host});
+    body = {...await assertion(options), host};
+  }
+  const result = await api(path + decision, body);
+  status(result.text, !result.ok);
 }
 function confirmAction(summary) {
   $("confirm-summary").textContent = summary;
@@ -101,6 +116,23 @@ function age(seconds) {
   return `${Math.floor(seconds / 3600)}h ago`;
 }
 function when(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "Time unknown"; }
+function jobDue(ts, now = Date.now() / 1000) {
+  const seconds = ts - now;
+  if (seconds <= 0) {
+    if (seconds > -60) return "now";
+    const ago = -seconds;
+    const duration = ago < 3600 ? `${Math.floor(ago / 60)}m` : ago < 86400 ? `${Math.floor(ago / 3600)}h` : `${Math.floor(ago / 86400)}d`;
+    return "overdue by " + duration;
+  }
+  if (seconds < 3600) return `in ${Math.ceil(seconds / 60)}m`;
+  const due = new Date(ts * 1000), today = new Date(now * 1000), tomorrow = new Date(now * 1000);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const clock = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`;
+  if (due.toDateString() === today.toDateString()) return "at " + clock;
+  if (due.toDateString() === tomorrow.toDateString()) return "tomorrow " + clock;
+  return due.toLocaleDateString(undefined, {month: "short", day: "numeric",
+    ...(due.getFullYear() !== today.getFullYear() ? {year: "numeric"} : {weekday: "short"})}) + " at " + clock;
+}
 function sessionURL(s, host) { return "#session?" + new URLSearchParams({sid: s.sid, host: host || "local"}); }
 function jobURL(name, host) { return "#job?" + new URLSearchParams({job: name, host}); }
 function jobState(job) { return job.failing ? "Failing" : job.running ? "Running" : job.expired ? "Expired" : job.state || "Idle"; }
@@ -116,11 +148,15 @@ function jobsView() {
       link.href = jobURL(job.name, host);
       head.append(link, node("span", jobState(job), "state"));
       card.append(head, node("p", job.purpose || "", "words"), node("p", job.schedule || "No schedule", "meta"));
-      if (job.next_run) card.append(node("p", "Due approximately " + when(job.next_run), "meta"));
+      if (job.next_run) {
+        const due = jobDue(job.next_run, model.now);
+        card.append(node("p", (due.startsWith("overdue") ? "" : "Due ") + due + " (estimated)", "meta"));
+      }
       if (job.last_exit !== null && job.last_exit !== undefined) card.append(node("p", "Last exit: " + job.last_exit, "meta"));
       if (entry.ok) card.append(button("Run now", () => lever("atc_run_job", {host, job: job.name})));
       box.append(card);
     }
+    if (entry.apps_error) box.append(node("p", `Apps unavailable: ${entry.apps_error}. Showing last seen apps.`, "notice"));
     for (const app of entry.apps || []) {
       const card = node("article", null, "session");
       card.append(node("h3", "App · " + app.name), node("p", `${app.status || "Unknown"} · ${app.health || "Health unknown"}`));
@@ -205,6 +241,14 @@ function needsView() {
     head.append(title);
     card.append(head, node("p", item.host && item.host !== "local" ? item.host : model.machine || "Hub", "meta"),
       node("p", item.detail, "words"), node("p", item.hint, "notice"));
+    if (item.kind === "approval") {
+      card.append(node("p", `Caller: ${item.caller || "unknown"}${item.client ? " · " + item.client : ""} · Expires ${when(item.expires)}`, "meta"));
+      const controls = node("div", null, "actions");
+      for (const decision of ["approve", "deny"]) {
+        controls.append(button(decision === "approve" ? "Approve with passkey" : "Deny", () => decideApproval(item, decision)));
+      }
+      card.append(controls);
+    }
     fragment.append(card);
   }
   if (!(model.needs || []).length) fragment.append(node("p", "Nobody needs you. The queue is empty."));

@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -21,7 +22,7 @@ class Jobs(unittest.TestCase, HTTP):
         self.fx = fixture.AmailFixture()
         self.addCleanup(self.fx.stop)
         self.env = self.fx.env(ATC_LOOM=os.path.join(self.fx.stub, "loom"), ATC_LOOM_HOSTS="server1",
-                               ATC_MCP_LEVERS="confirm", ATC_PEER_TOKEN="")
+                               ATC_MCP_LEVERS="confirm", ATC_PEER_TOKEN="", ATC_NOTIFY_CMD="")
         patch = mock.patch.dict(os.environ, self.env, clear=True)
         patch.start()
         self.addCleanup(patch.stop)
@@ -55,13 +56,16 @@ class Jobs(unittest.TestCase, HTTP):
         model = self.service.model
         self.assertEqual(set(model["jobs"]), {"local", "server1"})
         local = model["jobs"]["local"]
-        self.assertEqual(set(local), {"ok", "error", "jobs", "apps"})
+        self.assertEqual(set(local), {"ok", "error", "jobs", "apps", "apps_ok", "apps_error"})
         self.assertTrue(local["ok"])
         self.assertIsNone(local["error"])
         self.assertEqual([j["name"] for j in local["jobs"]], ["crashed", "running", "due-next", "later", "expired"])
         self.assertIsNone(local["jobs"][-1]["next_run"])
         self.assertEqual(local["apps"][0]["name"], "dashboard")
+        self.assertTrue(local["apps_ok"])
+        self.assertIsNone(local["apps_error"])
         self.assertEqual(model["jobs"]["server1"]["apps"], [])
+        self.assertIsNone(model["jobs"]["server1"]["apps_ok"])
         self.assertEqual(model["counts"]["jobs_failing"], 2)
         needs = [n for n in model["needs"] if n["kind"] == "job"]
         self.assertEqual([(n["host"], n["job"]) for n in needs], [("local", "crashed"), ("server1", "remote-failure")])
@@ -127,7 +131,44 @@ class Jobs(unittest.TestCase, HTTP):
             self.assertTrue(self.loom.data["server1"]["ok"])
         Path(self.fx.stub, "loom-apps.json").write_text("null")
         self.refresh()
-        self.assertIn("apps:", self.loom.data["local"]["error"])
+        self.assertIn("apps:", self.loom.data["local"]["apps_error"])
+
+    def test_app_failure_does_not_disable_job_status_or_run(self):
+        Path(self.fx.stub, "loom-fail-apps").touch()
+        model = self.refresh()
+        local = model["jobs"]["local"]
+        self.assertTrue(local["ok"])
+        self.assertIsNone(local["error"])
+        self.assertFalse(local["apps_ok"])
+        self.assertIn("app registry unavailable", local["apps_error"])
+        self.assertEqual(local["apps"][0]["name"], "dashboard")
+        self.assertTrue(all("Last seen" not in n["hint"] for n in model["needs"] if n["kind"] == "job"))
+        self.assertIn("Apps unavailable", self.m.tool_jobs(self.ck, {}, self.m.Call()))
+        self.assertIn("Recent log", self.m.tool_jobs(self.ck, {"job": "crashed"}, self.m.Call()))
+        result = self.service.run_tool("web", "atc_run_job", {"arguments": {"job": "crashed"}}, "Phone")
+        self.assertTrue(result["ok"])
+        self.assertIn("loom jobs run crashed", self.fx.calls())
+        Path(self.fx.stub, "loom-fail-apps").unlink()
+        self.assertTrue(self.refresh()["jobs"]["local"]["apps_ok"])
+
+    def test_stalled_poll_workers_cannot_hold_process_exit(self):
+        script = '''import runpy, sys, threading
+m = runpy.run_path(sys.argv[1])
+started = threading.Event()
+def stalled(self, host, kind):
+    assert threading.current_thread().daemon
+    started.set()
+    threading.Event().wait(30)
+m["Loom"].read = stalled
+loom = m["Loom"]()
+assert started.wait(2), "poll did not start"
+assert all(t.daemon for t in threading.enumerate() if t is not threading.main_thread())
+print("stalled daemon poll started", flush=True)
+'''
+        result = subprocess.run([sys.executable, "-c", script, fixture.ATC], env=self.env,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stalled daemon poll started", result.stdout)
 
     def test_sixty_second_cache_including_failures(self):
         checked = self.loom.checked = 100.0
@@ -185,6 +226,28 @@ class Jobs(unittest.TestCase, HTTP):
         self.assertEqual(next_run({"calendar": {"Weekday": 0, "Hour": 9, "Minute": 0}}), datetime(2026, 10, 18, 9).timestamp())
         for schedule in ({"every": -1}, {"every": float("inf")}, {"calendar": {"Hour": 25}}, "odd", {"calendar": {"Day": 31, "Month": 2}}):
             self.assertIsNone(next_run(schedule))
+
+    def test_human_due_times_in_screen_mcp_and_machine_timestamps_in_json(self):
+        now = datetime(2026, 10, 17, 7).timestamp()
+        times = [datetime(2026, 10, 17, 7, 12).timestamp(), datetime(2026, 10, 17, 8, 5).timestamp(),
+                 datetime(2026, 10, 18, 1, 30).timestamp()]
+        rows = [{"name": name, "schedule_raw": {"at": at}} for name, at in zip(("soon", "today", "tomorrow"), times)]
+        Path(self.fx.stub, "loom-jobs-local.json").write_text(json.dumps(rows))
+        with mock.patch.object(self.m.time, "time", return_value=now):
+            self.refresh()
+        model = self.service.model
+        screen = "\n".join(self.m.plain(line) for line, _ in self.m.jobs_lines(model, 200, expanded=True))
+        mcp = self.m.tool_jobs(self.ck, {}, self.m.Call())
+        for expected in ("in 12m", "at 08:05", "tomorrow 01:30"):
+            self.assertIn(expected, screen)
+            self.assertIn(expected, mcp)
+        for text in (screen, mcp):
+            self.assertNotIn("2026-10-17T", text)
+            self.assertNotIn("2026-10-18T", text)
+        jobs = json.loads(json.dumps(self.service.web_model()))["jobs"]["local"]["jobs"]
+        self.assertEqual([j["next_run"] for j in jobs], times)
+        self.assertEqual([j["next_run_iso"] for j in jobs], [self.m.iso(at) for at in times])
+        self.assertEqual(self.m.job_due(now - 720, now), "overdue by 12m")
 
     def test_render_is_cached_idle_folded_and_rows_resolve(self):
         with mock.patch.object(self.loom, "fetch", side_effect=AssertionError("screen must not poll")), \
@@ -320,6 +383,100 @@ class Jobs(unittest.TestCase, HTTP):
         self.assertEqual([a["outcome"] for a in audit], ["dry run", "asked", "done", "refused", "refused", "refused"])
         off = self.m.McpServer(self.ck, "http", levers=False)
         self.assertTrue(off.call_tool({"name": "atc_run_job", "arguments": args}, ctx, None)["isError"])
+
+    def test_job_approval_shares_needs_queue_and_runs_only_once(self):
+        args = {"job": "crashed"}
+        ctx = {"modern": True, "caps": {}, "client": None}
+        result = self.service.mcp.call_tool({"name": "atc_run_job", "arguments": args}, ctx, "owner-session")
+        self.assertIn("Waiting for approval", result["content"][0]["text"])
+        self.assertNotIn("jobs run", self.fx.calls())
+        self.service.refresh()
+        needs = self.service.model["needs"]
+        self.assertEqual(needs[0]["kind"], "approval")
+        self.assertEqual(sum(n["kind"] == "job" for n in needs), 2)
+        row = self.fleet.approvals.access()[0]
+        self.fleet.approvals.decide(row["id"], "approve", "owner", "terminal")
+        params = {"name": "atc_run_job", "arguments": dict(args, approval=row["id"])}
+        result = self.service.mcp.call_tool(params, ctx, "owner-session")
+        self.assertFalse(result["isError"])
+        self.assertTrue(self.service.mcp.call_tool(params, ctx, "owner-session")["isError"])
+        self.assertEqual(self.fx.calls().count("loom jobs run crashed"), 1)
+        self.assertEqual(len(self.m.TOOLS), 20)
+        self.assertEqual(sum(not tool["lever"] for tool in self.m.TOOLS.values()), 8)
+
+    def test_service_dry_run_reaches_shared_runner_after_approval(self):
+        service = self.m.Service(self.fleet, None, [], self.m.Terminals(dry_run=True), writes=True,
+                                 token="fixture-token", background=False, peer_secret="")
+        service.refresh()
+        self.assertTrue(service.cockpit.dry_run)
+        args = {"host": "server1", "job": "remote-failure", "dry_run": False}
+        lever = self.m.tool_run_job(service.cockpit, args, self.m.Call())
+        row = self.fleet.approvals.create("atc_run_job", args, lever.summary, "owner-session", "test-client", lever.target)
+        self.fleet.approvals.decide(row["id"], "approve", "owner", "terminal")
+        result = service.mcp.call_tool({"name": "atc_run_job", "arguments": dict(args, approval=row["id"])},
+                                       {"modern": True, "caps": {}, "client": None}, "owner-session")
+        self.assertFalse(result["isError"])
+        self.assertIn("dry run:", result["content"][0]["text"])
+        self.assertEqual(self.fleet.approvals.get(row["id"])["state"], "used")
+        web = service.run_tool("web", "atc_run_job", {"arguments": args}, "Phone")
+        self.assertTrue(web["ok"])
+        self.assertIn("dry run:", web["text"])
+        ok, text = lever.run()  # shared runner also protects callers that build a Lever directly
+        self.assertTrue(ok)
+        self.assertIn("dry run:", text)
+        self.assertNotIn("jobs run", self.fx.calls())
+        audit = [json.loads(line) for line in Path(self.m.AUDIT_LOG).read_text().splitlines()]
+        self.assertEqual([a["outcome"] for a in audit if a["transport"] in ("web", "http")], ["dry run", "dry run"])
+
+    @unittest.skipUnless(OPENSSL, "openssl is needed for the passkey fixture")
+    def test_serve_writes_dry_run_cli_never_runs_confirmed_web_or_mcp_job(self):
+        log, errors = Path(self.fx.root, "serve.log"), Path(self.fx.root, "serve-errors.log")
+        with log.open("w") as out, errors.open("w") as err:
+            proc = subprocess.Popen([sys.executable, fixture.ATC, "--serve", "127.0.0.1:0", "--serve-writes",
+                                     "--dry-run", "--no-hosts", "--web-origin", ORIGIN],
+                                    env=dict(self.env, ATC_SERVE_TOKEN="fixture-token"), stdout=out, stderr=err)
+        def stop():
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=5)
+        self.addCleanup(stop)
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            address = re.search(r"serving (http://\S+)", log.read_text())
+            if address:
+                break
+            if proc.poll() is not None:
+                if "Operation not permitted" in errors.read_text() or "Permission denied" in errors.read_text():
+                    self.skipTest("sandbox denied loopback server: " + errors.read_text().splitlines()[-1])
+                self.fail(errors.read_text())
+            time.sleep(0.05)
+        self.assertIsNotNone(address, errors.read_text())
+        self.url = address.group(1)
+        headers = {"Authorization": "Bearer fixture-token"}
+        while time.monotonic() < end:
+            status, model, _ = self.request("/api/fleet", headers=headers)
+            if status == 200 and model.get("jobs", {}).get("local", {}).get("ok"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(status, 200)
+        self.assertTrue(model.get("jobs", {}).get("local", {}).get("ok"), errors.read_text())
+        code = self.m.web_enroll(os.path.join(self.fx.root, "home", ".config", "atc", "web"), is_tty=lambda: True)
+        options = self.begin(code=code)
+        status, _, response_headers = self.finish(Passkey(self.fx.root), options, register=True)
+        self.assertEqual(status, 200)
+        cookie = response_headers["Set-Cookie"].split(";", 1)[0]
+        path = "/api/web/tools/atc_run_job"
+        args = {"host": "server1", "job": "remote-failure"}
+        self.assertTrue(self.request(path, {"arguments": dict(args, dry_run=True)}, cookie=cookie)[1]["ok"])
+        web = self.request(path, {"arguments": dict(args, dry_run=False)}, cookie=cookie)[1]
+        self.assertTrue(web["ok"])
+        self.assertIn("dry run:", web["text"])
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "atc_run_job", "arguments": args}}
+        status, reply, _ = self.request("/mcp", body, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertFalse(reply["result"]["isError"])
+        self.assertIn("dry run:", reply["result"]["content"][0]["text"])
+        self.assertNotIn("jobs run", self.fx.calls())
 
     def test_rechecks_after_confirmation_and_timeout_is_not_retried(self):
         lever = self.m.tool_run_job(self.ck, {"job": "crashed"}, self.m.Call())

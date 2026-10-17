@@ -77,7 +77,8 @@ class Client:
     """A fake MCP client: starts `atc mcp`, writes JSON-RPC lines, reads them back."""
 
     def __init__(self, **env):
-        base = {"CLAUDE_CODE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ATTENDED": "1", "ATC_MCP_LEVERS": ""}
+        base = {"CLAUDE_CODE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ATTENDED": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+                "ATC_MCP_LEVERS": ""}
         self.proc = subprocess.Popen([sys.executable, fixture.ATC, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=FX.env(**dict(base, **env)))
         self.lines = queue.Queue()
@@ -328,9 +329,9 @@ class Levers(unittest.TestCase):
         self.assertNotIn("declined text", FX.pane("beta-22"))
 
     def test_no_way_to_ask(self):
-        refused = self.c.call("atc_interrupt", {"session": "alpha-11"}, caps={})
-        self.assertTrue(refused["isError"])
-        self.assertIn("can't ask", text(refused))
+        pending = self.c.call("atc_interrupt", {"session": "alpha-11"}, caps={})
+        self.assertFalse(pending["isError"])
+        self.assertIn("Waiting for approval", text(pending))
 
     def test_audit_log(self):
         self.c.call("atc_message", {"session": "gamma-33", "text": "audited"})
@@ -379,12 +380,24 @@ class Policy(unittest.TestCase):
         finally:
             c.close()
 
-    def test_unattended_session_cannot_confirm(self):
+    def test_unattended_session_requests_owner_approval(self):
         c = Client(CLAUDE_CODE_SESSION_ATTENDED="0")
         try:
-            refused = c.call("atc_message", {"session": "beta-22", "text": "nobody watching"})
-            self.assertIn("nobody is attending", text(refused))
+            pending = c.call("atc_message", {"session": "beta-22", "text": "nobody watching"})
+            self.assertFalse(pending["isError"])
+            self.assertIn("Waiting for approval", text(pending))
+            self.assertNotIn("nobody watching", FX.pane("beta-22"))
             self.assertFalse(c.call("atc_jump", {"session": "beta-22", "dry_run": True})["isError"])
+        finally:
+            c.close()
+
+    def test_headless_run_requests_owner_approval(self):
+        c = Client(CLAUDE_CODE_ENTRYPOINT="sdk-cli")  # claude -p: says attended, can't show a form
+        try:
+            pending = c.call("atc_message", {"session": "beta-22", "text": "from a headless run"})
+            self.assertFalse(pending["isError"])
+            self.assertIn("Waiting for approval", text(pending))
+            self.assertNotIn("from a headless run", FX.pane("beta-22"))
         finally:
             c.close()
 
@@ -392,7 +405,7 @@ class Policy(unittest.TestCase):
         off = Client(ATC_MCP_LEVERS="off")
         try:
             names = [t["name"] for t in off.request("tools/list")["result"]["tools"]]
-            self.assertEqual(len(names), 7)
+            self.assertEqual(len(names), 8)
             self.assertNotIn("atc_message", names)
             self.assertIn("levers are off", text(off.call("atc_message", {"session": "beta-22", "text": "x"})))
         finally:
@@ -536,11 +549,16 @@ class Http(unittest.TestCase):
         self.assertEqual((status, len(tools["result"]["tools"])), (200, 20))
         status, lever = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {
             "session": "beta-22", "text": "legacy http"}}, False))
-        self.assertTrue(lever["result"]["isError"])
+        self.assertEqual(status, 200)
+        self.assertFalse(lever["result"]["isError"])
+        row = self.m.Approvals().access()[-1]
+        self.assertEqual((row["tool"], row["state"]), ("atc_message", "pending"))
+        self.assertIn("Waiting for approval " + row["id"], text(lever["result"]))
+        self.assertNotIn("legacy http", FX.pane("beta-22"))
 
     def test_levers_need_serve_writes(self):
         names = [t["name"] for t in self.post(self.rpc("tools/list"), url=self.read_url)[1]["result"]["tools"]]
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 8)
         reply = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {"session": "beta-22",
                                                                                         "text": "x"}}), url=self.read_url)
         self.assertIn("levers are off", text(reply[1]["result"]))

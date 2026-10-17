@@ -59,7 +59,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie, CookieError
 
@@ -1047,13 +1046,29 @@ def job_order(job):
             job.get("next_run") or float("inf"), job["name"])
 
 
-def job_summary(job):
+def job_due(at, now=None):
+    now = time.time() if now is None else now
+    seconds = at - now
+    if seconds <= 0:
+        return "now" if seconds > -60 else "overdue by " + human_age(-seconds)
+    if seconds < 3600:
+        return "in " + str(math.ceil(seconds / 60)) + "m"
+    due, today = datetime.fromtimestamp(at), datetime.fromtimestamp(now).date()
+    if due.date() == today:
+        return "at " + due.strftime("%H:%M")
+    if due.date() == today + timedelta(days=1):
+        return "tomorrow " + due.strftime("%H:%M")
+    return due.strftime("%d %b %Y at %H:%M" if due.year != today.year else "%a %d %b at %H:%M")
+
+
+def job_summary(job, now=None):
     state = "failing" if job.get("failing") else "running" if job.get("running") else job.get("state") or "idle"
     parts = [state]
     if job.get("last_exit") is not None:
         parts.append("last exit " + str(job["last_exit"]))
     if job.get("next_run"):
-        parts.append("due ~" + iso(job["next_run"]))
+        due = job_due(job["next_run"], now)
+        parts.append(("" if due.startswith("overdue") else "due ") + due + " (estimated)")
     elif job.get("schedule"):
         parts.append(str(job["schedule"]))
     if job.get("expired"):
@@ -1098,8 +1113,7 @@ class Loom:
             if kind == "jobs":
                 rows = [dict(row, next_run=job_next_run(row, time.time())) for row in rows]
                 for row in rows:
-                    if row["next_run"] is not None:
-                        iso(row["next_run"])  # reject unusable timestamps before publishing a snapshot
+                    row["next_run_iso"] = iso(row["next_run"])  # validate before publishing a snapshot
                 rows.sort(key=job_order)
             else:
                 rows.sort(key=lambda row: (row.get("status") == "running", row["name"]))
@@ -1113,16 +1127,30 @@ class Loom:
                 return
             tasks = [(host, "jobs") for host in self.hosts] + [("local", "apps")]
             data = {host: {"ok": True, "error": None, "jobs": self.data.get(host, {}).get("jobs", []),
-                           "apps": self.data.get(host, {}).get("apps", [])} for host in self.hosts}
-            with ThreadPoolExecutor(max_workers=min(16, len(tasks))) as pool:
-                pending = [(host, kind, pool.submit(self.read, host, kind)) for host, kind in tasks]
-                for host, kind, future in pending:
-                    rows, error = future.result()
-                    if error:
-                        data[host]["ok"] = False
-                        data[host]["error"] = "; ".join(filter(None, [data[host]["error"], kind + ": " + error]))
-                    else:
-                        data[host][kind] = rows
+                           "apps": self.data.get(host, {}).get("apps", []), "apps_ok": None, "apps_error": None}
+                    for host in self.hosts}
+            pending, results = queue.Queue(), queue.Queue()
+            for task in tasks:
+                pending.put(task)
+
+            def read():
+                while True:
+                    try:
+                        host, kind = pending.get_nowait()
+                    except queue.Empty:
+                        return
+                    rows, error = self.read(host, kind)
+                    results.put((host, kind, rows, error))
+
+            for _ in range(min(16, len(tasks))):
+                threading.Thread(target=read, daemon=True).start()
+            for _ in tasks:
+                host, kind, rows, error = results.get()
+                ok_key, error_key = ("ok", "error") if kind == "jobs" else ("apps_ok", "apps_error")
+                data[host][ok_key] = error is None
+                data[host][error_key] = kind + ": " + error if error else None
+                if rows is not None:
+                    data[host][kind] = rows
             self.data, self.checked = data, time.monotonic()
 
     def loop(self):
@@ -1670,8 +1698,8 @@ class RemoteAtc(Remote):
 
 # ---------------------------------------------------------------- the fleet
 
-# New sources add typed items here; `approval` (pending levers) and `later` (wake-ups/reminders) are reserved.
-NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": 1, "amail_request": 2, "amail_proposal": 3,
+# Typed needs shared by the screen, web UI, MCP and JSON. `later` is reserved for wake-ups/reminders.
+NEED_ORDER = {"blocked": 0, "amail_approval": 1, "approval": -1, "amail_request": 2, "amail_proposal": 3,
               "amail_device": 4, "amail_unreachable": 5, "job": 5, "waiting": 6, "later": 7, "amail_inbox": 8}
 URGENT_NEEDS = {"blocked", "amail_approval", "amail_request", "amail_device", "approval", "job"}
 
@@ -1699,6 +1727,9 @@ def needs_queue(groups, hosts, items=()):
                 continue
             needs.append(need_item(item["kind"], item.get("title", ""), item.get("detail", ""), host=h["host"],
                                    since=item.get("since"), hint=item.get("hint", "")))
+            if item["kind"] == "approval":
+                needs[-1].update({key: item.get(key) for key in
+                                  ("id", "tool", "args_digest", "summary", "target", "caller", "client", "expires")})
     for item in needs:
         if item["kind"] == "job":
             continue  # loom has its own hosts and availability, independent of atc's agent peers
@@ -1714,8 +1745,8 @@ def needs_counts(items):
 
 
 class Fleet:
-    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None, amail=None,
-                 loom=None):
+    def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None,
+                 amail=None, loom=None, approvals=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
@@ -1724,6 +1755,7 @@ class Fleet:
         self.closed = closed
         self.amail_poller = amail
         self.loom = loom
+        self.approvals = approvals or Approvals()
         self.swarms = swarms or Swarms()
         self.swarm_pids = {}     # unit pid -> swarm id, unit id and display label
         self.sessions = {}       # sid -> Session
@@ -1935,14 +1967,14 @@ class Fleet:
         helpers = [h for v in sessions for h in v["helpers"] + [a for t in v["teams"] for a in t["agents"]]]
         hosts = unique_hosts([r.view(now) for r in remotes])
         jobs = self.loom.data if self.loom else {}
-        items = list(self.amail_poller.items) if self.amail_poller else []
+        items = list(self.amail_poller.items if self.amail_poller else ()) + self.approvals.needs()
         for host, entry in jobs.items():
             for job in entry["jobs"]:
                 if job.get("failing"):
                     hint = "Open Jobs for status; run it again when ready."
                     if not entry["ok"]:
                         hint += " Last seen; loom isn't answering: " + (entry["error"] or "unknown error")
-                    items.append(dict(need_item("job", job["name"], job_summary(job), host=host, hint=hint),
+                    items.append(dict(need_item("job", job["name"], job_summary(job, now), host=host, hint=hint),
                                       job=job["name"]))
         needs = needs_queue(groups, hosts, items)
         return {
@@ -2612,12 +2644,162 @@ def web_enroll(directory=None, is_tty=None, now=None):
     return code
 
 
-def web_file_lock(directory):
-    fd = os.open(os.path.join(directory, "identity.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+def web_file_lock(directory, name="identity.lock"):
+    fd = os.open(os.path.join(directory, name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     os.fchmod(fd, 0o600)
     fh = os.fdopen(fd, "r+")
     fcntl.flock(fh, fcntl.LOCK_EX)
     return fh  # closing the file releases the lock, including on exceptions
+
+
+APPROVAL_TTL = 600
+APPROVAL_WAIT = 45.0
+APPROVAL_POLL = 0.25
+
+
+def approval_wait():
+    try:
+        seconds = float(os.environ.get("ATC_APPROVAL_WAIT", str(APPROVAL_WAIT)))
+    except ValueError:
+        raise WebError("ATC_APPROVAL_WAIT must be a finite, non-negative number of seconds") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise WebError("ATC_APPROVAL_WAIT must be a finite, non-negative number of seconds")
+    return seconds
+
+
+class Approvals:
+    """A machine's single-use grants. Every read/transition locks across threads and processes."""
+
+    def __init__(self, directory=None, background=False):
+        self.directory = directory or os.path.expanduser("~/.config/atc")
+        self.path = os.path.join(self.directory, "approvals.json")
+        self.background, self.cached = background, []
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def access(self, change=None):
+        if change is None and not os.path.exists(self.path):
+            return []
+        private_dir(self.directory)
+        with web_file_lock(self.directory, "approvals.lock"):
+            rows = private_read(self.path, [])
+            before = json.dumps(rows, sort_keys=True)
+            now = time.time()
+            rows = [row for row in rows if row["expires"] + APPROVAL_TTL > now]
+            for row in rows:
+                if row["expires"] <= now and row["state"] in ("pending", "approved"):
+                    row["state"] = "expired"
+            result = change(rows) if change else rows
+            if json.dumps(rows, sort_keys=True) != before:
+                private_write(self.path, rows)
+            return result
+
+    def create(self, tool, args, summary, caller, client, target=None):
+        now = time.time()
+        row = {"id": secrets.token_urlsafe(12), "tool": tool, "args_digest": args_digest(tool, args),
+               "summary": summary, "target": target or summary, "caller": caller, "client": client, "created": now,
+               "expires": now + APPROVAL_TTL, "state": "pending", "decided_at": None,
+               "decided_by": None, "via": None}
+        self.access(lambda rows: rows.append(row))
+        audit(dict(row, transport="approval", outcome="pending"))
+        return row
+
+    @staticmethod
+    def find(rows, ident):
+        if not isinstance(ident, str) or not re.fullmatch(r"[A-Za-z0-9_-]{16}", ident):
+            raise WebError("Invalid approval id")
+        row = next((row for row in rows if row["id"] == ident), None)
+        if row is None:
+            raise WebError("Approval is unknown or expired", 404)
+        return row
+
+    def get(self, ident):
+        return self.find(self.access(), ident)
+
+    def decide(self, ident, decision, by, via):
+        if decision not in ("approve", "deny"):
+            raise WebError("decision must be approve or deny")
+        def change(rows):
+            row = self.find(rows, ident)
+            if row["state"] != "pending":
+                raise WebError("Approval is " + row["state"], 409)
+            row.update(state="approved" if decision == "approve" else "denied", decided_at=time.time(),
+                       decided_by=by, via=via)
+            return dict(row)
+        row = self.access(change)
+        audit(dict(row, transport="approval", outcome=row["state"]))
+        return row
+
+    def consume(self, ident, tool, args, caller, summary):
+        def change(rows):
+            row = self.find(rows, ident)
+            if row["tool"] != tool or row["args_digest"] != args_digest(tool, args) or row["caller"] != caller:
+                raise WebError("Approval does not match this tool, arguments and caller", 403)
+            if row["state"] != "approved":
+                raise WebError("Approval is " + row["state"], 409)
+            if row["summary"] != summary:
+                raise WebError("Approval does not match the resolved action. Call again without approval "
+                               "to request a new approval.", 403)
+            row["state"] = "used"  # claim before running, even if the lever subsequently fails
+            return dict(row)
+        row = self.access(change)
+        audit(dict(row, transport="approval", outcome="used"))
+        return row
+
+    def needs(self):
+        rows = self.cached if self.background else self.access()
+        items = []
+        for row in rows:
+            if row["state"] != "pending" or row["expires"] <= time.time():
+                continue
+            item = need_item("approval", "Approval " + row["id"], row["summary"],
+                             hint="Approve with a passkey, y y on its atc screen, or atc approve " + row["id"])
+            item.update({key: row[key] for key in ("id", "tool", "args_digest", "summary", "caller", "client", "expires")})
+            item["target"] = row.get("target") or row["summary"]
+            items.append(item)
+        return items
+
+    def loop(self):
+        while True:
+            try:
+                self.cached = self.access()
+            except (OSError, ValueError, WebError):
+                self.cached = []
+            time.sleep(1)
+
+
+def approval_cli(argv, store=None, is_tty=None):
+    store = store or Approvals()
+    if argv == ["approvals"]:
+        rows = [row for row in store.access() if row["state"] in ("pending", "approved")]
+        for row in rows:
+            until = time.strftime("%H:%M", time.localtime(row["expires"]))
+            print(clean(f"{row['id']}  {row['state']} until {until}  {row['summary']}  caller: {row['caller'] or 'unknown'}"))
+        if not rows:
+            print("No approvals waiting.")
+        return 0
+    if len(argv) != 2 or argv[0] not in ("approve", "deny"):
+        raise WebError("Use atc approvals, atc approve <id>, or atc deny <id>")
+    if not (is_tty or sys.stdin.isatty)():
+        raise WebError("Approving or denying needs a terminal (stdin must be a TTY)")
+    row = store.decide(argv[1], argv[0], "owner", "terminal")
+    print("Approval " + row["id"] + " " + row["state"] + ".")
+    return 0
+
+
+def notify_approval(row, args):
+    command = os.environ.get("ATC_NOTIFY_CMD")
+    if not command:
+        return
+    target = args.get("session") or args.get("pid") or args.get("folder") or args.get("host") or "this machine"
+    line = clean(f"atc: approval waiting: {row['tool']} on {target} ({row['id']})")
+    try:
+        argv = shlex.split(command)
+        if argv:
+            subprocess.run(argv + [line], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
 
 
 def peer_token():
@@ -2782,7 +2964,7 @@ class WebAuth:
                 raise WebError("Enrollment code is invalid or expired; run atc web-enroll on the hub", 401)
             os.unlink(path)
 
-    def begin(self, kind, body, identity=None):
+    def begin(self, kind, body, identity=None, binding=None):
         with self.lock:
             if kind == "register":
                 name = body.get("name")
@@ -2797,7 +2979,12 @@ class WebAuth:
                         "attestation": "none", "authenticatorSelection": {
                             "userVerification": "required", "residentKey": "preferred"},
                         "excludeCredentials": [{"type": "public-key", "id": k} for k in self.data["keys"]]}
-            return {"challenge": self.issue(kind), "rpId": self.rp, "timeout": 120000,
+            bound = {}
+            if kind == "approval":
+                if not identity or not binding:
+                    raise WebError("An approval and signed-in session are required", 401)
+                bound = {"binding": binding, "session": identity["token"]}
+            return {"challenge": self.issue(kind, **bound), "rpId": self.rp, "timeout": 120000,
                     "userVerification": "required",
                     "allowCredentials": [{"type": "public-key", "id": k} for k in self.data["keys"]]}
 
@@ -2808,7 +2995,7 @@ class WebAuth:
         if not pending or pending["kind"] != kind or pending["expires"] <= time.time():
             raise WebError("Challenge is expired, reused or unknown")
         if pending.get("session") and (not identity or pending["session"] != identity["token"]):
-            raise WebError("Sign in again before adding a passkey", 401)
+            raise WebError("Sign in again before completing this passkey action", 401)
         response = body.get("response")
         if not isinstance(response, dict) or body.get("type") != "public-key":
             raise WebError("Invalid passkey response")
@@ -2851,10 +3038,12 @@ class WebAuth:
         if offset != len(raw):
             raise WebError("Unexpected authenticator data")
 
-    def finish(self, kind, body, identity=None):
+    def finish(self, kind, body, identity=None, binding=None):
         with self.lock:
             self.prune()
             pending, response, client, cid = self.client_data(body, kind, identity)
+            if kind == "approval" and (not binding or pending.get("binding") != binding):
+                raise WebError("Passkey challenge belongs to a different approval")
             if kind == "register":
                 raw = unb64url(response.get("attestationObject"))
                 att, end = cbor_read(raw)
@@ -2904,6 +3093,8 @@ class WebAuth:
             private_write(self.path, updated)
             self.data = updated
             self.prune()
+            if kind == "approval":
+                return entry["name"]
             token = b64url(secrets.token_bytes(32))
             self.sessions[token] = {"id": cid, "expires": time.time() + 12 * 3600}
             audit({"transport": "web", "caller": entry["name"], "tool": kind, "outcome": "done"})
@@ -2943,7 +3134,9 @@ class Service:
         self.fleet, self.quota, self.remotes, self.terminals = fleet, quota, remotes, terminals
         self.writes, self.token = writes, token
         self.model, self.at, self.error = None, 0.0, None
-        self.cockpit = Cockpit(fleet, quota, remotes, terminals, claude_cmd or ["claude"], route_cmd, service=self)
+        self.approvals = fleet.approvals
+        self.cockpit = Cockpit(fleet, quota, remotes, terminals, claude_cmd or ["claude"], route_cmd, service=self,
+                               dry_run=terminals.dry_run)
         self.mcp = McpServer(self.cockpit, "http", levers=writes)
         self.web = WebAuth(web_origin, web_dir) if web_origin else None
         self.peer_secret = peer_secret if peer_secret is not None else peer_token()
@@ -3066,6 +3259,61 @@ class Service:
         # Some readers use sets internally. The web contract contains only JSON values.
         return json.loads(json.dumps(result, default=lambda x: list(x) if isinstance(x, set) else str(x)))
 
+    def approval_target(self, ident, host):
+        if host is None or host == "local":
+            row, remote = self.approvals.get(ident), None
+        else:
+            if not isinstance(host, str):
+                raise WebError("Invalid approval machine")
+            remote = next((r for r in self.remotes if isinstance(r, RemoteAtc) and r.host == host), None)
+            if remote is None:
+                raise WebError("No HTTP atc for this approval machine", 404)
+            if remote.error or not remote.ok_at:
+                raise WebError("The approval machine is not answering", 503)
+            row = next((n for n in (remote.data or {}).get("needs", [])
+                        if n.get("kind") == "approval" and n.get("id") == ident and n.get("host") is None), None)
+            if row is None:
+                raise WebError("Approval is unknown or expired", 404)
+        if row.get("state", "pending") != "pending" or row["expires"] <= time.time():
+            raise WebError("Approval is no longer pending", 409)
+        return row, remote
+
+    def web_approval(self, ident, stage, body, identity):
+        if not self.writes:
+            raise WebError("writes are off: start atc with --serve-writes", 403)
+        host = body.get("host")
+        row, remote = self.approval_target(ident, host)
+        binding = {"id": ident, "args_digest": row["args_digest"], "host": host or "local"}
+        if stage == "options":
+            return self.web.begin("approval", {}, identity, binding)
+        by = identity["name"]
+        if stage == "approve":
+            by = self.web.finish("approval", body, identity, binding)
+        elif stage != "deny":
+            raise WebError("not found", 404)
+        if remote:
+            if not self.peer_secret:
+                raise WebError("Approvals on another machine need the peer secret", 503)
+            machine = str((self.model or {}).get("machine") or socket.gethostname()).split(".")[0]
+            payload = {"decision": stage, "by": {"name": by, "hub": machine}}
+            req = urllib.request.Request(remote.url + "/api/peer/approvals/" + ident,
+                                         data=json.dumps(payload).encode(), headers={
+                                             "Authorization": "Bearer " + self.peer_secret,
+                                             "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    result = json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                raise WebError(f"Approval machine refused the decision (HTTP {exc.code}); refresh the queue", 409) from None
+            except Exception:
+                raise WebError("Approval machine stopped answering; the decision may have arrived. Refresh the queue.", 503) from None
+            audit({"transport": "web", "caller": by, "tool": "approval", "id": ident,
+                   "host": remote.host, "outcome": stage})
+            return result
+        decided = self.approvals.decide(ident, stage, by, "web passkey" if stage == "approve" else "web session")
+        return {"ok": True, "text": "Approval " + ident + " " + decided["state"] + "."}
+
     def run_tool(self, transport, name, body, caller):
         if not isinstance(body.get("arguments", {}), dict) or not isinstance(name, str):
             raise WebError("arguments must be an object")
@@ -3177,7 +3425,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/api/web/"):
             return self.web_request(path, post=True)
-        if path.startswith("/api/peer/tools/"):
+        if path.startswith(("/api/peer/tools/", "/api/peer/approvals/")):
             return self.peer_request(path)
         if path == "/mcp":
             return self.mcp()
@@ -3214,12 +3462,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(401, {"detail": "a peer secret is required"})
         try:
             body = self.json_body()
+            if path.startswith("/api/peer/approvals/"):
+                by = body.get("by")
+                if not isinstance(by, dict) or any(not isinstance(by.get(k), str) or not by[k]
+                                                   or len(by[k]) > 200 for k in ("name", "hub")):
+                    raise WebError("by must name the owner passkey and hub")
+                decision = body.get("decision")
+                via = ("web passkey via " if decision == "approve" else "web session via ") + by["hub"]
+                row = service.approvals.decide(path.rsplit("/", 1)[1], decision, by["name"], via)
+                return self.reply(200, {"ok": True, "text": "Approval " + row["id"] + " " + row["state"] + "."})
             caller = body.get("caller")
             if caller is not None and (not isinstance(caller, str) or len(caller) > 200):
                 raise WebError("Invalid caller")
             return self.reply(200, service.run_tool("peer", path.rsplit("/", 1)[1], body, caller))
         except WebError as exc:
             return self.reply(exc.status, {"ok": False, "text": str(exc)})
+        except (OSError, ValueError):
+            return self.reply(503, {"ok": False, "text": "Approval storage is unavailable"})
 
     def web_request(self, path, post=False):
         service, extra = self.server.service, {}
@@ -3254,6 +3513,11 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/web/passkeys/remove":
                     web.remove(body.get("id"), body.get("confirm_last"), identity)
                     result = {"ok": True}
+                elif path.startswith("/api/web/approvals/"):
+                    match = re.fullmatch(r"/api/web/approvals/([A-Za-z0-9_-]{16})/(options|approve|deny)", path)
+                    if not match:
+                        raise WebError("not found", 404)
+                    result = service.web_approval(*match.groups(), body, identity)
                 elif path.startswith("/api/web/tools/"):
                     result = service.run_tool("web", path.rsplit("/", 1)[1], body, identity["name"])
                 else:
@@ -3396,8 +3660,9 @@ class Lever:
     """A lever ready to pull: what it will do, in words (the question you are asked), and the call that does it,
     returning (ok, what happened). Refusals happen before a Lever exists, so you are never asked about them."""
 
-    def __init__(self, summary, run, confirm=True):
+    def __init__(self, summary, run, confirm=True, target=None):
         self.summary, self.run, self.confirm = summary, run, confirm
+        self.target = target or summary
 
 
 class Call:
@@ -3414,6 +3679,7 @@ class Cockpit:
     def __init__(self, fleet, quota, remotes, terminals, claude_cmd, route_cmd, service=None, dry_run=False):
         self.fleet, self.quota, self.remotes, self.terminals = fleet, quota, remotes, terminals
         self.claude_cmd, self.route_cmd, self.service, self.dry_run = claude_cmd, route_cmd, service, dry_run
+        self.approvals = fleet.approvals
         self.cached, self.cached_at, self.polled = None, 0.0, {}
         self.lock = threading.Lock()
 
@@ -3582,7 +3848,7 @@ def remote_tool(host, name, arguments):
     return not data.get("isError"), str(data.get("text") or "")
 
 
-def on_server(ck, h, name, arguments, summary, call, confirm=True):
+def on_server(ck, h, name, arguments, summary, call, confirm=True, target=None):
     """A lever aimed at a server: asked about here, then run there with the session's id."""
     view = next((x for x in ck.model().get("hosts", []) if x["host"] == h), None)
     if view is not None and not view["ok"]:
@@ -3600,13 +3866,13 @@ def on_server(ck, h, name, arguments, summary, call, confirm=True):
             if not ok:
                 raise ToolError(preview)
             summary = f"On {h}: {preview}"
-        return Lever(summary, lambda: remote.tool(name, args, token, call.caller), confirm)
+        return Lever(summary, lambda: remote.tool(name, args, token, call.caller), confirm, target)
     if call.transport == "web" and call.dry_run:
         ok, preview = remote_tool(h, name, args)
         if not ok:
             raise ToolError(preview)
         summary += "\n" + preview
-    return Lever(summary, lambda: remote_tool(h, name, args), confirm)
+    return Lever(summary, lambda: remote_tool(h, name, args), confirm, target)
 
 
 def done(result, *prefixes):
@@ -3687,6 +3953,8 @@ SESSION_ARG = {"type": "string", "description": "The session: its id (or its fir
 HOST_ARG = {"type": "string", "description": "A server from ~/.config/atc/hosts, when the session is there "
                                              "(default: this machine)"}
 LEVER_ARGS = {
+    "approval": {"type": "string", "description": "Retry with this pending approval id after the owner approves it. "
+                 "Single use, expires after 10 minutes; tool, other arguments and caller must match exactly."},
     "dry_run": {"type": "boolean", "description": "Say what would happen, and do nothing", "default": False},
     "allow_self": {"type": "boolean", "description": "Allow aiming at the session that is calling (refused "
                                                      "otherwise)", "default": False},
@@ -3736,7 +4004,9 @@ def tool_jobs(ck, a, call):
         out.append("Jobs & apps on " + host)
         if not entry["ok"]:
             out.append("  Unavailable (last seen rows): " + clean(entry["error"]))
-        out += ["  " + clean(job["name"]) + " · " + job_summary(job) for job in entry["jobs"]]
+        out += ["  " + clean(job["name"]) + " · " + job_summary(job, model["now"]) for job in entry["jobs"]]
+        if entry.get("apps_error"):
+            out.append("  Apps unavailable (last seen apps): " + clean(entry["apps_error"]))
         out += ["  app " + clean(app["name"]) + " · " + clean(app.get("status")) + " · " + clean(app.get("health"))
                 for app in entry["apps"]]
         if not entry["jobs"] and not entry["apps"]:
@@ -3758,7 +4028,8 @@ def tool_run_job(ck, a, call):
 
 
 @mcp_tool("atc_needs_me", "Who needs me", "The ordered needs-you queue on every machine: blocked prompts, "
-          "a-mail owner items, failing jobs, waiting sessions and a-mail inbox counts. Says where to answer each item.")
+          "pending lever approvals, a-mail owner items, failing jobs, waiting sessions and a-mail inbox counts. "
+          "Says where to answer each item.")
 def tool_needs_me(ck, a, call):
     model = ck.model()
     needs = model["needs"]
@@ -3931,14 +4202,15 @@ def tool_message(ck, a, call):
     not_self(call, h, v)
     refuse_blocked(h, v)
     live_only(h, v)
-    summary = f"type “{squash(text)[:300]}” into {session_ref(v, h)}, in {short_path(v.get('cwd') or '')}"
+    target = f"{session_ref(v, h)}, in {short_path(v.get('cwd') or '')}"
+    summary = f"type “{squash(text)[:300]}” into {target}"
     if h:
-        return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call)
+        return on_server(ck, h, "atc_message", {"session": v["sid"], "text": text}, summary, call, target=target)
 
     def go():
         delivered, detail = deliver(ck.fleet, ck.terminals, v, text, call.dry_run)
         return delivered, f"{'typed into' if delivered else 'not delivered to'} {session_ref(v)}: {detail}"
-    return Lever(summary, go)
+    return Lever(summary, go, target=target)
 
 
 @mcp_tool("atc_broadcast", "Message a folder", "Type the same message into every live session in a folder (or the "
@@ -3966,9 +4238,9 @@ def tool_broadcast(ck, a, call):
                  and v.get("kind") in ("interactive", "herdr") and v.get("sid") != call.caller]
         if not peers:
             raise ToolError(f"no live session in {folder} on {h['host']}")
-        summary = (f"type “{squash(text)[:300]}” into {len(peers)} session(s) in {folder} on {h['host']}: "
-                   f"{', '.join(session_ref(v) for v in peers)}")
-        return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call)
+        target = f"{len(peers)} session(s) in {folder} on {h['host']}: {', '.join(session_ref(v) for v in peers)}"
+        summary = f"type “{squash(text)[:300]}” into {target}"
+        return on_server(ck, h["host"], "atc_broadcast", {"folder": folder, "text": text}, summary, call, target=target)
     folder = os.path.abspath(os.path.expanduser(folder))
     everyone = [v for v in ordered_sessions(model, True) if within(v.get("cwd") or "", folder)
                 and v["kind"] in ("interactive", "herdr")]
@@ -3976,8 +4248,9 @@ def tool_broadcast(ck, a, call):
     if not targets:
         raise ToolError(f"no live session in {short_path(folder)}" + (" besides the calling one" if everyone else ""))
     blocked = [v for v in targets if v["group"] == "blocked"]
-    summary = (f"type “{squash(text)[:300]}” into {len(targets) - len(blocked)} session(s) in {short_path(folder)}: "
-               f"{', '.join(session_ref(v) for v in targets if v not in blocked)}"
+    target = (f"{len(targets) - len(blocked)} session(s) in {short_path(folder)}: "
+              f"{', '.join(session_ref(v) for v in targets if v not in blocked)}")
+    summary = (f"type “{squash(text)[:300]}” into {target}"
                + (f"; skipping {', '.join(session_ref(v) for v in blocked)} (blocked on a prompt)" if blocked else ""))
     if len(blocked) == len(targets):
         raise ToolError("every session there is blocked on a prompt: " + ", ".join(session_ref(v) for v in blocked))
@@ -3989,7 +4262,7 @@ def tool_broadcast(ck, a, call):
             (sent if delivered else skipped).append(session_ref(v) + ("" if delivered else f" ({detail})"))
         said = ("dry run: " if call.dry_run else "") + (f"typed into {', '.join(sent)}" if sent else "typed into nobody")
         return bool(sent), said + (f"; skipped {'; '.join(skipped)}" if skipped else "")
-    return Lever(summary, go)
+    return Lever(summary, go, target=target)
 
 
 @mcp_tool("atc_interrupt", "Interrupt a session", "Interrupt a session (Esc, as if the user pressed it; at a prompt, "
@@ -4166,9 +4439,10 @@ def tool_new_task(ck, a, call):
                           f"pool: \"{plan.get('chosen')}\".")
         return Lever(f"plan “{task[:200]}” with route", plan_only, confirm=False)
     command = dispatch_command(ck.route_cmd or ["route"], ck.claude_cmd, {"chosen": pool}, task)
-    summary = f"start “{squash(task)[:300]}” on {pool} in {short_path(folder)}, in a new terminal tab"
+    target = f"{pool} in {short_path(folder)}"
+    summary = f"start “{squash(task)[:300]}” on {target}, in a new terminal tab"
     return Lever(summary, lambda: done(f"{pool}: " + open_tab(folder, command, call.dry_run), f"{pool}: opened",
-                                       f"{pool}: started", f"{pool}: dry run"))
+                                       f"{pool}: started", f"{pool}: dry run"), target=target)
 
 
 @mcp_tool("atc_jump", "Jump to a session", "Bring a session's terminal tab to the front (a background session opens "
@@ -4307,7 +4581,9 @@ class McpServer:
 
     def call_tool(self, params, ctx, caller):
         name = params.get("name")
-        args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        args = dict(params.get("arguments")) if isinstance(params.get("arguments"), dict) else {}
+        has_approval = "approval" in args
+        approval = args.pop("approval", None)
         tool = TOOLS.get(name)
         if tool is None:
             raise BadParams(f"no tool {name!r}; tools/list has them")
@@ -4315,7 +4591,8 @@ class McpServer:
             if self.transport in ("web", "peer"):
                 self.record(name, args, ctx, caller, "refused", LEVERS_OFF)
             return text_result(LEVERS_OFF, True)
-        call = Call(caller, bool(args.get("dry_run")), bool(args.get("allow_self")), self.transport)
+        call = Call(caller, bool(args.get("dry_run")) or self.cockpit.dry_run,
+                    bool(args.get("allow_self")), self.transport)
         try:
             outcome = tool["fn"](self.cockpit, args, call)
         except ToolError as exc:
@@ -4328,12 +4605,25 @@ class McpServer:
             return text_result(self.cockpit.notice() + outcome)
         lever = outcome
         if call.dry_run and self.transport in ("web", "peer"):
-            self.record(name, args, ctx, caller, "dry run", lever.summary)
-            return text_result(lever.summary)
-        if lever.confirm and not call.dry_run and self.policy == "confirm":
-            answer = self.confirmation(name, args, ctx, caller, lever, params)
+            summary = ("dry run: " if self.cockpit.dry_run else "") + lever.summary
+            self.record(name, args, ctx, caller, "dry run", summary)
+            return text_result(summary)
+        if has_approval:
+            try:
+                self.cockpit.approvals.consume(approval, name, args, caller, lever.summary)
+            except (WebError, OSError, ValueError) as exc:
+                self.record(name, args, ctx, caller, "not confirmed", str(exc))
+                return text_result(str(exc), True)
+        elif lever.confirm and not call.dry_run and self.policy == "confirm":
+            try:
+                answer = self.confirmation(name, args, ctx, caller, lever, params)
+            except (WebError, OSError, ValueError, ToolError) as exc:
+                answer = "Approval unavailable: " + str(exc)
+            if isinstance(answer, Lever):
+                lever, answer = answer, True
             if isinstance(answer, dict):
-                self.record(name, args, ctx, caller, "asked", lever.summary)
+                outcome = "asked" if answer.get("resultType") == "input_required" else "waiting"
+                self.record(name, args, ctx, caller, outcome, lever.summary)
                 return answer
             if answer is not True:
                 self.record(name, args, ctx, caller, "not confirmed", answer)
@@ -4346,14 +4636,11 @@ class McpServer:
         return text_result(self.cockpit.notice() + text, not ok)
 
     def confirmation(self, name, args, ctx, caller, lever, params):
-        """True when you said yes to this very call; an input_required result that asks you; or why it can't run."""
-        if not self.attended:
-            return ("nobody is attending the calling session, so there is no one to confirm this: nothing was done "
-                    "(ATC_MCP_LEVERS=auto lets levers run without asking)")
+        """Yes (or a rebuilt approved Lever), a question/waiting result, or why the call cannot run."""
         asks = ctx["caps"].get("elicitation")
-        if not isinstance(asks, dict) or (asks and "form" not in asks):
-            return ("this client can't ask the user to confirm (no MCP elicitation), so the lever was refused "
-                    "(ATC_MCP_LEVERS=auto lets levers run without asking)")
+        if (not self.attended or not isinstance(asks, dict) or (asks and "form" not in asks)
+                or (not ctx["modern"] and self.ask is None)):
+            return self.pending_approval(name, args, ctx, caller, lever)
         question = {"mode": "form", "message": f"atc: {lever.summary}", "requestedSchema": CONFIRM_SCHEMA}
         if ctx["modern"]:
             state, answers = params.get("requestState"), params.get("inputResponses")
@@ -4362,15 +4649,34 @@ class McpServer:
                 return True if self.said_yes(reply) else f"Not confirmed ({reply.get('action')}): nothing was done."
             return {"resultType": "input_required", "requestState": self.issue(name, args, caller),
                     "inputRequests": {"confirm": {"method": "elicitation/create", "params": question}}}
-        if self.ask is None:
-            return ("this connection can't ask the user to confirm (handshake protocol over HTTP): nothing was done. "
-                    "A client on protocol 2026-07-28 can, or set ATC_MCP_LEVERS=auto.")
         if ctx["version"] < "2025-11-25":
             question.pop("mode")
         reply = self.ask(question)
         if not isinstance(reply, dict):
             return "no answer to the question, so nothing was done"
         return True if self.said_yes(reply) else f"Not confirmed ({reply.get('action')}): nothing was done."
+
+    def pending_approval(self, name, args, ctx, caller, lever):
+        store = self.cockpit.approvals
+        deadline = time.monotonic() + approval_wait()
+        row = store.create(name, args, lever.summary, caller, (ctx.get("client") or {}).get("name"), lever.target)
+        notify_approval(row, args)
+        while True:
+            row = store.get(row["id"])
+            if row["state"] == "approved":
+                call = Call(caller, bool(args.get("dry_run")) or self.cockpit.dry_run,
+                            bool(args.get("allow_self")), self.transport)
+                current = TOOLS[name]["fn"](self.cockpit, args, call)
+                store.consume(row["id"], name, args, caller, current.summary)
+                return current
+            if row["state"] != "pending":
+                return "Approval " + row["id"] + " is " + row["state"] + "; nothing was done."
+            if time.monotonic() >= deadline:
+                until = time.strftime("%H:%M", time.localtime(row["expires"]))
+                return text_result(f"Waiting for approval {row['id']} until {until}. Approve it in the atc web UI, "
+                                   "on the atc screen, or with `atc approve " + row["id"] +
+                                   "` in a terminal; then call this tool again with approval: \"" + row["id"] + "\".")
+            time.sleep(min(APPROVAL_POLL, max(0, deadline - time.monotonic())))
 
     @staticmethod
     def said_yes(reply):
@@ -4405,6 +4711,15 @@ class McpServer:
         audit({"transport": self.transport, "caller": caller, "client": (ctx.get("client") or {}).get("name"),
                "host": socket.gethostname().split(".")[0], "tool": name, "arguments": args, "outcome": outcome,
                "detail": first_line(str(detail))[:300]})
+
+
+def stdio_attended(env):
+    """Whether someone can answer a question in the session that started `atc mcp`. Claude Code says so with
+    CLAUDE_CODE_SESSION_ATTENDED, but a headless run (`claude -p`, the SDK: entrypoint sdk-*) still reports itself
+    attended and advertises forms it can't show, then cancels them: treat it as unattended, so a lever waits for
+    the owner's approval instead of being refused."""
+    entry = env.get("CLAUDE_CODE_ENTRYPOINT") or "cli"
+    return env.get("CLAUDE_CODE_SESSION_ATTENDED") != "0" and not entry.startswith("sdk")
 
 
 def mcp_stdio(cockpit, instream=None, outstream=None):
@@ -4444,7 +4759,7 @@ def mcp_stdio(cockpit, instream=None, outstream=None):
         return None
 
     server = McpServer(cockpit, "stdio", caller=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
-                       attended=os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") != "0", ask=ask)
+                       attended=stdio_attended(os.environ), ask=ask)
     threading.Thread(target=read, daemon=True).start()
     while True:
         line = backlog.popleft() if backlog else inbox.get()
@@ -4705,11 +5020,14 @@ def jobs_lines(model, width, expanded=False):
                 idle.append(job)
                 continue
             style = "err" if job.get("failing") else "busy" if job.get("running") else "dim"
-            out.append(([("  " + clean(job["name"]) + "  ", style), (job_summary(job), style)], job_key(host, job["name"])))
+            out.append(([("  " + clean(job["name"]) + "  ", style), (job_summary(job, model["now"]), style)],
+                        job_key(host, job["name"])))
         if idle:
             expired = sum(bool(j.get("expired")) for j in idle)
             note = f" ({expired} expired)" if expired else ""
             out.append(([(f"  {len(idle)} idle jobs{note} · p lists them", "dim")], None))
+        if entry.get("apps_error"):
+            out.append(([("  apps unavailable; last seen apps · " + clean(entry["apps_error"]), "warn")], None))
         for app in entry["apps"]:
             status = clean(app.get("status"))
             out.append(([("  app " + clean(app["name"]) + " · " + status + " · " + clean(app.get("health")),
@@ -4733,9 +5051,19 @@ def fleet_lines(model, width, show_all, jobs_all=False):
         "background": ("Background", "claude --bg"),
         "other": ("Other", ""),
     }
-    for key in ("blocked", "waiting", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
+    for key in ("approvals", "blocked", "waiting", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
+        if key == "approvals":
+            items = [item for item in model.get("needs", []) if item["kind"] == "approval" and item["host"] is None]
+            if items:
+                out.append((rule("Approvals", width, "y y approve · n n deny"), None))
+                for item in items:
+                    until = time.strftime("%H:%M", time.localtime(item["expires"]))
+                    out.append(([(clean(item["title"]) + "  " + clean(item["summary"]), "warn")], "approval::" + item["id"]))
+                    out.append(([(clean(f"  caller: {item['caller'] or 'unknown'} · expires {until}"), "dim")], None))
+            continue
         if key == "needs":
-            items = [item for item in model.get("needs", []) if item["sid"] is None]
+            items = [item for item in model.get("needs", []) if item["sid"] is None
+                     and not (item["kind"] == "approval" and item["host"] is None)]
             if items:
                 out.append((rule("a-mail" if all(n["kind"].startswith("amail_") for n in items) else "Needs you",
                                  width, "where to answer"), None))
@@ -4885,7 +5213,7 @@ def comm_lines(items, limit):
 
 def resolve(fleet, model, key):
     """What a selected row is: ("session", v) | ("helper", v, row, helper) | ("process", host, agent) |
-    ("remote", host, v) | ("closed", c) | (None,)."""
+    ("remote", host, v) | ("closed", c) | ("approval", item) | (None,)."""
     if not key:
         return (None,)
     if key.startswith("job::"):
@@ -4893,6 +5221,10 @@ def resolve(fleet, model, key):
         host = urllib.parse.unquote(host)
         job = next((j for j in model.get("jobs", {}).get(host, {}).get("jobs", []) if j["name"] == name), None)
         return ("job", host, job) if job else (None,)
+    if key.startswith("approval::"):
+        item = next((n for n in model.get("needs", []) if n["kind"] == "approval"
+                     and n.get("id") == key[10:] and n["host"] is None), None)
+        return ("approval", item) if item else (None,)
     if key.startswith("swarm::"):
         ident, _, unit_id = key[7:].partition("::")
         swarm = next((v for v in model.get("swarms", []) if v["id"] == ident), None)
@@ -4936,6 +5268,8 @@ def selection_name(item):
     kind = item[0]
     if kind == "job":
         return item[2]["name"] + " on " + item[1]
+    if kind == "approval":
+        return "Approval " + item[1]["id"]
     if kind == "swarm":
         return item[1]["name"] + ("/" + item[2]["id"] if item[2] else "")
     if kind == "session":
@@ -4957,8 +5291,21 @@ def selection_lines(fleet, model, item, limit, width):
     if kind == "job":
         host, job = item[1], item[2]
         detail = fleet.loom.details.get((host, job["name"])) if fleet.loom else None
-        text = detail or job_summary(job) + "\nEnter reads status and recent log; x x runs it now."
+        text = detail or job_summary(job, model["now"]) + "\nEnter reads status and recent log; x x runs it now."
         lines = [[(part, "plain")] for line in text.splitlines() for part in wrap(line, max(1, width - 2))]
+        return lines[:limit] if limit else lines
+    if kind == "approval":
+        row = item[1]
+        until = time.strftime("%H:%M:%S", time.localtime(row["expires"]))
+        details = [("Tool: " + row["tool"], "head"),
+                   ("Machine: " + (row["host"] or model["machine"]), "dim"),
+                   ("Caller: " + (row["caller"] or "unknown"), "dim"),
+                   ("Client: " + (row["client"] or "unknown"), "dim"),
+                   ("Expires: " + until, "warn"),
+                   ("Target: " + (row.get("target") or row["summary"]), "head"),
+                   ("Action: " + row["summary"], "plain"),
+                   ("y y approves · n n denies · esc closes", "warn")]
+        lines = [[(line, style)] for text, style in details for line in wrap(text, width)]
         return lines[:limit] if limit else lines
     if kind == "swarm":
         return swarm_detail_lines(item[1], item[2], limit, width)
@@ -5329,6 +5676,8 @@ HELP = [
     "           an agent process (here or on a server): SIGTERM, over ssh for a server",
     "enter      on a subagent, a process or a server row: open it (its task, steps, report, command)",
     "           on a route swarm or unit: read its units, logs, branches and worktree paths",
+    "enter / f  on an approval: read its whole action and target; arrows/PgUp/PgDn scroll",
+    "y y / n n  approve / deny the selected approval, on its row or in its detail view",
     "C C / F F  type /closecode or /forkcode into the selected session (wrap it up, or split work off)",
     "           Steering never types into a session that is blocked on a prompt: that would answer it.",
     "R R        restore a closed session: opens `claude --resume <id>` in a new tab",
@@ -5568,6 +5917,11 @@ class App:
             return self.edit(key, self.submit_rename)
         if self.mode == "plan":
             return self.handle_plan_key(key)
+        if key in ("y", "n") and self.ui["view"] in (None, "detail"):
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] == "approval":
+                self.confirm_approval(key, item[1])
+                return True
         if self.ui["view"]:
             return self.handle_view_key(key)
         if key in ("q", "Q"):
@@ -5593,7 +5947,7 @@ class App:
             if item[0] == "job":
                 self.fleet.loom.load_detail(item[1], item[2]["name"])
                 self.ui.update(view="detail", view_scroll=0)
-            elif item[0] in ("helper", "process", "closed", "swarm"):
+            elif item[0] in ("helper", "process", "closed", "swarm", "approval"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.open_remote(item[1], item[2])
@@ -5652,6 +6006,22 @@ class App:
         elif key == "N":
             self.start_rename(v)
         return True
+
+    def confirm_approval(self, key, item):
+        decision = "approve" if key == "y" else "deny"
+        target = item.get("target") or item["summary"]
+        if self.confirm(key + ":" + item["id"], decision + " " + target):
+            if self.dry_run:
+                self.say("dry run: " + decision + " " + item["id"])
+            else:
+                threading.Thread(target=self.decide_approval, args=(item["id"], decision), daemon=True).start()
+
+    def decide_approval(self, ident, decision):
+        try:
+            row = self.fleet.approvals.decide(ident, decision, "owner", "screen")
+            self.say("Approval " + ident + " " + row["state"] + ".")
+        except (OSError, ValueError, WebError) as exc:
+            self.say(str(exc))
 
     def confirm(self, key, what):
         """True on the second press of `key` within a few seconds; the first press says what will happen."""
@@ -5937,6 +6307,12 @@ def tui(stdscr, app):
 
 
 def main():
+    if sys.argv[1:2] and sys.argv[1] in ("approvals", "approve", "deny"):
+        try:
+            return approval_cli(sys.argv[1:])
+        except (WebError, OSError, ValueError) as exc:
+            print(f"atc: {exc}", file=sys.stderr)
+            return 1
     if sys.argv[1:] == ["web-enroll"]:
         try:
             code = web_enroll()
@@ -5950,7 +6326,8 @@ def main():
     if sys.argv[1:2] == ["mcp-call"] and len(sys.argv) == 3:
         return mcp_call(sys.argv[2])
     parser = argparse.ArgumentParser(description="One terminal view of every Claude Code session on this machine.",
-                                     epilog="atc mcp: an MCP server over stdio (atc mcp --help).")
+                                     epilog="atc mcp: MCP over stdio. atc approvals: list grants. "
+                                            "atc approve <id> / deny <id>: decide from a terminal.")
     parser.add_argument("--once", action="store_true", help="print one frame as plain text and exit")
     parser.add_argument("--tree", action="store_true", help="with --once: print the hierarchy instead")
     parser.add_argument("--comms", action="store_true", help="with --once: print every message instead")
@@ -6011,7 +6388,8 @@ def main():
     closed = ClosedSessions(repos=repos, background=False) if not only and not args.jump else None
     amail = AMail(background=not one_shot) if not args.jump else None
     loom = Loom(background=not one_shot) if not args.jump else None
-    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail, loom=loom)
+    fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail, loom=loom,
+                  approvals=Approvals(background=not one_shot))
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
