@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>atc</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <a class="brand" href="#needs">atc <span>air traffic control</span></a>
+    <span id="connection" role="status">Connecting…</span>
+  </header>
+  <main>
+    <section id="signin" hidden aria-labelledby="signin-title">
+      <h1 id="signin-title">Your fleet, at a glance.</h1>
+      <p>Sign in with a passkey to see sessions and steer them.</p>
+      <button id="login" type="button" class="primary">Sign in with a passkey</button>
+      <details class="enroll-box">
+        <summary>Add your first passkey</summary>
+        <p>Run <code>atc web-enroll</code> in a terminal on the hub. Enter the one-time code here within 10 minutes.</p>
+        <form id="enroll-first">
+          <label>Enrollment code<input name="code" required autocomplete="off" spellcheck="false"></label>
+          <label>Passkey name<input name="name" required maxlength="80" placeholder="Phone" autocomplete="off"></label>
+          <button type="submit">Add a passkey</button>
+        </form>
+      </details>
+      <p class="muted">Passkeys need this page to be served over HTTPS.</p>
+    </section>
+    <div id="workspace" hidden>
+      <nav aria-label="Views">
+        <a href="#needs" data-view="needs">Needs you <span id="needs-count">0</span></a>
+        <a href="#fleet" data-view="fleet">Fleet</a>
+        <a href="#comms" data-view="comms">Comms</a>
+        <a href="#quota" data-view="quota">Quota</a>
+        <a href="#closed" data-view="closed">Closed</a>
+        <a href="#account" data-view="account">Passkeys</a>
+      </nav>
+      <div class="view-heading"><h1 id="view-title">Needs you</h1><button id="refresh" type="button">Refresh</button></div>
+      <p id="read-only" class="notice" hidden>Levers are off on this hub. Start it with --serve-writes to enable them.</p>
+      <label id="comms-filter" hidden>Filter by session<input id="filter" type="search" placeholder="Session or helper name"></label>
+      <section id="content" aria-label="Fleet information"></section>
+      <section id="session-actions" hidden aria-label="Session levers">
+        <h2>Steer this session</h2>
+        <p class="muted">Every action is checked first. You’ll see what it will do before confirming.</p>
+        <form id="message-form">
+          <label>Message<textarea id="message" rows="4" required placeholder="What should this session do next?"></textarea></label>
+          <button type="submit" data-lever="atc_message">Message</button>
+        </form>
+        <div class="actions">
+          <button type="button" data-lever="atc_interrupt">Interrupt</button>
+          <button type="button" data-lever="atc_close" data-how="save">Save &amp; close</button>
+          <button type="button" data-lever="atc_close" data-how="exit">Exit</button>
+          <button type="button" data-lever="atc_fork">Fork</button>
+          <button type="button" data-lever="atc_jump">Jump</button>
+        </div>
+        <form id="rename-form" class="rename-form">
+          <label>New name<input id="new-name" required maxlength="100" autocomplete="off"></label>
+          <button type="submit" data-lever="atc_rename">Rename</button>
+        </form>
+        <p class="muted">Jump focuses the terminal on the session’s machine.</p>
+      </section>
+      <section id="account" hidden aria-label="Passkey management">
+        <div id="passkeys"></div>
+        <h2>Add a passkey</h2>
+        <form id="enroll-more">
+          <label>Passkey name<input name="name" required maxlength="80" placeholder="Laptop" autocomplete="off"></label>
+          <button type="submit">Add a passkey</button>
+        </form>
+        <button id="signout" type="button">Sign out</button>
+      </section>
+    </div>
+    <p id="result" role="status" aria-live="polite"></p>
+  </main>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title">Confirm action</h2>
+      <p id="confirm-summary"></p>
+      <div class="actions"><button value="cancel" autofocus>Cancel</button><button value="confirm" class="primary">Confirm</button></div>
+    </form>
+  </dialog>
+</body>
+</html>
