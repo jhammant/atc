@@ -328,9 +328,9 @@ class Levers(unittest.TestCase):
         self.assertNotIn("declined text", FX.pane("beta-22"))
 
     def test_no_way_to_ask(self):
-        refused = self.c.call("atc_interrupt", {"session": "alpha-11"}, caps={})
-        self.assertTrue(refused["isError"])
-        self.assertIn("can't ask", text(refused))
+        pending = self.c.call("atc_interrupt", {"session": "alpha-11"}, caps={})
+        self.assertFalse(pending["isError"])
+        self.assertIn("Waiting for approval", text(pending))
 
     def test_audit_log(self):
         self.c.call("atc_message", {"session": "gamma-33", "text": "audited"})
@@ -379,11 +379,13 @@ class Policy(unittest.TestCase):
         finally:
             c.close()
 
-    def test_unattended_session_cannot_confirm(self):
+    def test_unattended_session_requests_owner_approval(self):
         c = Client(CLAUDE_CODE_SESSION_ATTENDED="0")
         try:
-            refused = c.call("atc_message", {"session": "beta-22", "text": "nobody watching"})
-            self.assertIn("nobody is attending", text(refused))
+            pending = c.call("atc_message", {"session": "beta-22", "text": "nobody watching"})
+            self.assertFalse(pending["isError"])
+            self.assertIn("Waiting for approval", text(pending))
+            self.assertNotIn("nobody watching", FX.pane("beta-22"))
             self.assertFalse(c.call("atc_jump", {"session": "beta-22", "dry_run": True})["isError"])
         finally:
             c.close()

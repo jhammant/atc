@@ -180,7 +180,8 @@ written `name@host`.
 - **Never into a session blocked on a prompt.** Its default answer is "Yes"; the message is refused, not typed.
 - **You confirm steering.** `message`, `broadcast`, `interrupt`, `stop_process`, `close`, `fork`, `rename`,
   `restore` and a `new_task` with a `pool` ask you first, in the calling session (an MCP elicitation). A client that
-  can't ask, or a session nobody is watching, gets a refusal. `jump`, `cap` and a `new_task` plan just run.
+  can't ask, or a session nobody is watching, creates a pending owner approval (see below).
+  `jump`, `cap` and a `new_task` plan just run.
   `ATC_MCP_LEVERS=auto` drops the question; `ATC_MCP_LEVERS=off` makes MCP read-only.
 - **Not into itself.** A lever aimed at the session that called it is refused unless the call says
   `allow_self: true`. Over stdio atc knows the caller from Claude Code's environment; over HTTP, from an
@@ -193,6 +194,39 @@ written `name@host`.
 - **Over HTTP the token is always required at `/mcp`**, on this machine too, and levers are listed only with
   `--serve-writes`. A request that arrives through a reverse proxy (`X-Forwarded-For`) counts as off this
   machine for every endpoint.
+
+### Pending approvals
+
+When a steering call cannot ask you in-session (no MCP elicitation, a handshake-era HTTP client, or an
+unattended session), atc creates an approval on the machine handling the call. It waits up to 45 seconds:
+your approval runs the lever once, and denial refuses it. If you have not decided yet, the tool returns a
+non-error **Waiting for approval** result with an ID and expiry. The approval lasts ten minutes from creation.
+After approving, retry the same tool with exactly the same arguments and caller, adding `approval: "<id>"`.
+Every lever documents this argument. A retry with a changed tool, arguments or caller, or a pending, denied,
+expired or already-used approval, is refused. Calls that can ask you in-session keep their existing prompts.
+Dry runs and refusals before a lever is ready do not create approvals.
+
+Grant or deny an approval in any of these places:
+
+- **Web UI, on a phone or laptop:** Needs you shows each approval's summary, caller, machine and expiry.
+  **Approve with passkey** needs a fresh passkey assertion with user verification; signing in alone is
+  insufficient. **Deny** needs your signed-in session.
+- **atc screen on the owning machine:** approvals appear first. Select one and press `y y` to approve or
+  `n n` to deny, using the usual two-press confirmation.
+- **A terminal on the owning machine:** `atc approvals` lists pending and approved grants;
+  `atc approve <id>` and `atc deny <id>` decide pending ones. Both decisions require stdin to be a TTY.
+
+The file `~/.config/atc/approvals.json` has mode `0600`. File locks and an atomic claim before executing make
+approvals single-use across processes and concurrent requests. A failed or interrupted lever attempt still
+spends its grant; check the target before requesting another. Finished and expired entries are removed ten
+minutes after their original expiry; the audit log retains creation, decisions and use. The digest binds the
+exact original arguments without storing a second copy of them; the stored summary may contain message text.
+A missing caller is bound as missing, so clients should consistently send their session ID.
+
+Optional notifications: set `ATC_NOTIFY_CMD` to a command. atc splits it with `shlex` (no shell) and appends one
+argument: `atc: approval waiting: <tool> on <target> (<id>)`. It contains no message body. Command output is
+discarded, failures are ignored and execution times out after five seconds. Approvals are urgent items of
+kind `approval` in the shared needs queue, `counts.needs_urgent`, `/api/fleet` and `--json` for Roost.
 
 **A laptop that sleeps.** Run a second atc on an always-on server and point it at the laptop's:
 
@@ -238,8 +272,8 @@ must verify you. Once signed in, the **Passkeys** view adds further passkeys wit
 and signs out. Removing the last passkey requires explicit confirmation; recovery uses a new hub code.
 Removing a passkey revokes its web sessions. Restarting atc signs every browser out.
 
-**Needs you** comes first: the shared queue of prompts, a-mail owner items, waiting sessions and inbox counts,
-including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
+**Needs you** comes first: the shared queue of pending approvals, prompts, a-mail owner items, waiting sessions
+and inbox counts, including last-seen items from machines that aren't answering. Its badge uses `counts.needs`.
 Unavailable machines keep one connection notice with their specific error and last-seen time, even when
 their cached items are in the queue. Each queue item names its machine.
 **Fleet** groups sessions, helpers, workflow phases, workers, route
@@ -284,6 +318,15 @@ host's levers to `/api/peer/tools/<tool>` using the peer secret, after confirmat
 still use SSH. Peer calls run the same tools and refusals, with transport `peer`, and are audited on both
 sides. A lost response is not retried automatically because the action may already have run. HTTP hosts
 poll every five seconds while reachable and every thirty seconds while offline.
+
+Approval assertions use a fresh random challenge bound to the approval ID, argument digest, owning machine
+and browser session. A login assertion cannot approve an action, and an action assertion cannot approve
+another action. Neither MCP nor the bearer token can grant or deny approvals; there is no approval MCP tool.
+For approvals owned by another HTTP atc, the hub relays the verified decision to
+`POST /api/peer/approvals/<id>` with the separate peer secret. The body is
+`{"decision":"approve","by":{"name":"Phone","hub":"server1"}}` (or `"deny"`). The owning atc makes the
+locked transition and audits `via: "web passkey via server1"` for approval, or `web session via server1` for
+denial. The owning machine must be reachable; cached approvals cannot be granted while it sleeps.
 
 Bearer tokens are for machines, passkeys are for people, and the peer secret is between atc instances.
 The web UI needs HTTPS: WebAuthn requires a secure context and the session cookie is Secure. The backend
