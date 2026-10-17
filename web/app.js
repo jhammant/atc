@@ -177,8 +177,9 @@ function needsView() {
   }
   if (!(model.needs || []).length) fragment.append(node("p", "Nobody needs you. The queue is empty."));
   for (const machine of model.hosts || []) {
-    if (!machine.ok && !(model.needs || []).some((item) => item.host === machine.host)) {
-      fragment.append(node("p", `${machine.host} isn't answering. Last seen: ${age(machine.age)}.`, "notice"));
+    if (!machine.ok) {
+      const error = String(machine.error || "Not answering").trim().replace(/[.!]+$/, "");
+      fragment.append(node("p", `${machine.host}: ${error}. Last seen: ${age(machine.age)}.`, "notice"));
     }
   }
   return fragment;
