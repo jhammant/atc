@@ -23,7 +23,8 @@ class ApprovalCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="atc-approvals-")
         self.addCleanup(self.tmp.cleanup)
         env = mock.patch.dict(os.environ, {"HOME": self.tmp.name, "ATC_PEER_TOKEN": "",
-                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": "", "ATC_APPROVAL_WAIT": "0"})
+                                          "ATC_MCP_LEVERS": "confirm", "ATC_NOTIFY_CMD": "", "ATC_APPROVAL_WAIT": "0",
+                                          "ATC_LOOM": "", "ATC_LOOM_HOSTS": ""})
         env.start()
         self.addCleanup(env.stop)
         self.m = load_atc({})
@@ -366,7 +367,7 @@ except m['WebError']:
         for name in ("atc_approve", "atc_deny", "approve", "deny"):
             with self.assertRaises(self.m.BadParams):
                 self.call(name=name)
-        self.assertEqual(len(self.m.TOOLS), 18)
+        self.assertEqual(len(self.m.TOOLS), 20)
 
     def test_cli_listing_tty_rule_and_real_subprocess_refusal(self):
         row = self.pending()

@@ -137,7 +137,7 @@ class Stdio(unittest.TestCase):
             self.assertGreaterEqual(result["ttlMs"], 0)
             self.assertIn(result["cacheScope"], ("public", "private"))
         tools = {t["name"]: t for t in listed["tools"]}
-        self.assertEqual(len(tools), 18)
+        self.assertEqual(len(tools), 20)
         for name, t in tools.items():
             self.assertEqual(t["inputSchema"]["type"], "object", name)
             lever = "dry_run" in t["inputSchema"]["properties"]
@@ -156,7 +156,7 @@ class Stdio(unittest.TestCase):
             c.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
             tools = c.request("tools/list", modern=False)["result"]
             self.assertNotIn("resultType", tools)
-            self.assertEqual(len(tools["tools"]), 18)
+            self.assertEqual(len(tools["tools"]), 20)
             c.send({"jsonrpc": "2.0", "id": 99, "method": "initialize", "params": {"protocolVersion": "2024-01-01"}})
             self.assertEqual(c.recv()["result"]["protocolVersion"], "2025-11-25")
         finally:
@@ -405,7 +405,7 @@ class Policy(unittest.TestCase):
         off = Client(ATC_MCP_LEVERS="off")
         try:
             names = [t["name"] for t in off.request("tools/list")["result"]["tools"]]
-            self.assertEqual(len(names), 7)
+            self.assertEqual(len(names), 8)
             self.assertNotIn("atc_message", names)
             self.assertIn("levers are off", text(off.call("atc_message", {"session": "beta-22", "text": "x"})))
         finally:
@@ -516,7 +516,7 @@ class Http(unittest.TestCase):
 
     def test_read_tools(self):
         status, reply = self.post(self.rpc("tools/list"))
-        self.assertEqual((status, len(reply["result"]["tools"])), (200, 18))
+        self.assertEqual((status, len(reply["result"]["tools"])), (200, 20))
         status, reply = self.post(self.rpc("tools/call", {"name": "atc_needs_me", "arguments": {}}))
         self.assertEqual(status, 200)
         self.assertIn("gamma-33", text(reply["result"]))
@@ -546,7 +546,7 @@ class Http(unittest.TestCase):
         status, init = self.post(self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}}, False))
         self.assertEqual((status, init["result"]["protocolVersion"]), (200, "2025-06-18"))
         status, tools = self.post(self.rpc("tools/list", modern=False), headers={"MCP-Protocol-Version": "2025-06-18"})
-        self.assertEqual((status, len(tools["result"]["tools"])), (200, 18))
+        self.assertEqual((status, len(tools["result"]["tools"])), (200, 20))
         status, lever = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {
             "session": "beta-22", "text": "legacy http"}}, False))
         self.assertEqual(status, 200)
@@ -558,7 +558,7 @@ class Http(unittest.TestCase):
 
     def test_levers_need_serve_writes(self):
         names = [t["name"] for t in self.post(self.rpc("tools/list"), url=self.read_url)[1]["result"]["tools"]]
-        self.assertEqual(len(names), 7)
+        self.assertEqual(len(names), 8)
         reply = self.post(self.rpc("tools/call", {"name": "atc_message", "arguments": {"session": "beta-22",
                                                                                         "text": "x"}}), url=self.read_url)
         self.assertIn("levers are off", text(reply[1]["result"]))
