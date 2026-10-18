@@ -343,6 +343,8 @@ print("stalled daemon poll started", flush=True)
                 press("Down")
             self.fail("could not select " + needle + ":\n" + screen())
 
+        wait_for("4 Jobs")
+        press("4")
         wait_for("2 idle jobs (1 expired)")
         select("crashed")
         press("Enter")

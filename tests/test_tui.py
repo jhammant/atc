@@ -4,24 +4,33 @@ exactly as drawn. Steering is checked in the dummy sessions' own terminals.
 Run from the repo root:  python3 -m unittest discover -s tests -v
 """
 import os
+import json
+from pathlib import Path
 import shlex
 import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fixture  # noqa: E402
+from test_units import load_atc  # noqa: E402
 
 FX = None
 TMUX = fixture.TMUX
+LIVE_SKIP = ""
 
 
 def setUpModule():
-    global FX
+    global FX, LIVE_SKIP
     if not TMUX:
-        raise unittest.SkipTest("tmux is needed for the screen tests")
-    FX = fixture.Fixture().start()
+        LIVE_SKIP = "tmux is needed for the screen tests"
+        return
+    try:
+        FX = fixture.Fixture().start()
+    except unittest.SkipTest as exc:
+        LIVE_SKIP = str(exc)
 
 
 def tearDownModule():
@@ -32,16 +41,18 @@ def tearDownModule():
 class Screen:
     """atc running in a tmux window of its own, with keys in and the screen out."""
 
-    def __init__(self, width, height, *args, hosts=False, extra_env=None, ready="Blocked on you"):
+    def __init__(self, width, height, *args, hosts=False, extra_env=None, ready="Blocked on you", fx=None):
+        fx = fx or FX
         self.name = f"atc-ui-{os.getpid()}-{width}x{height}"
-        self.err = os.path.join(FX.root, f"{self.name}.err")
-        self.code = os.path.join(FX.root, f"{self.name}.code")
-        self.debug = os.path.join(FX.root, f"{self.name}.debug")
-        env = FX.env(ATC_DEBUG_LOG=self.debug, **(extra_env or {}))
+        self.err = os.path.join(fx.root, f"{self.name}.err")
+        self.code = os.path.join(fx.root, f"{self.name}.code")
+        self.debug = os.path.join(fx.root, f"{self.name}.debug")
+        env = fx.env()
+        env.update(ATC_DEBUG_LOG=self.debug, **(extra_env or {}))
         exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()
-                           if k.startswith(("ATC_", "CLAUDE_", "ROUTE_", "TERM")))
+                           if k.startswith(("ATC_", "CLAUDE_", "ROUTE_", "TERM")) or k == "PATH")
         hosts_arg = "" if hosts else "--no-hosts"
-        command = (f"cd {shlex.quote(FX.work)} && env {exports} HOME={shlex.quote(env['HOME'])} "
+        command = (f"cd {shlex.quote(fx.work)} && env {exports} HOME={shlex.quote(env['HOME'])} "
                    f"{shlex.quote(sys.executable)} {shlex.quote(fixture.ATC)} {hosts_arg} {' '.join(args)} "
                    f"2> {shlex.quote(self.err)}; echo $? > {shlex.quote(self.code)}; sleep 30")
         subprocess.run([TMUX, "new-session", "-d", "-s", self.name, "-x", str(width), "-y", str(height), command],
@@ -136,6 +147,8 @@ class Wide(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if LIVE_SKIP:
+            raise unittest.SkipTest(LIVE_SKIP)
         cls.s = Screen(160, 45)
 
     @classmethod
@@ -182,14 +195,14 @@ class Wide(unittest.TestCase):
         self.assertIn("beta-22", s.selected_line())
         self.assertEqual(next(i for i, line in enumerate(s.lines()) if line.startswith("▶")), row)
 
-    def test_03_tab_switches_the_left_panel(self):
+    def test_03_b_switches_the_left_panel(self):
         s = self.s
         s.select("beta-22")
         s.wait_for("── Activity, all sessions")
-        s.press("Tab")
+        s.press("b")
         s.wait_for("── Selected: beta-22")
         self.assertIn("said   Done. Want me to ship it?", s.text())
-        s.press("Tab")
+        s.press("b")
         s.wait_for("── Activity, all sessions")  # two panels here: comms is already on the right
 
     def test_04_comms_view(self):
@@ -346,9 +359,9 @@ class Wide(unittest.TestCase):
             self.assertIn(" atc ", text)
             for line in text.splitlines():
                 self.assertLessEqual(len(line), width)
-            clock = s.lines()[0].split()[1]
+            clock = s.lines()[1].split()[1]
             time.sleep(2.2)  # still alive: the clock in the header keeps moving after a resize
-            self.assertNotEqual(s.lines()[0].split()[1], clock, f"frozen after resizing to {width}x{height}")
+            self.assertNotEqual(s.lines()[1].split()[1], clock, f"frozen after resizing to {width}x{height}")
         s.select("gamma-33")
         s.step("Down")
         self.assertIn("beta-22", s.selected_line())
@@ -470,6 +483,8 @@ class Server(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if LIVE_SKIP:
+            raise unittest.SkipTest(LIVE_SKIP)
         cls.log = os.path.join(FX.root, "ssh.log")
         cls.ssh = os.path.join(FX.stub, "fake-ssh")
         with open(cls.ssh, "w") as fh:
@@ -481,7 +496,9 @@ if [ "$1" = kill ]; then exit 0; fi
 "$@" | {sys.executable} -c 'import json,sys; d=json.load(sys.stdin); d["machine"]="fakebox"; d["agents"]=[{{"pid": 4242, "tool": "codex", "etime": "5-00:00:00", "age": 432000, "stale": True, "parent": "openclaw", "tty": "", "command": "node codex exec stuck"}}]; print(json.dumps(d))'
 """)
         os.chmod(cls.ssh, 0o755)
-        cls.s = Screen(160, 50, "--host", "fakebox", hosts=True, extra_env={"ATC_SSH": cls.ssh}, ready="── fakebox")
+        cls.s = Screen(160, 50, "--host", "fakebox", hosts=True, extra_env={"ATC_SSH": cls.ssh}, ready="5 Servers")
+        cls.s.press("5")
+        cls.s.wait_for("── fakebox")
 
     @classmethod
     def tearDownClass(cls):
@@ -513,10 +530,12 @@ if [ "$1" = kill ]; then exit 0; fi
 
 
 class Narrow(unittest.TestCase):
-    """100 columns: one bottom panel, cycled with tab."""
+    """100 columns: one bottom panel, cycled with b."""
 
     @classmethod
     def setUpClass(cls):
+        if LIVE_SKIP:
+            raise unittest.SkipTest(LIVE_SKIP)
         cls.s = Screen(100, 30)
 
     @classmethod
@@ -524,14 +543,14 @@ class Narrow(unittest.TestCase):
         code, err = cls.s.quit()
         assert code == "0" and not err.strip(), (code, err)
 
-    def test_tab_cycles_three_panels(self):
+    def test_b_cycles_three_panels(self):
         s = self.s
         s.wait_for("── Activity, all sessions")
-        s.press("Tab")
+        s.press("b")
         s.wait_for("── Selected: ")
-        s.press("Tab")
+        s.press("b")
         s.wait_for("── Comms (c opens the full view)")
-        s.press("Tab")
+        s.press("b")
         s.wait_for("── Activity, all sessions")
 
     def test_page_keys_scroll_activity(self):
@@ -542,12 +561,453 @@ class Narrow(unittest.TestCase):
 
 class Tiny(unittest.TestCase):
     def test_a_tiny_window_still_runs_and_quits(self):
+        if LIVE_SKIP:
+            self.skipTest(LIVE_SKIP)
         s = Screen(60, 14)
         s.press("Down", "Tab", "c", "Escape", "h", "Escape", "?", "Escape")
         self.assertIn(" atc ", s.text())
         code, err = s.quit()
         self.assertEqual(code, "0")
         self.assertEqual(err.strip(), "")
+
+
+def tabs_fixture():
+    fx = fixture.AmailFixture()
+    fx.write_closed_transcript()
+    swarm = fixture.SwarmFixture()
+    try:
+        status = swarm.status("release", "release-swarm", state="done")
+        status["repo"] = fx.work
+        path = Path(fx.root, "route", "swarms", "release", "status.json")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(status))
+    finally:
+        swarm.stop()
+    for name, body in (("quotamax", fixture.STUB_QUOTAMAX), ("route", fixture.STUB_ROUTE)):
+        path = Path(fx.stub, name)
+        path.write_text(body)
+        path.chmod(0o755)
+    with open(os.path.join(fx.stub, "processes.txt"), "a") as fh:
+        fh.write("900 1 ? 02:00 codex exec fixture-worker\n")
+    server = {"machine": "server1", "counts": {"working": 1}, "groups": {"working": [
+        {"sid": "remote-session", "name": "server-session", "group": "working", "state": "busy",
+         "doing": "Building on server", "cwd": "/tmp/project"}]}, "agents": []}
+    Path(fx.stub, "server.json").write_text(json.dumps(server))
+    ssh = Path(fx.stub, "ssh")
+    ssh.write_text("#!/usr/bin/env python3\nimport os, sys\nsys.stdin.buffer.read()\n"
+                   "print(open(os.path.join(os.path.dirname(__file__), 'server.json')).read())\n")
+    ssh.chmod(0o755)
+    return fx
+
+
+def tabs_env(fx):
+    env = fx.env(ATC_AMAIL=os.path.join(fx.stub, "amail"), ATC_LOOM=os.path.join(fx.stub, "loom"),
+                 ATC_LOOM_HOSTS="server1", ATC_SSH=os.path.join(fx.stub, "ssh"))
+    env.update(ATC_QUOTAMAX=os.path.join(fx.stub, "quotamax"), ATC_ROUTE=os.path.join(fx.stub, "route"))
+    return env
+
+
+class TabLogic(unittest.TestCase):
+    """The same fixture and rendering without a tty, including races and missing data."""
+
+    def setUp(self):
+        self.fx = tabs_fixture()
+        self.addCleanup(self.fx.stop)
+        self.env = tabs_env(self.fx)
+        patch = mock.patch.dict(os.environ, self.env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.m = load_atc(self.env)
+        m = self.m
+        feed = m.Feed([self.env["ATC_CLAUDE"]], background=False)
+        feed.fetch()
+        mail, loom = m.AMail(background=False), m.Loom(background=False)
+        mail.fetch()
+        loom.fetch()
+        self.fleet = m.Fleet(feed=feed, amail=mail, loom=loom, closed=m.ClosedSessions(background=False))
+        self.fleet.refresh(time.time())
+        self.quota = m.Quota([self.env["ATC_QUOTAMAX"]], background=False)
+        self.quota.fetch()
+        remote = m.Remote("server1", background=False)
+        remote.data = json.loads(Path(self.fx.stub, "server.json").read_text())
+        remote.ok_at, remote.latency = time.time(), 0
+        self.model = self.fleet.model(time.time(), self.quota, [remote])
+        self.app = m.App(self.fleet, self.quota, m.Terminals(True), [self.env["ATC_ROUTE"]],
+                         [self.env["ATC_CLAUDE"]], True)
+        self.app.switch_tab("sessions", self.model)
+
+    def text(self, frame):
+        return "\n".join(self.m.plain(line) for line in frame)
+
+    def palette(self, query):
+        self.app.handle(":", self.model)
+        for char in query:
+            self.app.handle(char, self.model)
+        return self.app.palette_actions(self.model)
+
+    def test_tab_visibility_numbers_and_selection_survive_refresh(self):
+        app, model, m = self.app, self.model, self.m
+        beta = self.fx.sid("beta-22")
+        app.ui["selected"] = beta
+        app.handle("2", model)
+        self.assertEqual(app.ui["tab"], "needs")
+        app.handle(m.curses.KEY_RIGHT, model)
+        self.assertEqual((app.ui["tab"], app.ui["view"]), ("agents", "tree"))
+        app.handle("c", model)
+        self.assertEqual(app.ui["view"], "comms")
+        app.handle("4", model)
+        app.handle(m.curses.KEY_LEFT, model)
+        self.assertEqual(app.ui["view"], "comms")
+        app.handle("1", model)
+        self.assertEqual(app.ui["selected"], beta)
+        empty = dict(model, needs=[], jobs={}, hosts=[], quota=None, groups={k: [] for k in model["groups"]},
+                     agents=[], swarms=[], comms=[], closed=[])
+        self.assertEqual([n for n, _, _ in m.visible_tabs(empty, {})], ["1"])
+        self.assertEqual([n for n, _, _ in m.visible_tabs(empty, app.ui)], list("123456"))
+        app.handle("2", empty)
+        self.assertIn("Nothing needs you", self.text([line for line, _ in m.tab_rows(empty, app.ui, 100)]))
+
+    def test_tabs_render_cached_data_and_do_not_mutate_once_output(self):
+        m, model, app = self.m, self.model, self.app
+        once = self.text(m.render(self.fleet, model, app.ui, 180)[0])
+        before = self.fx.calls()
+        expected = {"sessions": "Closed (resumable)", "needs": "a-mail 2 approvals", "jobs": "app dashboard",
+                    "servers": "Building on server", "quota": "quotamax advice"}
+        with mock.patch.object(m, "run", side_effect=AssertionError("render must not run commands")):
+            for tab, needle in expected.items():
+                app.switch_tab(tab, model)
+                frame = self.text(m.render(self.fleet, model, app.ui, 180, 90)[0])
+                self.assertIn(needle, frame)
+                if tab == "sessions":
+                    self.assertNotIn("Jobs & apps", frame)
+                    self.assertNotIn("Building on server", frame)
+                elif tab == "quota":
+                    for text in ("Codex (test)", "weekly 19%", "DeepSeek", "balance $9.50", "parallelism: 4", "auto"):
+                        self.assertIn(text, frame)
+            self.assertEqual(self.text(m.render(self.fleet, model, app.ui, 180)[0]), once)
+        self.assertEqual(self.fx.calls(), before)
+        self.assertNotIn("1 Sessions", once)
+        self.assertIn("Jobs & apps", once)
+        self.assertIn("Building on server", once)
+
+    def test_footer_capabilities_per_row_and_views(self):
+        m, app, model = self.m, self.app, self.model
+        helper = next(key for _, key in m.tab_rows(model, app.ui, 180) if key and "::" in key and not key.startswith("@"))
+        cases = [(self.fx.sid("beta-22"), "m msg", "R R restore"),
+                 (self.fx.sid("gamma-33"), "enter jump", "m msg"),
+                 (helper, "enter detail", "x x stop"), ("@local::p::900", "x x stop", "m msg"),
+                 ("closed::" + self.fx.closed_sid, "R R restore", "E exit"),
+                 ("@server1::s::remote-session", "enter ssh", "m msg"),
+                 (m.job_key("local", "crashed"), "x x run now", "x x stop")]
+        need = next(n for n in model["needs"] if n["kind"] == "amail_request")
+        cases.append((m.need_key(need), "enter detail", "y y approve"))
+        cases.append(("swarm::release", "enter detail", "x x stop"))
+        for key, present, absent in cases:
+            with self.subTest(key=key):
+                app.ui["selected"] = key
+                footer = m.plain(app.footer(time.time(), model))
+                self.assertIn(present, footer)
+                self.assertNotIn(absent, footer)
+                self.assertIn(": actions", footer)
+        app.ui.update(view="tree", tab="agents")
+        footer = m.plain(app.footer(time.time(), model))
+        self.assertIn("s all/selected", footer)
+        self.assertNotIn("m msg", footer)
+
+    def test_palette_filters_selects_and_reuses_confirmation(self):
+        app, m = self.app, self.m
+        actions = self.palette("raise swarm cap")
+        self.assertEqual(len(actions), 1)
+        app.handle("\n", self.model)
+        self.assertIn("dry run:", app.flash[0])
+        self.assertNotIn("override abundant", self.fx.calls())
+        actions = self.palette("jump beta-22")
+        self.assertEqual(len(actions), 1)
+        with mock.patch.object(m, "jump_to", return_value="dry run: focus") as jump:
+            app.handle("\n", self.model)
+            self.assertEqual(jump.call_args.args[-1], True)
+        self.assertEqual(app.ui["selected"], self.fx.sid("beta-22"))
+        self.assertIn("dry run", app.flash[0])
+        self.palette("save and close session")
+        with mock.patch.object(m, "deliver", return_value=(True, "dry run")) as deliver:
+            app.handle("\n", self.model)
+            deliver.assert_not_called()
+            self.assertIn("press S again", app.flash[0])
+            app.handle("S", self.model)
+            self.assertEqual(deliver.call_args.args[-2:], ("/closecode", True))
+        self.palette("no-action-matches-this")
+        app.handle("\n", self.model)
+        self.assertEqual(app.mode, "palette")
+        app.handle("\x1b", self.model)
+        self.assertEqual(app.mode, "normal")
+
+    def test_run_command_preview_cancel_dry_run_and_state_change(self):
+        app, model, m = self.app, self.model, self.m
+        app.ui["selected"] = self.fx.sid("beta-22")
+        self.palette("run /status")
+        app.handle("\n", model)
+        self.assertEqual(app.mode, "command_confirm")
+        self.assertIn("Type /status into beta-22?", m.plain(app.footer(time.time(), model)))
+        with mock.patch.object(m, "deliver", return_value=(True, "dry run")) as deliver:
+            app.handle("\x1b", model)
+            deliver.assert_not_called()
+            self.palette("run /status")
+            app.handle("\n", model)
+            app.handle("\n", model)
+            self.assertEqual(deliver.call_args.args[-2:], ("/status", True))
+            self.palette("run /status")
+            app.handle("\n", model)
+            v = app.selected_view(model)
+            v["group"] = "blocked"
+            app.handle("\n", model)
+            self.assertEqual(deliver.call_count, 1)
+            self.assertIn("no longer idle", app.flash[0])
+
+    def test_palette_approval_and_remote_needs_cannot_decide_locally(self):
+        app, m = self.app, self.m
+        row = self.fleet.approvals.create("atc_message", {}, "Message beta-22", "caller", "fixture")
+        self.model = self.fleet.model(time.time(), self.quota)
+        self.palette("approve " + row["id"])
+        app.handle("\n", self.model)
+        self.assertEqual(app.ui["tab"], "needs")
+        self.assertIn("press y again", app.flash[0])
+        app.handle("y", self.model)
+        self.assertIn("dry run: approve", app.flash[0])
+        self.assertEqual(self.fleet.approvals.get(row["id"])["state"], "pending")
+        remote = dict(next(n for n in self.model["needs"] if n["kind"] == "approval"), host="server1")
+        self.model["needs"] = [remote]
+        app.ui["selected"] = m.need_key(remote)
+        app.flash = ("", 0)
+        self.assertNotIn("y y approve", m.plain(app.footer(time.time(), self.model)))
+        self.assertEqual(m.resolve(self.fleet, self.model, app.ui["selected"])[0], "need")
+
+    def test_command_exit_keeps_unsaved_guard_and_palette_works_from_views(self):
+        app, model, m = self.app, self.model, self.m
+        app.ui["selected"] = self.fx.sid("beta-22")
+        app.selected_view(model)["repo"] = {"dirty": 1, "unpushed": 0}
+        self.palette("run /exit")
+        app.handle("\n", model)
+        with mock.patch.object(m, "deliver") as deliver:
+            app.handle("\n", model)
+            deliver.assert_not_called()
+        self.assertIn("unsaved work", app.flash[0])
+        app.handle("h", model)
+        self.palette("message selected session")
+        app.handle("\n", model)
+        self.assertEqual(app.mode, "message")
+        self.assertEqual(app.targets[0]["sid"], self.fx.sid("beta-22"))
+        self.assertIsNone(app.ui["view"])
+
+    def test_slow_route_can_be_cancelled_without_blocking_keys(self):
+        import threading
+        app, model, m = self.app, self.model, self.m
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        app.in_tui = True
+
+        def plan(*args):
+            entered.set()
+            gate.wait(3)
+            return {"chosen": "codex"}, None
+
+        with mock.patch.object(m, "route_plan", side_effect=plan):
+            app.handle("n", model)
+            app.buffer = "test the queue"
+            started = time.monotonic()
+            app.handle("\n", model)
+            self.assertLess(time.monotonic() - started, 0.3)
+            self.assertTrue(entered.wait(1))
+            app.handle("\x1b", model)
+            app.handle("2", model)
+            self.assertEqual(app.ui["tab"], "needs")
+            gate.set()
+        self.assertEqual(app.mode, "normal")
+
+
+@unittest.skipUnless(TMUX, "tmux is needed for the screen tests")
+class Tabs(unittest.TestCase):
+    """Real curses screens with fixed process data, also runnable when ps is denied."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fx = tabs_fixture()
+        cls.target = f"atc-tabs-target-{os.getpid()}"
+        subprocess.run([TMUX, "new-session", "-d", "-s", cls.target, "sleep 3600"], check=True)
+        tty = subprocess.run([TMUX, "display-message", "-p", "-t", cls.target, "#{pane_tty}"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        processes = Path(cls.fx.stub, "processes.txt")
+        processes.write_text(processes.read_text().replace(" ? ", " " + tty.removeprefix("/dev/") + " "))
+        cls.env = tabs_env(cls.fx)
+        with mock.patch.dict(os.environ, cls.env, clear=True):
+            cls.m = load_atc(cls.env)
+            cls.approvals = cls.m.Approvals()
+            cls.approval = cls.approvals.create("atc_message", {}, "Message beta-22", "caller", "fixture")
+        try:
+            cls.s = Screen(160, 45, "--dry-run", "--host", "server1", hosts=True, fx=cls.fx,
+                           extra_env=cls.env, ready="6 Quota")
+        except Exception:
+            subprocess.run([TMUX, "kill-session", "-t", cls.target], capture_output=True)
+            cls.fx.stop()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            code, err = cls.s.quit()
+            assert (code, err.strip()) == ("0", ""), (code, err)
+        finally:
+            subprocess.run([TMUX, "kill-session", "-t", cls.target], capture_output=True)
+            cls.fx.stop()
+
+    def setUp(self):
+        self.s.press("Escape", "1")
+
+    def test_01_tab_numbers_arrows_content_and_selection(self):
+        s = self.s
+        self.assertEqual(s.lines()[0].strip(), "1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota")
+        s.select("beta-22")
+        s.press("2")
+        s.wait_for("── Needs you")
+        self.assertIn("a-mail 2 approvals", s.text())
+        self.assertNotIn("── Working", s.text())
+        s.press("Right")
+        s.wait_for("Hierarchy: all sessions")
+        self.assertIn("workflow release-train", s.text())
+        s.press("c")
+        s.wait_for("Comms: all sessions")
+        s.press("4")
+        s.wait_for("── Jobs & apps")
+        self.assertIn("app dashboard", s.text())
+        self.assertNotIn("── Working", s.text())
+        s.press("Right")
+        s.wait_for("Building on server")
+        s.press("6")
+        s.wait_for("── quotamax advice")
+        for needle in ("Codex (test)", "DeepSeek", "parallelism: 4", "Swarm cap", "auto"):
+            self.assertIn(needle, s.text())
+        s.press("Right")
+        s.wait_for("── Blocked on you")
+        self.assertIn("beta-22", s.selected_line())
+        s.press("Left")
+        s.wait_for("── quotamax advice")
+
+    def test_02_palette_filter_arrows_escape_and_dry_run(self):
+        s = self.s
+        s.press(":")
+        s.wait_for("Command palette")
+        s.type("swarm cap")
+        s.wait_for("raise swarm cap")
+        self.assertNotIn("message selected session", s.text())
+        s.press("Down")
+        self.assertIn("lower swarm cap", s.selected_line())
+        s.press("Up", "Enter")
+        s.wait_for("dry run:")
+        self.assertNotIn("quotamax override abundant", self.fx.calls())
+        s.press(":")
+        s.type("jump beta-22")
+        s.press("Enter")
+        s.wait_for("dry run: would focus")
+        self.assertIn("beta-22", s.selected_line())
+        s.press(":")
+        s.type("no-such-action")
+        s.wait_for("No matching actions")
+        s.press("Enter", "Escape")
+        s.wait_for("Command palette", absent=True)
+
+    def test_03_palette_command_confirmation(self):
+        s = self.s
+        s.select("beta-22")
+        s.press(":")
+        s.type("run /status")
+        s.press("Enter")
+        s.wait_for("Type /status into beta-22?")
+        s.press("Enter")
+        s.wait_for("dry run: message to beta-22")
+
+    def test_04_contextual_footer(self):
+        s = self.s
+        cases = [("beta-22", "m msg", "R R restore"), ("Write the tests", "enter detail", "m msg"),
+                 ("release-swarm", "enter detail", "x x stop"),
+                 ("pid 900", "x x stop", "m msg"), ("api-client", "R R restore", "m msg")]
+        for target, present, absent in cases:
+            s.select(target)
+            self.assertIn(present, s.footer())
+            self.assertNotIn(absent, s.footer())
+        s.press("5")
+        s.wait_for("enter ssh")
+        self.assertNotIn("m msg", s.footer())
+        s.press("4")
+        s.wait_for("x x run now")
+        s.press("2")
+        s.select("a-mail 3 requests")
+        self.assertIn("enter detail", s.footer())
+        self.assertNotIn("y y approve", s.footer())
+
+    def test_05_approval_palette_uses_existing_keys(self):
+        s = self.s
+        s.press(":")
+        s.type("approve " + self.approval["id"])
+        s.press("Enter")
+        s.wait_for("press y again")
+        s.press("y")
+        s.wait_for("dry run: approve " + self.approval["id"])
+        self.assertEqual(self.approvals.get(self.approval["id"])["state"], "pending")
+
+    def test_06_b_panel_and_legacy_tab_alias(self):
+        s = self.s
+        s.select("beta-22")
+        s.wait_for("── Activity, all sessions")
+        s.press("b")
+        s.wait_for("── Selected: beta-22")
+        s.press("Tab")
+        s.wait_for("── Activity, all sessions")
+
+    def test_07_small_screen_help_scroll_and_tabs(self):
+        s = self.s
+        try:
+            subprocess.run([TMUX, "resize-window", "-t", s.name, "-x", "60", "-y", "14"], check=True)
+            s.press("b")
+            s.wait_for("── Selected:")
+            s.press("b")
+            s.wait_for("── Comms (c opens")
+            s.press("b")
+            s.wait_for("── Activity, all sessions")
+            s.press("6")
+            s.wait_for("6 Quota")
+            self.assertIn("6 Quota", s.lines()[0])
+            s.press("?")
+            s.wait_for("── Keys")
+            s.press(*(["PageDown"] * 8))
+            s.wait_for("quit (esc closes")
+            s.press("Escape")
+        finally:
+            subprocess.run([TMUX, "resize-window", "-t", s.name, "-x", "160", "-y", "45"], check=True)
+
+    def test_08_slow_action_does_not_freeze_the_screen(self):
+        s = self.s
+        route = Path(self.fx.stub, "route")
+        original = route.read_text()
+        route.write_text(original.replace("import json, os, sys", "import json, os, sys, time\ntime.sleep(2)"))
+        try:
+            s.press("n")
+            s.type("slow plan")
+            s.press("Enter", pause=0.05)
+            s.wait_for("Planning with route")
+            s.press("Escape", "2", pause=0.05)
+            s.wait_for("── Needs you", timeout=1)
+            time.sleep(2.2)
+            self.assertIn("── Needs you", s.text())
+            self.assertNotIn("dispatch in a new tab", s.footer())
+        finally:
+            route.write_text(original)
+
+    def test_99_screen_loop_stays_quick(self):
+        lines = Path(self.s.debug).read_text().splitlines()
+        passes = [float(line.split()[2].rstrip("s")) for line in lines if " loop " in line][1:]
+        refreshes = [float(line.split()[2].rstrip("s")) for line in lines if " refresh " in line][1:]
+        self.assertGreater(len(passes), 50)
+        self.assertLess(max(passes), 0.6, sorted(passes)[-5:])
+        self.assertLess(max(refreshes), 0.3, sorted(refreshes)[-5:])
 
 
 if __name__ == "__main__":
