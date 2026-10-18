@@ -2668,14 +2668,20 @@ def deliver(fleet, terminals, v, text, dry_run=False):
     Returns (delivered, detail). The screen's m/M/C/F, the HTTP sink and MCP all come through here."""
     if v.get("kind") not in ("interactive", "herdr"):
         return False, "only live interactive sessions take messages (a background session: attach to it)"
-    status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
-    if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
-        return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
-    if v.get("herdr") and fleet.herdr:
-        result = (f"dry run: herdr agent prompt {v['herdr']} {shlex.quote(text)}" if dry_run
-                  else fleet.herdr.act(v["herdr"], "type", text))
-    else:
-        result = (Terminals(dry_run=True) if dry_run else terminals).act(v.get("tty"), "type", text)
+    target = "herdr:" + v["herdr"] if v.get("herdr") and fleet.herdr else "tty:" + (v.get("tty") or v["sid"])
+    directory = os.path.join(HOME, ".config", "atc", "delivery-locks")
+    private_dir(directory)
+    # Independent opens of a flock serialize threads and processes. Never unlink a target's lock file.
+    name = hashlib.sha256(target.encode()).hexdigest() + ".lock"
+    with web_file_lock(directory, name):
+        status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
+        if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
+            return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
+        if v.get("herdr") and fleet.herdr:
+            result = (f"dry run: herdr agent prompt {v['herdr']} {shlex.quote(text)}" if dry_run
+                      else fleet.herdr.act(v["herdr"], "type", text))
+        else:
+            result = (Terminals(dry_run=True) if dry_run else terminals).act(v.get("tty"), "type", text)
     return result.startswith(("type: done", "dry run")), result
 
 
@@ -5336,7 +5342,11 @@ def job_key(host, name):
     return "job::" + urllib.parse.quote(host, safe="") + "::" + name
 
 
-def jobs_lines(model, width, expanded=False):
+def app_key(host, name):
+    return "app::" + urllib.parse.quote(host, safe="") + "::" + name
+
+
+def jobs_lines(model, width, expanded=False, select_apps=False):
     entries = model.get("jobs", {})
     if not entries:
         return []
@@ -5363,7 +5373,7 @@ def jobs_lines(model, width, expanded=False):
         for app in entry["apps"]:
             status = clean(app.get("status"))
             out.append(([("  app " + clean(app["name"]) + " · " + status + " · " + clean(app.get("health")),
-                          "busy" if status == "running" else "warn")], None))
+                          "busy" if status == "running" else "warn")], app_key(host, app["name"]) if select_apps else None))
         if not entry["jobs"] and not entry["apps"]:
             out.append(([("  No jobs or apps.", "dim")], None))
     return out
@@ -5574,11 +5584,12 @@ def resolve(fleet, model, key):
     if key.startswith("need::"):
         item = next((n for n in model.get("needs", []) if need_key(n) == key), None)
         return ("need", item) if item else (None,)
-    if key.startswith("job::"):
+    if key.startswith(("job::", "app::")):
+        kind = key[:3]
         host, _, name = key[5:].partition("::")
         host = urllib.parse.unquote(host)
-        job = next((j for j in model.get("jobs", {}).get(host, {}).get("jobs", []) if j["name"] == name), None)
-        return ("job", host, job) if job else (None,)
+        row = next((j for j in model.get("jobs", {}).get(host, {}).get(kind + "s", []) if j["name"] == name), None)
+        return (kind, host, row) if row else (None,)
     if key.startswith("approval::"):
         item = next((n for n in model.get("needs", []) if n["kind"] == "approval"
                      and n.get("id") == key[10:] and n["host"] is None), None)
@@ -5626,7 +5637,7 @@ def selection_name(item):
     kind = item[0]
     if kind == "need":
         return clean(item[1]["title"])
-    if kind == "job":
+    if kind in ("job", "app"):
         return item[2]["name"] + " on " + item[1]
     if kind == "approval":
         return "Approval " + item[1]["id"]
@@ -5648,6 +5659,14 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind == "app":
+        host, app = item[1], item[2]
+        details = ["App: " + app["name"], "Machine: " + host,
+                   "Status: " + clean(app.get("status")), "Health: " + clean(app.get("health"))]
+        if app.get("url"):
+            details.append("URL: " + clean(app["url"]))
+        lines = [[(line, "plain")] for text in details for line in wrap(text, width)]
+        return lines[:limit] if limit else lines
     if kind == "need":
         row = item[1]
         details = [row["title"], row.get("summary") or row.get("detail"), row.get("hint")]
@@ -6151,7 +6170,7 @@ def tab_rows(model, ui, width):
                 rows.append(([("  " + clean(item["hint"]), "dim")], None))
         return rows if model.get("needs") else rows + [([("Nothing needs you.", "dim")], None)]
     if tab == "jobs":
-        return jobs_lines(model, width, ui.get("jobs_all", False)) or [([("No jobs or apps.", "dim")], None)]
+        return jobs_lines(model, width, ui.get("jobs_all", False), select_apps=True) or [([("No jobs or apps.", "dim")], None)]
     if tab == "servers":
         return [row for host in model.get("hosts", []) for row in host_lines(host, width, 18, now=model["now"])]
     if tab == "quota":
@@ -6187,7 +6206,7 @@ HELP = [
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
     "b / tab    bottom panel: all activity, the selected session, comms (tab kept as an alias)",
     "p          hide or show Later, parked, background and other sessions, finished route swarms and idle jobs",
-    "jobs       enter reads status and recent log; x x runs the selected job now",
+    "jobs       enter reads status and recent log; x x runs the selected job now; app rows open read-only details",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
 ]
@@ -6453,7 +6472,7 @@ class App:
                 keys += ["enter detail", "y y approve", "n n deny"]
             elif kind == "remote":
                 keys += ["enter ssh"]
-            elif kind in ("helper", "swarm", "need"):
+            elif kind in ("helper", "swarm", "need", "app"):
                 keys += ["enter detail"]
             if self.ui["tab"] == "quota":
                 keys += ["↑↓ PgUp/PgDn scroll", "+/- pin cap", "0 auto"]
@@ -6581,7 +6600,7 @@ class App:
                 elif self.command == "/exit" and exit_refusal(v[1]):
                     self.say(exit_refusal(v[1]))
                 else:
-                    self.perform(self.submit_message, self.command, [v[1]])
+                    self.queue_message(self.command, [v[1]])
             return True
         if self.mode == "planning":
             if key == "\x1b":
@@ -6590,7 +6609,7 @@ class App:
         if self.mode == "task":
             return self.edit(key, self.submit_task)
         if self.mode == "message":
-            return self.edit(key, lambda text: self.perform(self.submit_message, text, list(self.targets)))
+            return self.edit(key, lambda text: self.queue_message(text, self.targets))
         if self.mode == "rename":
             return self.edit(key, lambda text: self.perform(self.submit_rename, text, self.targets[0]))
         if self.mode == "plan":
@@ -6646,7 +6665,7 @@ class App:
             if item[0] == "job":
                 self.fleet.loom.load_detail(item[1], item[2]["name"])
                 self.ui.update(view="detail", view_scroll=0)
-            elif item[0] in ("helper", "process", "closed", "swarm", "approval", "need"):
+            elif item[0] in ("helper", "process", "closed", "swarm", "approval", "need", "app"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
                 self.perform(self.open_remote, item[1], item[2])
@@ -6769,7 +6788,7 @@ class App:
             return self.say(f"{v['name']} is blocked on a prompt: answer it first (enter jumps there)")
         if self.confirm(f"{key}:{v['sid']}", f"type {command} into {v['name']}"):
             self.targets = [v]
-            self.perform(self.submit_message, command, [v])
+            self.queue_message(command, [v])
 
     def open_remote(self, host, v):
         self.say(open_tab(HOME, remote_shell_command(host["host"], v.get("cwd")), self.dry_run))
@@ -6847,6 +6866,12 @@ class App:
             message += f"; skipped {', '.join(skipped)} (blocked on a prompt: answer it there)"
         self.say(message)
 
+    def queue_message(self, text, targets):
+        targets = list(targets)
+        who = targets[0]["name"] if len(targets) == 1 else f"{len(targets)} sessions"
+        self.say("sending to " + who + "…")
+        self.perform(self.submit_message, text, targets)
+
     def interrupt(self, v):
         if not v:
             return self.say("nothing selected")
@@ -6882,7 +6907,7 @@ class App:
             return self.say(refusal)
         if self.confirm(f"E:{v['sid']}", f"exit {v['name']} (/exit)"):
             self.targets = [v]
-            self.perform(self.submit_message, "/exit", [v])
+            self.queue_message("/exit", [v])
 
     def start_rename(self, v):
         """N N: open the rename input, pre-filled with a suggestion."""
@@ -6928,7 +6953,7 @@ class App:
             return self.say(f"{v['name']} is blocked: answer it first")
         if self.confirm(f"S:{v['sid']}", f"save and close {v['name']} (/closecode)"):
             self.targets = [v]
-            self.perform(self.submit_message, "/closecode", [v])
+            self.queue_message("/closecode", [v])
 
     def submit_task(self, text):
         task = self.task

@@ -87,6 +87,10 @@ the tab bar scrolls to keep the active tab visible.
 "Yes", so a message ending in Enter would approve whatever it was asking. `atc` re-reads the session's state
 right before typing and skips it; press `enter` to go and answer the prompt yourself. Sessions in Herdr panes
 are steered through `herdr agent prompt`, which has the same guard.
+Deliveries to the same terminal or Herdr pane are serialized across threads and local atc processes: each
+fresh state check, message and Enter completes before the next delivery checks again. Different targets can
+still receive messages in parallel. While a message or project broadcast runs, the footer shows its progress
+before reporting all recipients and skips.
 
 ## Install
 
@@ -221,8 +225,9 @@ agent hosts and are reached with `loom --host <host> jobs list --json`. Apps com
 
 Each host lists failing jobs first, then running jobs, then estimated due times. The terminal shows the nearest
 due job and folds the remaining healthy idle jobs into one line, including an expired count; `p` toggles those
-rows in Jobs. Select a job and press Enter for status and recent logs. `x x` triggers it now. The web
-Jobs view shows all jobs, links to status, and has **Run now** buttons using the existing preview and confirm
+rows in Jobs. Select a job and press Enter for status and recent logs. `x x` triggers it now.
+App rows are also selectable, including those after the last job; Enter shows their cached status, health and URL.
+The web Jobs view shows all jobs, links to status, and has **Run now** buttons using the existing preview and confirm
 dialog. MCP `atc_jobs` reads the same list; pass `job` and optionally `host` for status. `atc_run_job` accepts the
 exact `job` name and an optional `host` (default `local`), and supports confirmation, `dry_run`, and the audit log.
 Manual runs are allowed for known expired jobs; expiration excludes them from due estimates.

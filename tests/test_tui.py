@@ -823,6 +823,58 @@ class TabLogic(unittest.TestCase):
             gate.set()
         self.assertEqual(app.mode, "normal")
 
+    def test_broadcast_replaces_stale_result_and_keeps_project_targets(self):
+        app, model, m = self.app, self.model, self.m
+        views = {v["name"]: v for v in m.ordered_sessions(model, True)}
+        views["beta-22"]["cwd"] = self.fx.work
+        views["delta-44"]["cwd"] = os.path.join(self.fx.root, "parked")
+        app.submit_message("blocked message", [views["gamma-33"]])
+        self.assertIn("skipped gamma-33", app.flash[0])
+        app.ui["selected"] = views["beta-22"]["sid"]
+        app.handle("M", model)
+        self.assertEqual({v["name"] for v in app.targets}, {"alpha-11", "beta-22", "gamma-33"})
+        app.buffer = "sync up"
+
+        with mock.patch.object(app, "perform") as perform:
+            app.handle("\n", model)
+
+        self.assertEqual(app.flash[0], "sending to 3 sessions…")
+        app.switch_tab("needs", model)
+        app.targets = [views["gamma-33"]]
+        work, text, targets = perform.call_args.args
+        with mock.patch.object(m, "deliver", side_effect=lambda _f, _t, v, *_args:
+                               (False, "blocked") if v["group"] == "blocked" else (True, "dry run")) as deliver:
+            work(text, targets)
+        self.assertEqual({call.args[2]["name"] for call in deliver.call_args_list},
+                         {"alpha-11", "beta-22", "gamma-33"})
+        self.assertIn("beta-22, alpha-11", app.flash[0])
+        self.assertIn("skipped gamma-33", app.flash[0])
+
+    def test_jobs_apps_after_the_last_job_are_selectable_and_read_only(self):
+        app, model, m = self.app, self.model, self.m
+        model["jobs"] = {"local": model["jobs"]["local"]}
+        entry = model["jobs"]["local"]
+        entry["apps"] = [dict(entry["apps"][0], name=f"app-{i:02d}") for i in range(20)]
+        app.switch_tab("jobs", model)
+        last = m.app_key("local", "app-19")
+        self.assertIn(last, app.selectable)
+        for _ in app.selectable:
+            app.handle(m.curses.KEY_DOWN, model)
+        frame = m.render(self.fleet, model, app.ui, 80, 14)[0]
+        self.assertEqual(app.ui["selected"], last)
+        self.assertIn("app-19", self.text(frame))
+        footer = m.plain(app.footer(time.time(), model))
+        self.assertIn("enter detail", footer)
+        self.assertNotIn("run now", footer)
+        with mock.patch.object(m, "run", side_effect=AssertionError("app details are cached")):
+            app.handle("\n", model)
+            frame = m.render_view(self.fleet, model, app.ui, 80, 20)
+            self.assertIn("URL: https://example.com", self.text(frame))
+            app.handle("\x1b", model)
+            app.handle("x", model)
+            app.handle("x", model)
+        self.assertNotIn("jobs run", self.fx.calls())
+
 
 @unittest.skipUnless(TMUX, "tmux is needed for the screen tests")
 class Tabs(unittest.TestCase):
@@ -831,8 +883,18 @@ class Tabs(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fx = tabs_fixture()
+        cls.addClassCleanup(cls.fx.stop)
         cls.target = f"atc-tabs-target-{os.getpid()}"
-        subprocess.run([TMUX, "new-session", "-d", "-s", cls.target, "sleep 3600"], check=True)
+        try:
+            result = subprocess.run([TMUX, "new-session", "-d", "-s", cls.target, "sleep 3600"],
+                                    capture_output=True, text=True)
+        except PermissionError as exc:
+            raise unittest.SkipTest(f"screen fixture needs tmux; sandbox denied it: {exc}") from exc
+        if result.returncode:
+            if any(reason in result.stderr.lower() for reason in ("operation not permitted", "permission denied")):
+                raise unittest.SkipTest("screen fixture needs the tmux socket; sandbox denied it: " + result.stderr.strip())
+            raise AssertionError(result.stderr)
+        cls.addClassCleanup(subprocess.run, [TMUX, "kill-session", "-t", cls.target], capture_output=True)
         tty = subprocess.run([TMUX, "display-message", "-p", "-t", cls.target, "#{pane_tty}"],
                              check=True, capture_output=True, text=True).stdout.strip()
         processes = Path(cls.fx.stub, "processes.txt")
@@ -842,22 +904,13 @@ class Tabs(unittest.TestCase):
             cls.m = load_atc(cls.env)
             cls.approvals = cls.m.Approvals()
             cls.approval = cls.approvals.create("atc_message", {}, "Message beta-22", "caller", "fixture")
-        try:
-            cls.s = Screen(160, 45, "--dry-run", "--host", "server1", hosts=True, fx=cls.fx,
-                           extra_env=cls.env, ready="6 Quota")
-        except Exception:
-            subprocess.run([TMUX, "kill-session", "-t", cls.target], capture_output=True)
-            cls.fx.stop()
-            raise
+        cls.s = Screen(160, 45, "--dry-run", "--host", "server1", hosts=True, fx=cls.fx,
+                       extra_env=cls.env, ready="6 Quota")
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            code, err = cls.s.quit()
-            assert (code, err.strip()) == ("0", ""), (code, err)
-        finally:
-            subprocess.run([TMUX, "kill-session", "-t", cls.target], capture_output=True)
-            cls.fx.stop()
+        code, err = cls.s.quit()
+        assert (code, err.strip()) == ("0", ""), (code, err)
 
     def setUp(self):
         self.s.press("Escape", "1")
@@ -1000,6 +1053,21 @@ class Tabs(unittest.TestCase):
             self.assertNotIn("dispatch in a new tab", s.footer())
         finally:
             route.write_text(original)
+
+    def test_09_jobs_app_rows_scroll_past_the_last_job(self):
+        s = self.s
+        try:
+            subprocess.run([TMUX, "resize-window", "-t", s.name, "-x", "60", "-y", "14"], check=True)
+            s.press("4")
+            s.select("app dashboard")
+            self.assertIn("app dashboard", s.selected_line())
+            self.assertIn("enter detail", s.footer())
+            self.assertNotIn("run now", s.footer())
+            s.press("Enter")
+            s.wait_for("URL: https://example.com")
+            s.press("Escape")
+        finally:
+            subprocess.run([TMUX, "resize-window", "-t", s.name, "-x", "160", "-y", "45"], check=True)
 
     def test_99_screen_loop_stays_quick(self):
         lines = Path(self.s.debug).read_text().splitlines()
