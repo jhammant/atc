@@ -1,7 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const groups = ["blocked", "waiting", "working", "parked", "background", "other"];
-const labels = {needs: "Needs you", later: "Later", fleet: "Fleet", jobs: "Jobs & apps", job: "Job", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
+const labels = {tools: "Tools", needs: "Needs you", later: "Later", fleet: "Fleet", jobs: "Jobs & apps", job: "Job", comms: "Comms", quota: "Quota", closed: "Closed", account: "Passkeys", session: "Session",
   blocked: "Blocked on a prompt", waiting: "Waiting for you", working: "Working", parked: "Parked", background: "Background", other: "Other"};
 let model = null, signedIn = false, busy = false, refreshing = null, generation = 0;
 let view = "needs", selected = null;
@@ -106,7 +106,9 @@ async function lever(tool, args) {
   const preview = await api("tools/" + tool, {arguments: {...args, dry_run: true}});
   if (!preview.ok) { status(preview.text, true); return; }
   if (!await confirmAction(preview.text)) { status("Cancelled. Nothing was done."); return; }
-  const result = await api("tools/" + tool, {arguments: {...args, dry_run: false}});
+  const request = {arguments: {...args, dry_run: false}};
+  if (preview.requestState) request.requestState = preview.requestState;
+  const result = await api("tools/" + tool, request);
   status(result.text, !result.ok);
 }
 function age(seconds) {
@@ -232,6 +234,34 @@ function fleetView() {
   }
   return fragment;
 }
+function toolsView() {
+  const fragment = document.createDocumentFragment(), tools = model.tools || {};
+  fragment.append(node("p", "This machine · process memory and usage; no monetary estimates.", "meta"));
+  if (!tools.scanned_at) fragment.append(node("p", "Reading tool usage…", "notice"));
+  if (tools.error) fragment.append(node("p", tools.error, "notice"));
+  fragment.append(node("h2", "MCP servers"));
+  for (const s of tools.servers || []) {
+    const card = node("article", null, "session");
+    card.append(node("h3", s.name),
+      node("p", `${s.copies} copies · ${(s.rss_kb / 1024).toFixed(1)} MiB RSS · ${s.calls_7d} calls in 7d · ${s.calls_30d} in 30d`, "state"),
+      node("p", `Last used: ${s.last_used ? when(s.last_used) : "never"}`, "meta"),
+      node("p", `Areas in 30d: ${(s.areas || []).join(", ") || "none"}`));
+    if (s.transport === "http") card.append(node("p", "Remote transport; no local server process.", "notice"));
+    if (!s.configured) card.append(node("p", "Seen in transcripts; no user-scope definition.", "notice"));
+    fragment.append(card);
+  }
+  fragment.append(node("h2", "Skills"));
+  for (const s of tools.skills || []) {
+    const card = node("article", null, "session");
+    card.append(node("h3", s.name), node("p", `${s.uses} uses in retained history`, "state"),
+      node("p", `Last used: ${s.last_used ? when(s.last_used) : "never"}`, "meta"));
+    fragment.append(card);
+  }
+  if (!(tools.servers || []).length && !(tools.skills || []).length && tools.scanned_at) {
+    fragment.append(node("p", "No configured servers or skill usage found."));
+  }
+  return fragment;
+}
 function needsView() {
   const fragment = document.createDocumentFragment();
   let laterSection = null;
@@ -321,6 +351,7 @@ function drawModel() {
   if (view === "later") frag.append(laterView());
   if (view === "fleet") frag.append(fleetView());
   if (view === "jobs") frag.append(jobsView());
+  if (view === "tools") frag.append(toolsView());
   if (view === "comms") {
     const filter = $("filter").value.toLocaleLowerCase();
     frag.append(comms((model.comms || []).filter((c) => `${c.from} ${c.to}`.toLocaleLowerCase().includes(filter))));
@@ -398,7 +429,7 @@ async function drawAccount() {
 function navigate() {
   status("");
   const [name, query] = location.hash.slice(1).split("?");
-  view = ["needs", "later", "fleet", "jobs", "job", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
+  view = ["needs", "later", "fleet", "tools", "jobs", "job", "comms", "quota", "closed", "account", "session"].includes(name) ? name : "needs";
   const args = new URLSearchParams(query || "");
   const next = view === "session" ? {session: args.get("sid") || "", host: args.get("host") || "local"} :
     view === "job" ? {job: args.get("job") || "", host: args.get("host") || "local"} : null;

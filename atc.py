@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import base64
 import collections
+import copy
 import curses
 import fcntl
 import hashlib
@@ -48,6 +49,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import textwrap
@@ -102,6 +104,9 @@ CLOSED_SCAN_EVERY = 30.0
 CLOSED_TAIL_BYTES = 50_000
 LAUNCHERS = {"node", "python", "python3", "sh", "bash", "zsh", "env", "bun", "deno", "uv", "npx"}
 PATH_NOISE = {"index.js", "cli.js", "main.js", "main.py", "dist", "bin", "lib", "src", "build", ".bin", "node_modules"}
+TOOLS_EVERY = 30.0
+PROFILES_DIR = os.path.join(HOME, ".config", "atc", "profiles")
+CLAUDE_CONFIG = os.path.join(HOME, ".claude.json")
 
 CROSS_RE = re.compile(r"<cross-session-message\b([^>]*)>(.*?)</cross-session-message>", re.S)
 ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
@@ -1089,16 +1094,16 @@ def read_registry():
 
 
 def process_table():
-    """pid -> {ppid, tty, etime, command} for every process (one ps call)."""
-    _code, out, _err = run(["ps", "-A", "-o", "pid=,ppid=,tty=,etime=,command="], timeout=10)
+    """pid -> {ppid, tty, etime, rss, command}; RSS is in KiB on macOS and Linux."""
+    _code, out, _err = run(["ps", "-A", "-o", "pid=,ppid=,tty=,etime=,rss=,command="], timeout=10)
     table = {}
     for line in (out or "").splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5 or not parts[0].isdigit() or not parts[1].isdigit():
+        parts = line.split(None, 5)
+        if len(parts) < 6 or not parts[0].isdigit() or not parts[1].isdigit() or not parts[4].isdigit():
             continue
         tty = parts[2] if parts[2] not in ("?", "??", "-") else ""
         table[int(parts[0])] = {"ppid": int(parts[1]), "tty": f"/dev/{tty}" if tty else "", "etime": parts[3],
-                                "command": parts[4]}
+                                "rss": int(parts[4]), "command": parts[5]}
     return table
 
 
@@ -1652,6 +1657,451 @@ def process_label(command):
     return re.sub(r"-v?\d[\w.\-]*$", "", name)
 
 
+# ---------------------------------------------------------------- tools and profiles
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def server_definitions():
+    """Read only user-scope definitions. Never include their values in exceptions or view models."""
+    try:
+        with open(CLAUDE_CONFIG, encoding="utf-8") as fh:
+            data = json.load(fh)
+        servers = data.get("mcpServers", {}) if isinstance(data, dict) else None
+        if not isinstance(servers, dict) or any(not NAME_RE.fullmatch(k) or not isinstance(v, dict)
+                                                for k, v in servers.items()):
+            raise ValueError()
+        return servers
+    except (OSError, ValueError, TypeError):
+        raise ValueError("cannot read MCP server definitions from the Claude config") from None
+
+
+def profile_read(path, default=None):
+    """Private regular files only, without following symlinks or blocking on a FIFO."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return default
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        info = os.fstat(fh.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600:
+            raise ValueError("profile files must be regular files with mode 0600")
+        return json.load(fh)
+
+
+def validate_profiles(data):
+    if not isinstance(data, dict):
+        raise ValueError()
+    index = {}
+    for name, row in data.items():
+        if (not PROFILE_RE.fullmatch(name) or name.casefold() == "profiles"
+                or name.casefold() in {n.casefold() for n in index} or not isinstance(row, dict)
+                or not isinstance(row.get("folders"), list) or not isinstance(row.get("servers"), list)
+                or not isinstance(row.get("strict", False), bool)
+                or any(not isinstance(f, str) or not f or not os.path.isabs(os.path.expanduser(f))
+                       or any(ord(c) < 32 for c in f) for f in row["folders"])
+                or any(not isinstance(s, str) or not NAME_RE.fullmatch(s) for s in row["servers"])):
+            raise ValueError()
+        index[name] = {"folders": row["folders"], "servers": list(dict.fromkeys(row["servers"])),
+                       "strict": row.get("strict", False)}
+    return index
+
+
+def profile_index():
+    try:
+        return validate_profiles(profile_read(os.path.join(PROFILES_DIR, "profiles.json"), {}))
+    except (OSError, ValueError, TypeError, WebError):
+        raise ValueError("cannot read profiles.json; check its format and mode 0600") from None
+
+
+def choose_profile(directory, index):
+    directory = os.path.realpath(os.path.expanduser(directory))
+    matches = [(len(root), name, row) for name, row in index.items() for folder in row["folders"]
+               for root in [os.path.realpath(os.path.expanduser(folder))] if within(directory, root)]
+    if not matches:
+        return None
+    # A tie is deterministic: the alphabetically first profile wins.
+    _, name, row = sorted(matches, key=lambda match: (-match[0], match[1]))[0]
+    return name, row
+
+
+def read_profile(name, row):
+    try:
+        path = os.path.join(PROFILES_DIR, name + ".json")
+        data = profile_read(path)
+        if not isinstance(data, dict) or not isinstance(data.get("mcpServers"), dict):
+            return None
+        servers = data["mcpServers"]
+        if set(servers) != set(row["servers"]) or any(not isinstance(v, dict) for v in servers.values()):
+            return None
+        return path
+    except (OSError, ValueError, WebError):
+        return None
+
+
+def init_profiles(force=False, source=None):
+    servers = server_definitions()
+    index = {"base": {"folders": ["/"], "servers": sorted(servers), "strict": False}}
+    if source is not None:
+        try:
+            with open(source, encoding="utf-8") as fh:
+                index = validate_profiles(json.load(fh))
+        except (OSError, ValueError, TypeError):
+            raise ValueError("cannot read starter profiles; expected profile names, folders, servers and optional strict") from None
+        for row in index.values():
+            row["servers"] = [s for s in row["servers"] if s in servers]
+    private_dir(PROFILES_DIR)
+    with web_file_lock(PROFILES_DIR, ".init.lock"):
+        paths = [os.path.join(PROFILES_DIR, name + ".json") for name in ["profiles"] + list(index)]
+        if not force and any(os.path.lexists(path) for path in paths):
+            raise ValueError("profiles already exist; use --force to replace the starting profiles")
+        for name, row in index.items():
+            private_write(os.path.join(PROFILES_DIR, name + ".json"),
+                          {"mcpServers": {s: servers[s] for s in row["servers"]}})
+        private_write(os.path.join(PROFILES_DIR, "profiles.json"), index)
+    return index
+
+
+def profiles_cli(argv):
+    parser = argparse.ArgumentParser(prog="atc profiles", description="Choose MCP servers by folder.")
+    subs = parser.add_subparsers(dest="command", required=True)
+    subs.add_parser("list")
+    which = subs.add_parser("which")
+    which.add_argument("directory", nargs="?", default=os.getcwd())
+    show = subs.add_parser("show")
+    show.add_argument("name")
+    init = subs.add_parser("init")
+    init.add_argument("--force", action="store_true")
+    init.add_argument("--from", dest="source", metavar="FILE.json")
+    subs.add_parser("doctor")
+    args = parser.parse_args(argv)
+    index = init_profiles(args.force, args.source) if args.command == "init" else profile_index()
+    if args.command in ("list", "init"):
+        for name, row in sorted(index.items()):
+            print(f"{name}: {', '.join(row['folders'])}; servers: {', '.join(row['servers']) or '(none)'}; "
+                  + ("strict" if row["strict"] else "additive"))
+        if not index:
+            print("No profiles. Run atc profiles init to create the starting profiles.")
+    elif args.command == "which":
+        match = choose_profile(args.directory, index)
+        if not match:
+            print("No matching profile; Claude starts unchanged.")
+        else:
+            name, row = match
+            print(f"{name}: {', '.join(row['servers']) or '(none)'}; " + ("strict" if row["strict"] else "additive"))
+            if not read_profile(name, row):
+                print("Profile file unavailable or inconsistent; Claude starts unchanged.")
+    elif args.command == "show":
+        if args.name not in index:
+            raise ValueError("unknown profile; use atc profiles list")
+        print("\n".join(index[args.name]["servers"]) or "(no servers)")
+    elif args.command == "doctor":
+        servers = set(server_definitions())
+        used = set()
+        problems = False
+        for name, row in sorted(index.items()):
+            used.update(row["servers"])
+            if row["strict"]:
+                print(f"{name}: warning: strict drops claude.ai connectors, plugin and project servers, "
+                      "and unlisted user-scope servers")
+            missing = sorted(set(row["servers"]) - servers)
+            if missing:
+                problems = True
+                print(f"{name}: servers no longer configured: {', '.join(missing)}")
+            if not read_profile(name, row):
+                problems = True
+                print(f"{name}: profile file unavailable, unsafe permissions, or server names differ from the index")
+        print("Servers in no profile: " + (", ".join(sorted(servers - used)) or "(none)"))
+        return int(problems)
+    return 0
+
+
+def real_claude():
+    override = os.environ.get("ATC_CLAUDE")
+    try:
+        command = shlex.split(override) if override else ["claude"]
+        if not command:
+            raise ValueError()
+        candidates = ([command[0]] if os.path.dirname(command[0]) else
+                      [os.path.join(p or os.curdir, command[0]) for p in os.get_exec_path()])
+        ourselves = {os.path.realpath(__file__), os.path.realpath(sys.argv[0])}
+        for path in candidates:
+            if (os.path.isfile(path) and os.access(path, os.X_OK) and os.path.realpath(path) not in ourselves):
+                return [os.path.abspath(path)] + command[1:]
+    except (OSError, ValueError):
+        pass
+    raise ValueError("cannot find the real Claude executable; set ATC_CLAUDE to its path")
+
+
+def claude_argv(args, directory=None):
+    command = real_claude()
+    passthrough = (os.environ.get("ATC_PROFILES", "").lower() == "off" or
+                   args[:1] in (["mcp"], ["update"]) or
+                   any(a in ("--version", "-v", "-p", "--print") or a.startswith("--print=")
+                       or (a.startswith("-p") and not a.startswith("--")) for a in args))
+    if not passthrough:
+        try:
+            match = choose_profile(directory or os.getcwd(), profile_index())
+            if match:
+                name, row = match
+                path = read_profile(name, row)
+                if path:
+                    command += ["--mcp-config=" + path] + (["--strict-mcp-config"] if row["strict"] else [])
+        except ValueError:
+            pass  # malformed/unavailable index is also a safe fall-through
+    return command + args
+
+
+def claude_cli(args):
+    dry_run = args[:1] == ["--dry-run"]
+    argv = claude_argv(args[1:] if dry_run else args)
+    if dry_run:
+        print(shlex.join(argv))  # config paths only; never render server definitions
+        return 0
+    try:
+        os.execv(argv[0], argv)
+    except OSError:
+        raise ValueError("cannot execute Claude; check ATC_CLAUDE and PATH") from None
+
+
+def tool_area(cwd):
+    if not cwd:
+        return "unknown"
+    path = os.path.normpath(cwd)
+    dev = os.path.join(HOME, "dev")
+    if within(path, dev) and path != dev:
+        return os.path.join(dev, os.path.relpath(path, dev).split(os.sep)[0])
+    if within(path, HOME) and path != HOME:
+        return os.path.join(HOME, os.path.relpath(path, HOME).split(os.sep)[0])
+    return os.sep + path.lstrip(os.sep).split(os.sep)[0]
+
+
+def installed_skills(folders):
+    found = {}
+    roots = [(os.path.join(HOME, ".agents", "skills"), "", None, "user"),
+             (os.path.join(CLAUDE_HOME, "skills"), "", None, "user")]
+    roots += [(os.path.join(folder, ".claude", "skills"), "", folder, "project") for folder in sorted(folders)]
+    try:
+        with open(os.path.join(CLAUDE_HOME, "plugins", "installed_plugins.json"), encoding="utf-8") as fh:
+            plugins = json.load(fh).get("plugins", {})
+        for plugin, entries in plugins.items():
+            for entry in entries if isinstance(entries, list) else []:
+                if isinstance(entry, dict) and isinstance(entry.get("installPath"), str):
+                    scope, folder = entry.get("scope", "user"), entry.get("projectPath")
+                    if scope in ("project", "local"):
+                        if not isinstance(folder, str) or not os.path.isabs(folder):
+                            continue
+                    elif scope in ("user", "managed"):
+                        folder = None
+                    else:
+                        continue
+                    roots.append((os.path.join(entry["installPath"], "skills"), plugin.split("@")[0] + ":", folder, scope))
+    except (OSError, ValueError, AttributeError):
+        pass
+    for root, prefix, folder, scope in roots:
+        for path in sorted(glob.glob(os.path.join(root, "*", "SKILL.md"))):
+            name = prefix + os.path.basename(os.path.dirname(path))
+            if NAME_RE.fullmatch(name):
+                found.setdefault(name, []).append({"path": path, "folder": folder, "scope": scope,
+                                                   "projectPath": folder})
+    return found
+
+
+class ToolUsage:
+    """Read transcripts off the screen loop. Cache summaries, offsets and identity/size/mtime per file.
+    Only tool names, ids, timestamps and folders survive parsing; inputs and server definitions never enter data.
+    """
+
+    def __init__(self, background=True):
+        self.files, self.definitions, self.skills = {}, {}, {}
+        self.data = {"servers": [], "skills": [], "scanned_at": None, "error": None}
+        self.lock = threading.Lock()
+        if background:
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def read(self, path):
+        info = os.stat(path)
+        signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        old = self.files.get(path)
+        if old and old["signature"] == signature:
+            return old
+        append = old and old["signature"][:2] == signature[:2] and info.st_size > old["signature"][2]
+        row = old if append else {"offset": 0, "cwd": "", "seen": set(), "counts": {}, "events": []}
+        with open(path, "rb") as fh:
+            fh.seek(row["offset"])
+            while True:
+                line = fh.readline()
+                if not line or not line.endswith(b"\n"):
+                    break  # partial writes are read from the same offset next poll
+                row["offset"] = fh.tell()
+                try:
+                    rec = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if isinstance(rec.get("cwd"), str) and os.path.isabs(rec["cwd"]):
+                    row["cwd"] = rec["cwd"]
+                ts = parse_ts(rec.get("timestamp"))
+                msg = rec.get("message")
+                if rec.get("type") != "assistant" or not ts or not math.isfinite(ts) or not isinstance(msg, dict):
+                    continue
+                blocks = msg.get("content")
+                for block in blocks if isinstance(blocks, list) else []:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    name, inp = block.get("name"), block.get("input")
+                    if isinstance(name, str) and name.startswith("mcp__") and len(name.split("__")) >= 3:
+                        kind, name = "server", name.split("__")[1]
+                    elif name == "Skill" and isinstance(inp, dict):
+                        kind, name = "skill", inp.get("skill")
+                    else:
+                        continue
+                    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+                        continue
+                    tid = block.get("id")
+                    if isinstance(tid, str):
+                        if tid in row["seen"]:
+                            continue
+                        row["seen"].add(tid)
+                    key = (kind, name)
+                    count, last = row["counts"].get(key, (0, 0))
+                    row["counts"][key] = (count + 1, max(last, ts))
+                    row["events"].append((ts, key, row["cwd"]))
+        row["signature"] = signature
+        self.files[path] = row
+        return row
+
+    def fetch(self, now=None):
+        with self.lock:
+            now = time.time() if now is None else now
+            errors = []
+            try:
+                definitions = server_definitions()
+            except ValueError as exc:
+                definitions = {}
+                errors.append(str(exc))
+            paths = set(glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True))
+            for path in sorted(paths):
+                try:
+                    self.read(path)
+                except OSError:
+                    errors.append("Some transcripts could not be read.")
+            self.files = {p: r for p, r in self.files.items() if p in paths}
+            stats, folders = {}, set()
+            for path, row in self.files.items():
+                parent = os.path.dirname(os.path.dirname(path)) + ".jsonl"
+                cwd = row["cwd"] or self.files.get(parent, {}).get("cwd", "")
+                if cwd:
+                    folders.add(cwd)
+                row["events"] = [event for event in row["events"] if event[0] >= now - 30 * 86400]
+                for key, (count, last) in row["counts"].items():
+                    entry = stats.setdefault(key, {"uses": 0, "calls_7d": 0, "calls_30d": 0, "last_used": 0,
+                                                   "areas": set()})
+                    entry["uses"] += count
+                    entry["last_used"] = max(entry["last_used"], last)
+                for ts, key, folder in row["events"]:
+                    if ts > now:
+                        continue
+                    entry = stats[key]
+                    entry["calls_30d"] += 1
+                    entry["calls_7d"] += ts >= now - 7 * 86400
+                    entry["areas"].add(tool_area(folder or cwd))
+            skills = installed_skills(folders)
+            servers, skill_rows = [], []
+            for kind, names, output in (("server", set(definitions) | {n for k, n in stats if k == "server"}, servers),
+                                        ("skill", set(skills) | {n for k, n in stats if k == "skill"}, skill_rows)):
+                for name in sorted(names, key=str.casefold):
+                    entry = stats.get((kind, name), {})
+                    output.append({"name": name, "uses": entry.get("uses", 0),
+                                   "calls_7d": entry.get("calls_7d", 0), "calls_30d": entry.get("calls_30d", 0),
+                                   "last_used": entry.get("last_used"), "areas": sorted(entry.get("areas", [])),
+                                   **({"configured": name in definitions,
+                                       "transport": "http" if definitions.get(name, {}).get("type") in ("http", "sse") else "stdio"} if kind == "server"
+                                      else {"locations": skills.get(name, [])})})
+            self.definitions, self.skills = definitions, skills
+            self.data = {"servers": servers, "skills": skill_rows, "scanned_at": now,
+                         "error": " ".join(dict.fromkeys(errors)) or None}
+            return self.data
+
+    def loop(self):
+        while True:
+            self.fetch()
+            time.sleep(TOOLS_EVERY)
+
+    def model(self, table, sessions, taken_at):
+        matches = server_processes(self.definitions, table, sessions, taken_at)
+        servers = []
+        for row in self.data["servers"]:
+            processes = matches.get(row["name"], [])
+            servers.append(dict(row, copies=len(processes), rss_kb=sum(p["rss_kb"] for p in processes),
+                                processes=processes))
+        return dict(self.data, servers=servers)
+
+
+def matches_server(definition, command):
+    if definition.get("type") in ("http", "sse") or not isinstance(definition.get("command"), str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    args = definition.get("args", [])
+    if not tokens or not isinstance(args, list) or any(not isinstance(a, str) for a in args):
+        return False
+    executable = definition["command"]
+    same_exe = tokens[0] == executable or os.path.basename(tokens[0]) == os.path.basename(executable)
+    if same_exe and tokens[1:1 + len(args)] == args:
+        # A bare general-purpose interpreter is not enough to identify a server.
+        return bool(args) or os.path.basename(executable) not in LAUNCHERS
+    # npm's launcher becomes node .../node_modules/<package>/... after startup.
+    if os.path.basename(executable) in ("npx", "npm", "bunx"):
+        packages = [arg for arg in args if not arg.startswith("-") and arg not in ("exec", "x", "--")]
+        for package in packages:
+            package = re.sub(r"(?<=.)@[^/]*$", "", package)
+            if package and any("/node_modules/" + package + "/" in t for t in tokens[:2]):
+                return True
+        if os.path.basename(tokens[0]) == "npm" and tokens[1:2] == ["exec"]:
+            return bool(packages) and all(package in tokens[2:] for package in packages)
+    return False
+
+
+def server_processes(definitions, table, sessions, taken_at):
+    children = {}
+    for pid, proc in table.items():
+        children.setdefault(proc["ppid"], []).append(pid)
+    owners = {s.pid: s.sid for s in sessions if s.pid}
+    found = collections.defaultdict(list)
+    for root, sid in owners.items():
+        stack, seen = list(children.get(root, [])), {root}
+        while stack:
+            pid = stack.pop()
+            if pid in seen or pid in owners:
+                continue
+            seen.add(pid)
+            proc = table[pid]
+            names = [name for name, definition in definitions.items() if matches_server(definition, proc["command"])]
+            if len(names) != 1:
+                stack.extend(children.get(pid, []))
+                continue
+            rss, descendants, visited = 0, [pid], set()
+            while descendants:
+                child = descendants.pop()
+                if child in visited or child in owners:
+                    continue
+                visited.add(child)
+                rss += table[child].get("rss", 0)
+                descendants.extend(children.get(child, []))
+            members = [{"pid": child, "ppid": table[child]["ppid"],
+                        "started": taken_at - etime_seconds(table[child]["etime"]),
+                        "identity": hashlib.sha256(table[child]["command"].encode()).hexdigest()}
+                       for child in sorted(visited)]
+            found[names[0]].append({"pid": pid, "session": sid, "session_pid": root, "rss_kb": rss,
+                                    "started": taken_at - etime_seconds(proc["etime"]), "members": members})
+    return dict(found)
+
+
 # ---------------------------------------------------------------- herdr
 
 class Herdr:
@@ -1670,15 +2120,17 @@ class Herdr:
 
     def fetch(self):
         if not self.cmd:
-            return
+            return []
         code, out, _err = run(self.cmd + ["status", "server"], timeout=10)
         self.running = code == 0 and re.search(r"status:\s*running", out or "") is not None
         if not self.running:
             self.agents = []
-            return
-        _code, out, _err = run(self.cmd + ["agent", "list"], timeout=10)
+            return []
+        code, out, _err = run(self.cmd + ["agent", "list"], timeout=10)
         agents = ((json_in(out) or {}).get("result") or {}).get("agents")
-        self.agents = [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else []
+        snapshot = [a for a in agents if isinstance(a, dict)] if code == 0 and isinstance(agents, list) else []
+        self.agents = snapshot
+        return snapshot
 
     def loop(self):
         while True:
@@ -1693,6 +2145,9 @@ class Herdr:
             if session.get("kind") == "id" and session.get("value"):
                 out[str(session["value"])] = agent
         return out
+
+    def status_now(self, pane):
+        return next((a.get("agent_status") for a in self.fetch() if str(a.get("pane_id")) == pane), None)
 
     def act(self, pane, action, text=""):
         args = {"focus": ["agent", "focus", pane], "type": ["agent", "prompt", pane, text],
@@ -2004,7 +2459,7 @@ def needs_counts(items):
 
 class Fleet:
     def __init__(self, only=None, feed=None, herdr=None, procs=None, repos=None, closed=None, swarms=None,
-                 amail=None, loom=None, approvals=None, later=None):
+                 amail=None, loom=None, approvals=None, later=None, tools=None):
         self.only = only
         self.feed = feed
         self.herdr = herdr
@@ -2013,6 +2468,7 @@ class Fleet:
         self.closed = closed
         self.amail_poller = amail
         self.later_poller = later
+        self.tools = tools
         self.loom = loom
         self.approvals = approvals or Approvals()
         self.swarms = swarms or Swarms()
@@ -2252,6 +2708,7 @@ class Fleet:
             "later_errors": list(self.later_poller.errors if self.later_poller else ()),
             "jobs": jobs,
             "jobs_own": own_jobs,
+            "tools": self.tools.model(self.procs, list(self.sessions.values()), self.procs_at) if self.tools else {},
             "counts": {
                 **needs_counts(needs),
                 "jobs_failing": sum(bool(job.get("failing")) for entry in jobs.values() for job in entry["jobs"]),
@@ -2663,7 +3120,7 @@ end tell"""
     return f"opened a new {kind} tab" if ok else f"couldn't open a tab: {result}"
 
 
-def deliver(fleet, terminals, v, text, dry_run=False):
+def deliver(fleet, terminals, v, text, dry_run=False, idle_only=False):
     """Type text into one live session, unless it is blocked on a prompt (Enter would answer it).
     Returns (delivered, detail). The screen's m/M/C/F, the HTTP sink and MCP all come through here."""
     if v.get("kind") not in ("interactive", "herdr"):
@@ -2674,9 +3131,16 @@ def deliver(fleet, terminals, v, text, dry_run=False):
     # Independent opens of a flock serialize threads and processes. Never unlink a target's lock file.
     name = hashlib.sha256(target.encode()).hexdigest() + ".lock"
     with web_file_lock(directory, name):
-        status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
+        if v.get("kind") == "herdr":
+            status = fleet.herdr.status_now(v["herdr"]) if fleet.herdr and v.get("herdr") else None
+            if status not in ("idle", "working", "done", "blocked"):
+                return False, "cannot recheck Herdr session state; command cancelled"
+        else:
+            status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
         if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
             return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
+        if idle_only and status != "idle":
+            return False, "session is no longer idle; command cancelled"
         if v.get("herdr") and fleet.herdr:
             result = (f"dry run: herdr agent prompt {v['herdr']} {shlex.quote(text)}" if dry_run
                       else fleet.herdr.act(v["herdr"], "type", text))
@@ -2970,12 +3434,12 @@ class Approvals:
                 private_write(self.path, rows)
             return result
 
-    def create(self, tool, args, summary, caller, client, target=None):
+    def create(self, tool, args, summary, caller, client, target=None, snapshot=None):
         now = time.time()
         row = {"id": secrets.token_urlsafe(12), "tool": tool, "args_digest": args_digest(tool, args),
                "summary": summary, "target": target or summary, "caller": caller, "client": client, "created": now,
                "expires": now + APPROVAL_TTL, "state": "pending", "decided_at": None,
-               "decided_by": None, "via": None}
+               "decided_by": None, "via": None, "snapshot": copy.deepcopy(snapshot)}
         self.access(lambda rows: rows.append(row))
         audit(dict(row, transport="approval", outcome="pending"))
         return row
@@ -3519,6 +3983,7 @@ class Service:
             return 200, taxi_quota(self.quota)
         if path == "/api/fleet":  # what another atc shows of this machine (RemoteAtc), as `--json` has it
             result = {key: model.get(key) for key in ("machine", "counts", "groups", "agents", "swarms")}
+            result["tools"] = model.get("tools", {})
             result["jobs"] = model.get("jobs_own", {})  # never re-export another atc's: no loops
             result["later"] = [item for item in model.get("later", []) if item["host"] is None]
             result["later_errors"] = model.get("later_errors", [])
@@ -3532,7 +3997,7 @@ class Service:
     def web_model(self):
         model = self.cockpit.model()
         result = {k: model.get(k) for k in ("now", "machine", "groups", "hosts", "swarms", "agents", "counts", "needs",
-                                           "later", "later_errors", "jobs")}
+                                           "later", "later_errors", "jobs", "tools")}
         result.update(closed=model.get("closed", [])[:50], comms=list(reversed(model.get("comms", [])[-200:])),
                       quota=taxi_quota(self.quota), quota_text=tool_quota(self.cockpit, {}, Call()),
                       writes=self.writes, refreshed_at=iso(self.at), error=self.error)
@@ -3612,11 +4077,14 @@ class Service:
                 raise WebError(f"Invalid argument: {key}")
         server = self.web_tools if transport == "web" else self.peer_tools
         try:
-            result = server.call_tool({"name": name, "arguments": args},
+            result = server.call_tool({"name": name, "arguments": args, "requestState": body.get("requestState")},
                                       {"modern": True, "caps": {}, "client": None}, caller)
         except BadParams as exc:
             raise WebError(str(exc)) from None
-        return {"ok": not result.get("isError"), "text": result["content"][0]["text"]}
+        response = {"ok": not result.get("isError"), "text": result["content"][0]["text"]}
+        if "requestState" in result:
+            response["requestState"] = result["requestState"]
+        return response
 
     def post(self, path, body):
         """(status, body) for a POST (a write)."""
@@ -3940,16 +4408,18 @@ class Lever:
     """A lever ready to pull: what it will do, in words (the question you are asked), and the call that does it,
     returning (ok, what happened). Refusals happen before a Lever exists, so you are never asked about them."""
 
-    def __init__(self, summary, run, confirm=True, target=None):
+    def __init__(self, summary, run, confirm=True, target=None, snapshot=None):
         self.summary, self.run, self.confirm = summary, run, confirm
         self.target = target or summary
+        self.snapshot = snapshot
 
 
 class Call:
     """Who is calling and how: the calling session's id (when known), dry_run and allow_self."""
 
-    def __init__(self, caller=None, dry_run=False, allow_self=False, transport="stdio"):
+    def __init__(self, caller=None, dry_run=False, allow_self=False, transport="stdio", snapshot=None):
         self.caller, self.dry_run, self.allow_self, self.transport = caller, dry_run, allow_self, transport
+        self.snapshot = snapshot
 
 
 class Cockpit:
@@ -3983,6 +4453,10 @@ class Cockpit:
             for t in fetches:
                 t.start()
             fleet = self.fleet
+            if fleet.tools and self.due("tools", TOOLS_EVERY, now):
+                t = threading.Thread(target=fleet.tools.fetch, daemon=True)
+                t.start()
+                fetches.append(t)
             if fleet.later_poller:
                 t = threading.Thread(target=fleet.later_poller.fetch, daemon=True)
                 t.start()
@@ -4025,7 +4499,8 @@ def on_demand_cockpit(dry_run=False, hosts=(), use_hosts=True):
     herdr = Herdr(command_from_env("ATC_HERDR", "herdr"), dry_run, background=False)
     repos = Repos(background=False)
     fleet = Fleet(None, feed, herdr, Procs(background=False), repos, closed=ClosedSessions(repos=repos, background=False),
-                  amail=AMail(background=False), loom=Loom(background=False), later=Later(background=False))
+                  amail=AMail(background=False), loom=Loom(background=False), later=Later(background=False),
+                  tools=ToolUsage(background=False))
     quota = Quota(command_from_env("ATC_QUOTAMAX", "quotamax"), dry_run, background=False)
     remotes = [Remote(h, background=False) for h in configured_hosts(hosts)] if use_hosts else []
     return Cockpit(fleet, quota, remotes, Terminals(dry_run), claude_cmd, command_from_env("ATC_ROUTE", "route"),
@@ -4258,6 +4733,110 @@ def mcp_tool(name, title, description, properties=None, required=(), lever=False
                             "openWorldHint": False}}}
         return fn
     return register
+
+
+@mcp_tool("atc_tools", "Tools", "Local MCP server copies, resident memory, calls in 7/30 days and areas; "
+          "skill usage and last use. Resource cost only; no monetary estimates or configuration values.")
+def tool_tools(ck, a, call):
+    model = ck.model(hosts=False)
+    return "\n".join(plain(line) for line, _key in tools_lines(model.get("tools", {}), model["now"], 300))
+
+
+def find_skill(model, name, cwd=None):
+    row = next((s for s in model.get("tools", {}).get("skills", []) if s["name"] == name), None)
+    if row is None:
+        raise ToolError("unknown skill; atc_tools lists them")
+    locations = [loc for loc in row["locations"] if cwd is None or not loc["folder"]
+                 or (cwd and within(os.path.realpath(cwd), os.path.realpath(loc["folder"])))]
+    if not locations:
+        raise ToolError("no installed SKILL.md found for this skill in that folder")
+    location = max(locations, key=lambda loc: len(loc["folder"] or ""))
+    return row, location
+
+
+@mcp_tool("atc_open_skill", "Open a skill", "Open an installed skill's SKILL.md in a new terminal tab (less).",
+          {"skill": {"type": "string"}}, required=("skill",), lever=True)
+def tool_open_skill(ck, a, call):
+    row, location = find_skill(ck.model(hosts=False), a.get("skill"))
+    path = location["path"]
+
+    def go():
+        if not os.path.isfile(path):
+            return False, "SKILL.md is no longer available"
+        return done(open_tab(os.path.dirname(path), "less -- " + shlex.quote(path), call.dry_run), "opened", "started")
+    return Lever("open " + row["name"] + " SKILL.md in a new tab", go, confirm=False)
+
+
+@mcp_tool("atc_run_skill", "Run a skill", "Type /<skill> into a chosen local idle session. Rechecks idle state "
+          "and refuses permission prompts immediately before typing.",
+          {"skill": {"type": "string"}, "session": SESSION_ARG}, required=("skill", "session"), lever=True)
+def tool_run_skill(ck, a, call):
+    model = ck.model(hosts=False)
+    h, v = find_session(model, a.get("session"), None)
+    if h:
+        raise ToolError("choose a session on this machine")
+    not_self(call, h, v)
+    refuse_blocked(h, v)
+    live_only(h, v)
+    if v.get("status") != "idle":
+        raise ToolError("choose an idle session to run a skill")
+    row, _location = find_skill(model, a.get("skill"), v.get("cwd") or "")
+    command = "/" + row["name"]
+    summary = "type " + command + " into " + session_ref(v) + ", in " + short_path(v.get("cwd"))
+    return Lever(summary, lambda: deliver(ck.fleet, ck.terminals, v, command, call.dry_run, idle_only=True))
+
+
+def restart_server(fleet, name, expected, call):
+    """Revalidate ownership, command and start time. Never kill a recycled or newly discovered pid."""
+    try:
+        definitions = server_definitions()
+    except ValueError:
+        return False, "cannot recheck server configuration; nothing stopped"
+    table, now = process_table(), time.time()
+    matches = server_processes(definitions, table, list(fleet.sessions.values()), now).get(name, [])
+    actual = {p["pid"]: p for p in matches}
+    for p in expected:
+        fresh = actual.get(p["pid"])
+        owner = table.get(p["session_pid"], {})
+        if (not fresh or fresh["session"] != p["session"] or fresh["session_pid"] != p["session_pid"]
+                or abs(fresh["started"] - p["started"]) > 2
+                or "claude" not in owner.get("command", "").lower()):
+            return False, "server processes changed; refresh Tools and confirm again; nothing stopped"
+        members = {member["pid"]: member for member in fresh["members"]}
+        if set(members) != {member["pid"] for member in p["members"]} or any(
+                member["identity"] != members[member["pid"]]["identity"]
+                or member["ppid"] != members[member["pid"]]["ppid"]
+                or abs(member["started"] - members[member["pid"]]["started"]) > 2 for member in p["members"]):
+            return False, "server child processes changed; refresh Tools and confirm again; nothing stopped"
+        if not call.allow_self and p["session"] == call.caller:
+            return False, "refusing to restart a server in the session calling atc; set allow_self explicitly"
+    # Stop the actual workers as well as their launcher, which may not forward SIGTERM.
+    pids = [member["pid"] for p in expected for member in p["members"] if member["pid"] != p["pid"]]
+    pids += [p["pid"] for p in expected]
+    results = [stop_process(None, pid, call.dry_run) for pid in pids]
+    ok = all(r.startswith(("stopped", "dry run", "pid ")) for r in results)
+    return ok, "; ".join(results) + ". The session reconnects, or needs /mcp to reconnect."
+
+
+@mcp_tool("atc_restart_server", "Restart an MCP server", "SIGTERM the matched local server copies. The session "
+          "reconnects, or needs /mcp. Rechecks process ownership and refuses the calling session by default.",
+          {"server": {"type": "string"}}, required=("server",), lever=True, destructive=True)
+def tool_restart_server(ck, a, call):
+    name = a.get("server")
+    if call.snapshot is None:
+        model = ck.model(hosts=False)
+        row = next((s for s in model.get("tools", {}).get("servers", []) if s["name"] == name), None)
+        expected = copy.deepcopy(row["processes"]) if row else []
+    else:
+        expected = copy.deepcopy(call.snapshot)
+    if not expected:
+        raise ToolError("no matched running copies of that server")
+    for p in expected:
+        if not call.allow_self and p["session"] == call.caller:
+            raise ToolError("refusing to restart a server in the session calling atc; set allow_self explicitly")
+    targets = ", ".join("/".join(str(member["pid"]) for member in p["members"]) + " in " + p["session"][:8] for p in expected)
+    summary = f"SIGTERM {len(expected)} copies of {name} (pid in session: {targets}); reconnect or use /mcp"
+    return Lever(summary, lambda: restart_server(ck.fleet, name, expected, call), snapshot=expected)
 
 
 @mcp_tool("atc_fleet", "Fleet", "Every Claude Code session atc can see, here and on the servers, grouped by state "
@@ -4929,6 +5508,27 @@ class McpServer:
             return text_result(LEVERS_OFF, True)
         call = Call(caller, bool(args.get("dry_run")) or self.cockpit.dry_run,
                     bool(args.get("allow_self")), self.transport)
+        preview_transport = self.transport in ("web", "peer")
+        bound_args = dict(args, dry_run=False) if preview_transport else args
+        state = self.read_state(params.get("requestState"), name, bound_args, caller)
+        if state:
+            call.snapshot = state.get("snapshot")
+        if has_approval:
+            try:
+                approved = self.cockpit.approvals.get(approval)
+                if (approved["tool"] != name or approved["args_digest"] != args_digest(name, args)
+                        or approved["caller"] != caller):
+                    raise WebError("Approval does not match this tool, arguments and caller", 403)
+                call.snapshot = approved.get("snapshot")
+                if name == "atc_restart_server" and call.snapshot is None:
+                    raise WebError("Restart approval has no process snapshot; request a new approval", 403)
+            except (WebError, OSError, ValueError) as exc:
+                self.record(name, args, ctx, caller, "not confirmed", str(exc))
+                return text_result(str(exc), True)
+        elif name == "atc_restart_server" and preview_transport and not call.dry_run and not state:
+            text = "Preview the server restart and confirm its process snapshot first."
+            self.record(name, args, ctx, caller, "not confirmed", text)
+            return text_result(text, True)
         try:
             outcome = tool["fn"](self.cockpit, args, call)
         except ToolError as exc:
@@ -4943,13 +5543,21 @@ class McpServer:
         if call.dry_run and self.transport in ("web", "peer"):
             summary = ("dry run: " if self.cockpit.dry_run else "") + lever.summary
             self.record(name, args, ctx, caller, "dry run", summary)
-            return text_result(summary)
+            result = text_result(summary)
+            if lever.snapshot is not None:
+                result["requestState"] = self.issue(name, bound_args, caller, lever.snapshot)
+            return result
         if has_approval:
             try:
                 self.cockpit.approvals.consume(approval, name, args, caller, lever.summary)
             except (WebError, OSError, ValueError) as exc:
                 self.record(name, args, ctx, caller, "not confirmed", str(exc))
                 return text_result(str(exc), True)
+        elif lever.snapshot is not None and preview_transport and not call.dry_run:
+            if not self.redeem(params.get("requestState"), name, bound_args, caller):
+                text = "Restart preview expired or already used; preview and confirm again."
+                self.record(name, args, ctx, caller, "not confirmed", text)
+                return text_result(text, True)
         elif lever.confirm and not call.dry_run and self.policy == "confirm":
             try:
                 answer = self.confirmation(name, args, ctx, caller, lever, params)
@@ -4983,7 +5591,7 @@ class McpServer:
             reply = answers.get("confirm") if isinstance(answers, dict) else None
             if state is not None and isinstance(reply, dict) and self.redeem(state, name, args, caller):
                 return True if self.said_yes(reply) else f"Not confirmed ({reply.get('action')}): nothing was done."
-            return {"resultType": "input_required", "requestState": self.issue(name, args, caller),
+            return {"resultType": "input_required", "requestState": self.issue(name, args, caller, lever.snapshot),
                     "inputRequests": {"confirm": {"method": "elicitation/create", "params": question}}}
         if ctx["version"] < "2025-11-25":
             question.pop("mode")
@@ -4995,13 +5603,14 @@ class McpServer:
     def pending_approval(self, name, args, ctx, caller, lever):
         store = self.cockpit.approvals
         deadline = time.monotonic() + approval_wait()
-        row = store.create(name, args, lever.summary, caller, (ctx.get("client") or {}).get("name"), lever.target)
+        row = store.create(name, args, lever.summary, caller, (ctx.get("client") or {}).get("name"),
+                           lever.target, lever.snapshot)
         notify_approval(row, args)
         while True:
             row = store.get(row["id"])
             if row["state"] == "approved":
                 call = Call(caller, bool(args.get("dry_run")) or self.cockpit.dry_run,
-                            bool(args.get("allow_self")), self.transport)
+                            bool(args.get("allow_self")), self.transport, snapshot=row.get("snapshot"))
                 current = TOOLS[name]["fn"](self.cockpit, args, call)
                 store.consume(row["id"], name, args, caller, current.summary)
                 return current
@@ -5018,27 +5627,37 @@ class McpServer:
     def said_yes(reply):
         return reply.get("action") == "accept" and (reply.get("content") or {}).get("confirm", True) is True
 
-    def issue(self, name, args, caller):
+    def issue(self, name, args, caller, snapshot=None):
         """requestState for a question: what it is about, for whom, until when; signed, so it can't be made up."""
         body = json.dumps({"t": name, "a": args_digest(name, args), "c": caller or "", "x": int(time.time()) + CONFIRM_TTL,
-                           "n": secrets.token_hex(8)}, sort_keys=True)
+                           "n": secrets.token_hex(8), "snapshot": snapshot}, sort_keys=True)
         blob = base64.urlsafe_b64encode(body.encode()).decode()
         return blob + "." + hmac.new(self.secret, blob.encode(), hashlib.sha256).hexdigest()
 
-    def redeem(self, state, name, args, caller):
-        """True once for a requestState this server issued, for this tool, these arguments and this caller."""
+    def read_state(self, state, name, args, caller):
+        """Only trust a reviewed snapshot bound to this call by this server's signature."""
         blob, _, sig = str(state).rpartition(".")
         if not blob or not hmac.compare_digest(sig, hmac.new(self.secret, blob.encode(), hashlib.sha256).hexdigest()):
-            return False
+            return None
         try:
             data = json.loads(base64.urlsafe_b64decode(blob.encode()))
         except ValueError:
-            return False
+            return None
         now = time.time()
         with self.lock:
             self.spent = {n: x for n, x in self.spent.items() if x > now}
             if (data.get("t") != name or data.get("a") != args_digest(name, args) or data.get("c") != (caller or "")
                     or data.get("x", 0) < now or data.get("n") in self.spent):
+                return None
+        return data
+
+    def redeem(self, state, name, args, caller):
+        """True once for a requestState this server issued, for this tool, these arguments and this caller."""
+        data = self.read_state(state, name, args, caller)
+        if data is None:
+            return False
+        with self.lock:
+            if data["n"] in self.spent:
                 return False
             self.spent[data["n"]] = data["x"]
         return True
@@ -5581,6 +6200,10 @@ def resolve(fleet, model, key):
     ("remote", host, v) | ("closed", c) | ("approval", item) | (None,)."""
     if not key:
         return (None,)
+    if key.startswith(("server::", "skill::")):
+        kind, name = key.split("::", 1)
+        row = next((r for r in model.get("tools", {}).get(kind + "s", []) if r["name"] == name), None)
+        return (kind, row) if row else (None,)
     if key.startswith("need::"):
         item = next((n for n in model.get("needs", []) if need_key(n) == key), None)
         return ("need", item) if item else (None,)
@@ -5635,6 +6258,8 @@ def resolve(fleet, model, key):
 
 def selection_name(item):
     kind = item[0]
+    if kind in ("server", "skill"):
+        return item[1]["name"]
     if kind == "need":
         return clean(item[1]["title"])
     if kind in ("job", "app"):
@@ -5659,6 +6284,21 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind in ("server", "skill"):
+        row = item[1]
+        last = human_age(model["now"] - row["last_used"]) + " ago" if row.get("last_used") else "never"
+        details = [row["name"], "Last used: " + last,
+                   f"Calls in 7 / 30 days: {row['calls_7d']} / {row['calls_30d']}"]
+        if kind == "server":
+            details += [f"{row['copies']} copies; RSS {row['rss_kb'] / 1024:.1f} MiB (includes child processes)",
+                        "Areas in 30 days: " + (", ".join(short_path(a) for a in row["areas"]) or "none"),
+                        "x x sends SIGTERM. Sessions reconnect or need /mcp."]
+        else:
+            details += ["Uses in retained history: " + str(row["uses"])]
+            details += [short_path(loc["path"]) for loc in row["locations"]]
+            details += ["enter opens SKILL.md; r chooses an idle session to run this skill."]
+        lines = [[(part, "plain")] for text in details for part in wrap(text, width)]
+        return lines[:limit] if limit else lines
     if kind == "app":
         host, app = item[1], item[2]
         details = ["App: " + app["name"], "Machine: " + host,
@@ -6052,10 +6692,12 @@ def draw_tree(nodes, prefix=""):
 # ---------------------------------------------------------------- the screen
 
 TABS = (("1", "sessions", "Sessions"), ("2", "needs", "Needs"), ("3", "agents", "Agents"),
-        ("4", "jobs", "Jobs"), ("5", "servers", "Servers"), ("6", "quota", "Quota"))
+        ("4", "jobs", "Jobs"), ("5", "servers", "Servers"), ("6", "quota", "Quota"),
+        ("7", "tools", "Tools"))
 
-# Tools can be added here when it has a view; existing tab numbers stay put.
 PALETTE_KEYS = (
+    ("run selected skill in an idle session", "r"), ("open selected skill SKILL.md", "\n"),
+    ("restart selected MCP server", "x"),
     ("jump / open selected row", "\n"), ("message selected session", "m"),
     ("broadcast to this project", "M"), ("interrupt session / stop process / run job now", "x"),
     ("close session (/closecode)", "C"), ("fork session (/forkcode)", "F"),
@@ -6075,7 +6717,7 @@ PALETTE_KEYS = (
 def visible_tabs(model, ui):
     """Keep a tab once seen, so draining a queue does not move the user's view."""
     quota = model.get("quota")
-    content = {"sessions": True, "needs": bool(model.get("needs")),
+    content = {"sessions": True, "tools": bool(model.get("tools")), "needs": bool(model.get("needs")),
                "agents": bool(ordered_sessions(model, True) or model.get("agents") or model.get("swarms")
                               or model.get("comms") or model.get("hosts")),
                "jobs": any(entry.get("jobs") or entry.get("apps") or entry.get("error") or entry.get("apps_error")
@@ -6158,8 +6800,34 @@ def quota_lines(quota, width):
     return out
 
 
+def tools_lines(data, now, width):
+    rows = [(rule("Tools · this machine", width), None)]
+    if not data.get("scanned_at"):
+        rows.append(([('Reading tool usage…', "dim")], None))
+    if data.get("error"):
+        rows.append(([(data["error"], "warn")], None))
+    rows.append(([("MCP server · copies · RSS MiB · calls 7d / 30d · last used", "head")], None))
+    for server in data.get("servers", []):
+        last = human_age(now - server["last_used"]) + " ago" if server.get("last_used") else "never"
+        label = (f"{server['name']} · {server['copies']} copies · {server['rss_kb'] / 1024:.1f} MiB · "
+                 f"{server['calls_7d']} / {server['calls_30d']} calls · {last}")
+        rows.append(([(clean(label), "plain")], "server::" + server["name"]))
+        areas = ", ".join(short_path(area) for area in server["areas"]) or "none in 30d"
+        rows.append(([('  areas: ' + clean(areas), "dim")], None))
+    rows.append(([("Skills · uses (retained history) · last used", "head")], None))
+    for skill in data.get("skills", []):
+        last = human_age(now - skill["last_used"]) + " ago" if skill.get("last_used") else "never"
+        label = f"{skill['name']} · {skill['uses']} uses · {last}"
+        rows.append(([(clean(label), "plain")], "skill::" + skill["name"]))
+    if not data.get("servers") and not data.get("skills") and data.get("scanned_at"):
+        rows.append(([('No configured servers or skill usage found.', "dim")], None))
+    return rows
+
+
 def tab_rows(model, ui, width):
     tab = ui.get("tab", "sessions")
+    if tab == "tools":
+        return tools_lines(model.get("tools", {}), model["now"], width)
     if tab == "needs":
         rows = [(rule(f"Needs you ({len(model.get('needs', []))})", width), None)]
         for item in model.get("needs", []):
@@ -6180,7 +6848,9 @@ def tab_rows(model, ui, width):
     return fleet_lines(model, width, ui["show_all"], ui.get("jobs_all", False), sessions_only=True)
 
 HELP = [
-    "1–6 / ←→   tabs: Sessions, Needs, Agents, Jobs, Servers, Quota (appear when they have content)",
+    "1–7 / ←→   tabs: Sessions, Needs, Agents, Jobs, Servers, Quota, Tools (appear when they have content)",
+    "tools      enter opens SKILL.md in a new tab; r chooses an idle session, then review and confirm",
+    "           x x on a server sends SIGTERM; sessions reconnect or need /mcp",
     ":          command palette: type to filter, ↑↓ choose, enter runs, esc cancels",
     "           includes jump/message by session, run /<command> in this session, approve/deny by id",
     "enter      jump to the session's terminal tab; a background session opens attached in a new tab",
@@ -6395,11 +7065,14 @@ class App:
         self.task = None       # {"text", "cwd", "plan", "error"}
         self.targets = []      # sessions a message goes to
         self.armed = (None, 0.0)
+        self.reviewed_tool = None
         self.remotes = []
         self.tab_state = {}
         self.palette_pick = 0
         self.command = ""
         self.in_tui = False
+        self.skill_pick = 0
+        self.skill_name = ""
 
     def say(self, message):
         self.flash = (message, time.time())
@@ -6410,6 +7083,12 @@ class App:
         return item[1] if item[0] == "session" else None
 
     def footer(self, now, model=None):
+        if self.mode == "skill_pick":
+            target = self.targets[self.skill_pick]
+            return [(" Run /" + self.skill_name + " in " + target["name"], "title"),
+                    (" · ↑↓ choose session · enter review · esc cancel", "dim")]
+        if self.mode == "skill_confirm":
+            return [(" " + self.command, "warn"), (" · enter confirm · esc cancel", "dim")]
         if self.mode == "palette":
             return [(" ↑↓ choose · enter run · esc close", "dim")]
         if self.mode == "command":
@@ -6462,6 +7141,10 @@ class App:
                     keys += ["m msg", "M broadcast", "C close", "F fork", "S save"]
                     if v["status"] != "busy":
                         keys += ["N rename", "E exit"]
+            elif kind == "skill":
+                keys += ["enter SKILL.md", "r run in session"]
+            elif kind == "server":
+                keys += ["enter detail", "x x restart"]
             elif kind == "closed":
                 keys += ["enter detail", "R R restore", "D D done"]
             elif kind == "process":
@@ -6486,7 +7169,7 @@ class App:
             return
         current = self.ui["tab"]
         self.tab_state[current] = {key: self.ui[key] for key in ("selected", "panel", "scroll", "top_scroll")}
-        saved = self.tab_state.get(tab, {"selected": None, "panel": "session" if tab in ("needs", "jobs", "servers")
+        saved = self.tab_state.get(tab, {"selected": None, "panel": "session" if tab in ("needs", "jobs", "servers", "tools")
                                        else "activity", "scroll": 0, "top_scroll": 0})
         if tab == "agents":
             saved = dict(saved, selected=self.ui["selected"])
@@ -6584,7 +7267,54 @@ class App:
 
     # -- keys
 
+    def tools_cockpit(self, model):
+        ck = Cockpit(self.fleet, self.quota, self.remotes, self.terminals, self.claude_cmd, self.route_cmd)
+        ck.cached, ck.cached_at = model, time.time()
+        return ck
+
+    def tool_action(self, name, args, model, key=None, execute=False):
+        try:
+            call = Call(caller=os.environ.get("CLAUDE_CODE_SESSION_ID"), dry_run=self.dry_run, transport="screen")
+            binding = (name, args_digest(name, args), call.caller, call.dry_run, key)
+            if (self.reviewed_tool and self.reviewed_tool[0] == binding
+                    and self.armed[0] == self.reviewed_tool[1] and time.time() - self.armed[1] <= CONFIRM_SECONDS):
+                call.snapshot = self.reviewed_tool[2]
+            lever = TOOLS[name]["fn"](self.tools_cockpit(model), args, call)
+        except ToolError as exc:
+            self.say(str(exc))
+            return None
+        if key:
+            confirm_key = key + ":" + lever.summary
+            if not self.confirm(confirm_key, lever.summary):
+                self.reviewed_tool = (binding, confirm_key, lever.snapshot)
+                return None
+            self.reviewed_tool = None
+        if execute or key or not lever.confirm:
+            def work():
+                try:
+                    ok, text = lever.run()
+                except (OSError, ToolError):
+                    ok, text = False, "tool action failed; refresh Tools and try again"
+                audit({"transport": "screen", "tool": name, "arguments": args,
+                       "outcome": "dry run" if call.dry_run else "done" if ok else "failed", "detail": text})
+                self.say(text)
+            self.perform(work)
+        return lever
+
     def handle(self, key, model):
+        if self.mode in ("skill_pick", "skill_confirm"):
+            if key == "\x1b":
+                self.mode = "normal"
+            elif key in (curses.KEY_DOWN, curses.KEY_UP) and self.mode == "skill_pick":
+                self.skill_pick = (self.skill_pick + (1 if key == curses.KEY_DOWN else -1)) % len(self.targets)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                args = {"skill": self.skill_name, "session": self.targets[self.skill_pick]["sid"]}
+                execute = self.mode == "skill_confirm"
+                lever = self.tool_action("atc_run_skill", args, model, execute=execute)
+                self.mode = "normal" if execute or lever is None else "skill_confirm"
+                if lever:
+                    self.command = lever.summary
+            return True
         if self.mode == "palette":
             return self.handle_palette(key, model)
         if self.mode == "command":
@@ -6662,7 +7392,11 @@ class App:
             self.ui["panel"] = order[(order.index(self.ui["panel"]) + 1) % len(order)]
         elif key in ("\n", "\r", curses.KEY_ENTER, "f"):
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] == "job":
+            if item[0] == "skill":
+                self.tool_action("atc_open_skill", {"skill": item[1]["name"]}, model)
+            elif item[0] == "server":
+                self.ui.update(view="detail", view_scroll=0)
+            elif item[0] == "job":
                 self.fleet.loom.load_detail(item[1], item[2]["name"])
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] in ("helper", "process", "closed", "swarm", "approval", "need", "app"):
@@ -6697,7 +7431,9 @@ class App:
             self.start_message(peers)
         elif key == "x":
             item = resolve(self.fleet, model, self.ui["selected"])
-            if item[0] == "job":
+            if item[0] == "server":
+                self.tool_action("atc_restart_server", {"server": item[1]["name"]}, model, key="x")
+            elif item[0] == "job":
                 self.run_job(item)
             elif item[0] == "process":
                 self.stop(item)
@@ -6705,6 +7441,18 @@ class App:
                 self.say("a subagent stops with its session: select the session row, x x interrupts it")
             else:
                 self.interrupt(v)
+        elif key == "r":
+            item = resolve(self.fleet, model, self.ui["selected"])
+            if item[0] != "skill":
+                self.say("select a skill in Tools")
+            else:
+                self.targets = [v for v in ordered_sessions(model, True) if v.get("status") == "idle"
+                                and v.get("group") != "blocked" and v.get("kind") in ("interactive", "herdr")
+                                and v.get("sid") != os.environ.get("CLAUDE_CODE_SESSION_ID")]
+                if self.targets:
+                    self.skill_name, self.skill_pick, self.mode = item[1]["name"], 0, "skill_pick"
+                else:
+                    self.say("no idle sessions available")
         elif key == "R":
             item = resolve(self.fleet, model, self.ui["selected"])
             if item[0] == "closed":
@@ -7073,6 +7821,17 @@ def tui(stdscr, app):
 
 
 def main():
+    if sys.argv[1:2] and sys.argv[1] in ("profiles", "claude"):
+        try:
+            return profiles_cli(sys.argv[2:]) if sys.argv[1] == "profiles" else claude_cli(sys.argv[2:])
+        except ValueError as exc:
+            print("atc: " + str(exc), file=sys.stderr)
+            return 1
+        except (OSError, WebError):
+            # Neither a JSON error nor a filesystem error may echo config contents or values.
+            print("atc: profile/launcher operation failed; check config format, permissions, existing profiles "
+                  "(--force to replace), and ATC_CLAUDE/PATH", file=sys.stderr)
+            return 1
     if sys.argv[1:2] and sys.argv[1] in ("approvals", "approve", "deny"):
         try:
             return approval_cli(sys.argv[1:])
@@ -7092,7 +7851,8 @@ def main():
     if sys.argv[1:2] == ["mcp-call"] and len(sys.argv) == 3:
         return mcp_call(sys.argv[2])
     parser = argparse.ArgumentParser(description="One terminal view of every Claude Code session on this machine.",
-                                     epilog="atc mcp: MCP over stdio. atc approvals: list grants. "
+                                     epilog="atc profiles: folder MCP profiles. atc claude: launch with a profile. "
+                                            "atc mcp: MCP over stdio. atc approvals: list grants. "
                                             "atc approve <id> / deny <id>: decide from a terminal.")
     parser.add_argument("--once", action="store_true", help="print one frame as plain text and exit")
     parser.add_argument("--tree", action="store_true", help="with --once: print the hierarchy instead")
@@ -7155,14 +7915,17 @@ def main():
     amail = AMail(background=not one_shot) if not args.jump else None
     later = Later(background=not one_shot) if not args.jump else None
     loom = Loom(background=not one_shot) if not args.jump else None
+    tools = ToolUsage(background=not one_shot) if not args.jump else None
     fleet = Fleet(only, feed, herdr, Procs(background=not one_shot), repos, closed=closed, amail=amail, loom=loom,
-                  approvals=Approvals(background=not one_shot), later=later)
+                  approvals=Approvals(background=not one_shot), later=later, tools=tools)
     quota = Quota(quota_cmd, args.dry_run, background=not one_shot)
     hosts = [] if args.no_hosts or only else configured_hosts(args.host)
     remotes = [Remote(h, background=not one_shot) for h in hosts]
 
     if one_shot:
         workers = [threading.Thread(target=r.fetch) for r in remotes if not args.jump]
+        if tools:
+            workers.append(threading.Thread(target=tools.fetch))
         if amail:
             workers.append(threading.Thread(target=amail.fetch))
         if later:
