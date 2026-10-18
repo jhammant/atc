@@ -106,7 +106,9 @@ async function lever(tool, args) {
   const preview = await api("tools/" + tool, {arguments: {...args, dry_run: true}});
   if (!preview.ok) { status(preview.text, true); return; }
   if (!await confirmAction(preview.text)) { status("Cancelled. Nothing was done."); return; }
-  const result = await api("tools/" + tool, {arguments: {...args, dry_run: false}});
+  const request = {arguments: {...args, dry_run: false}};
+  if (preview.requestState) request.requestState = preview.requestState;
+  const result = await api("tools/" + tool, request);
   status(result.text, !result.ok);
 }
 function age(seconds) {

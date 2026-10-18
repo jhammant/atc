@@ -228,6 +228,29 @@ test("Run now previews, cancels without mutation, and only executes after the ex
   assert.match(p.get("result").textContent, /triggered remote-failure on server1/);
 });
 
+test("lever confirmation returns the exact reviewed snapshot token", async () => {
+  const requests = [];
+  const p = page(async (path, options) => {
+    if (path === "/api/web/model") return response(200, jobsModel());
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    return response(200, body.arguments.dry_run
+      ? {ok: true, text: "Reviewed action", requestState: "signed-reviewed-snapshot"}
+      : {ok: true, text: "Done"});
+  }, {}, "#jobs");
+  await p.settled();
+  const button = descendants(p.get("content")).find((n) => n.tag === "button");
+  const pending = button.fire("click");
+  await flush();
+  assert.equal(requests.length, 1);
+  p.confirm(true);
+  await pending;
+  await p.settled();
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].requestState, "signed-reviewed-snapshot");
+  assert.equal(requests[1].arguments.dry_run, false);
+});
+
 test("failing needs items open job status, reads show log as text, and read-only jobs disable Run", async () => {
   const data = jobsModel();
   data.writes = false;

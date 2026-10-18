@@ -53,6 +53,7 @@ class Delivery(unittest.TestCase):
         # Separate fleet and terminal objects represent separate callers sharing a target.
         other = m.Fleet(feed=m.Feed([self.env["ATC_CLAUDE"]], background=False))
         events = []
+        herdr_status = ["idle"]
         first_text, second_text, second_started, release = (threading.Event() for _ in range(4))
         real_run = m.run
 
@@ -68,7 +69,10 @@ class Delivery(unittest.TestCase):
         def enter(target):
             events.append((target, "Enter"))
             if blocked:
-                self.block(second["sid"])
+                if herdr:
+                    herdr_status[0] = "blocked"
+                else:
+                    self.block(second["sid"])
 
         def run(args, **kwargs):
             if args[:2] == ["tmux", "send-keys"]:
@@ -90,6 +94,9 @@ class Delivery(unittest.TestCase):
             return m.deliver(other, m.Terminals(), second, "second")
 
         self.fleet.herdr = other.herdr = mock.Mock(act=prompt) if herdr else None
+        if herdr:
+            self.fleet.herdr.status_now.side_effect = lambda pane: herdr_status[0]
+            self.fleet.feed.status_now = other.feed.status_now = mock.Mock(side_effect=AssertionError("Claude feed used for Herdr"))
         with mock.patch.object(m, "run", side_effect=run):
             with mock.patch.object(m.Terminals, "locate", side_effect=lambda tty: ("tmux", tty)):
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -104,6 +111,8 @@ class Delivery(unittest.TestCase):
                     results = a.result(timeout=3), b.result(timeout=3)
 
         self.assertTrue(results[0][0], results)
+        if herdr:
+            self.assertEqual(self.fleet.herdr.status_now.call_args_list, [mock.call("w1:p1"), mock.call("w1:p1")])
         if blocked:
             self.assertFalse(results[1][0], results)
             self.assertIn("blocked", results[1][1])

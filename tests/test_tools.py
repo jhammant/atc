@@ -55,7 +55,7 @@ class ToolsFixture:
         return {"type": "assistant", "cwd": str(cwd or self.work), "timestamp": ts,
                 "message": {"content": list(blocks)}}
 
-    def profiles(self, strict=True, folder=None):
+    def profiles(self, strict=False, folder=None):
         directory = self.home / ".config" / "atc" / "profiles"
         directory.mkdir(parents=True, exist_ok=True)
         index = {"project": {"folders": [str(folder or self.work)], "servers": ["notes", "remote"], "strict": strict}}
@@ -82,7 +82,7 @@ class Base(unittest.TestCase):
 
 class Profiles(Base):
     def test_longest_prefix_boundaries_tilde_and_symlinks(self):
-        base = {"folders": ["/"], "servers": [], "strict": True}
+        base = {"folders": ["/"], "servers": [], "strict": False}
         index = {"base": base, "area": dict(base, folders=["~/dev/project"]),
                  "repo": dict(base, folders=[str(self.fx.work)])}
         link = self.fx.root / "link"
@@ -96,20 +96,42 @@ class Profiles(Base):
         self.assertIsNone(self.m.choose_profile("/outside", {"repo": index["repo"]}))
 
     def test_exec_strict_and_argument_order_with_spaces(self):
-        directory, _index = self.fx.profiles()
+        directory, _index = self.fx.profiles(strict=True)
         args = ["--model", "example", "--resume", "id with spaces", "say 'hello'", "--", "literal"]
 
         result = self.cli("claude", *args)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), ["--mcp-config", str(directory / "project.json"),
+        self.assertEqual(json.loads(result.stdout), ["--mcp-config=" + str(directory / "project.json"),
                                                    "--strict-mcp-config"] + args)
         self.assertNotIn(self.fx.secret, result.stdout + result.stderr)
 
     def test_non_strict_only_adds_mcp_config(self):
         directory, _ = self.fx.profiles(strict=False)
         result = self.cli("claude", "--continue")
-        self.assertEqual(json.loads(result.stdout), ["--mcp-config", str(directory / "project.json"), "--continue"])
+        self.assertEqual(json.loads(result.stdout), ["--mcp-config=" + str(directory / "project.json"), "--continue"])
+
+    def test_prompt_stays_positional_with_commander_variadic_parsing(self):
+        parser = Path(__file__).parent / "stubs" / "claude_variadic.py"
+        self.fx.bin.write_text(f"#!{sys.executable}\n" + parser.read_text())
+        # Prove the fixture catches the original separated-option regression.
+        old = subprocess.run([str(self.fx.bin), "--mcp-config", "profile.json", "a prompt"],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(old.stdout)["configs"], ["profile.json", "a prompt"])
+        for strict in (False, True):
+            directory, _ = self.fx.profiles(strict=strict)
+            for args, prompts, options in (
+                    (["a prompt"], ["a prompt"], []),
+                    (["a prompt", "--model", "example"], ["a prompt"], ["--model", "example"]),
+                    (["--resume", "session id", "a prompt"], ["a prompt"], ["--resume", "session id"]),
+                    (["--", "-literal prompt"], ["-literal prompt"], [])):
+                with self.subTest(strict=strict, args=args):
+                    result = self.cli("claude", *args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    parsed = json.loads(result.stdout)
+                    self.assertEqual(parsed["configs"], [str(directory / "project.json")])
+                    self.assertEqual(parsed["positionals"], prompts)
+                    self.assertEqual(parsed["options"], (["--strict-mcp-config"] if strict else []) + options)
 
     def test_every_passthrough_case(self):
         directory, _ = self.fx.profiles()
@@ -155,8 +177,7 @@ class Profiles(Base):
             self.assertNotIn("Authorization", result.stdout + result.stderr)
             self.assertNotIn("https://example.com/mcp", result.stdout + result.stderr)
         dry = self.cli("claude", "--dry-run", *args)
-        self.assertEqual(shlex.split(dry.stdout), [str(self.fx.bin), "--mcp-config", str(directory / "project.json"),
-                                                 "--strict-mcp-config"] + args)
+        self.assertEqual(shlex.split(dry.stdout), [str(self.fx.bin), "--mcp-config=" + str(directory / "project.json")] + args)
         self.assertEqual(before, self.fx.config.read_bytes())
         (directory / "profiles.json").write_text('{"bad": "' + self.fx.secret + '"}')
         for command in (("profiles", "show", "project"), ("profiles", "which"), ("profiles", "doctor")):
@@ -170,27 +191,69 @@ class Profiles(Base):
 
     def test_init_filters_existing_servers_and_refuses_overwrite(self):
         before = self.fx.config.read_bytes()
-        with mock.patch.object(self.m, "PROFILE_BASE", ("notes",)), mock.patch.object(
-                self.m, "PROFILE_TEMPLATES", {"base": (["/"], ()), "work": (["~/dev/project"], ("search", "missing"))}):
-            index = self.m.init_profiles()
-            path = Path(self.m.PROFILES_DIR)
-            self.assertEqual(index["work"]["servers"], ["notes", "search"])
-            self.assertEqual(index["base"]["servers"], ["notes"])
-            original = (path / "base.json").read_bytes()
-            with self.assertRaisesRegex(ValueError, "already exist"):
-                self.m.init_profiles()
-            self.assertEqual((path / "base.json").read_bytes(), original)
-            self.m.init_profiles(force=True)
-            for file in path.glob("*.json"):
-                self.assertEqual(file.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
-            definitions = json.loads((path / "base.json").read_text())["mcpServers"]
-            self.assertEqual(definitions["notes"], self.fx.definitions["notes"])
-            self.assertEqual(before, self.fx.config.read_bytes())
-        # Exercise the actual CLI templates too; a second init cannot silently overwrite.
+        index = self.m.init_profiles()
+        path = Path(self.m.PROFILES_DIR)
+        self.assertEqual(index, {"base": {"folders": ["/"], "servers": ["notes", "remote", "search"], "strict": False}})
+        original = (path / "base.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "already exist"):
+            self.m.init_profiles()
+        self.assertEqual((path / "base.json").read_bytes(), original)
+        self.m.init_profiles(force=True)
+        for file in path.glob("*.json"):
+            self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+        definitions = json.loads((path / "base.json").read_text())["mcpServers"]
+        self.assertEqual(definitions, self.fx.definitions)
+        self.assertEqual(before, self.fx.config.read_bytes())
         self.assertNotEqual(self.cli("profiles", "init").returncode, 0)
         self.assertEqual(self.cli("profiles", "init", "--force").returncode, 0)
         self.assertFalse((self.fx.home / ".zshrc").exists())
+
+    def test_import_starters_filters_servers_defaults_additive_and_refuses_overwrite(self):
+        starter = self.fx.root / "starter.json"
+        data = {"base": {"folders": ["/"], "servers": ["notes", "missing", "notes"]},
+                "project": {"folders": [str(self.fx.work)], "servers": ["remote"], "strict": True}}
+        starter.write_text(json.dumps(data))
+        before = starter.read_bytes(), self.fx.config.read_bytes()
+        result = self.cli("profiles", "init", "--from", str(starter))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(self.fx.secret, result.stdout + result.stderr)
+        index = self.m.profile_index()
+        self.assertEqual(index["base"], {"folders": ["/"], "servers": ["notes"], "strict": False})
+        self.assertTrue(index["project"]["strict"])
+        files = {p: p.read_bytes() for p in Path(self.m.PROFILES_DIR).glob("*.json")}
+        self.assertNotEqual(self.cli("profiles", "init", "--from", str(starter)).returncode, 0)
+        self.assertTrue(all(p.read_bytes() == content for p, content in files.items()))
+        self.assertEqual(self.cli("profiles", "init", "--from", str(starter), "--force").returncode, 0)
+        self.assertTrue(all(p.stat().st_mode & 0o777 == 0o600 for p in files))
+        self.assertEqual(before, (starter.read_bytes(), self.fx.config.read_bytes()))
+
+    def test_import_invalid_starters_never_writes_or_prints_values(self):
+        starter = self.fx.root / "starter.json"
+        for data in ([self.fx.secret], {"base": {"folders": ["/"], "servers": [self.fx.secret], "strict": "yes"}},
+                     {"profiles": {"folders": ["/"], "servers": []}},
+                     {"../escape": {"folders": ["/"], "servers": []}}):
+            starter.write_text(json.dumps(data))
+            result = self.cli("profiles", "init", "--from", str(starter))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn(self.fx.secret, result.stdout + result.stderr)
+            self.assertFalse(Path(self.m.PROFILES_DIR).exists())
+
+    def test_index_strict_defaults_false_and_doctor_warns_each_strict_profile(self):
+        directory, index = self.fx.profiles()
+        del index["project"]["strict"]
+        (directory / "profiles.json").write_text(json.dumps(index))
+        self.assertFalse(self.m.profile_index()["project"]["strict"])
+        self.assertNotIn("--strict-mcp-config", json.loads(self.cli("claude", "prompt").stdout))
+        self.m.init_profiles(force=True)
+        index.update(self.m.profile_index())
+        for row in index.values():
+            row["strict"] = True
+        (directory / "profiles.json").write_text(json.dumps(index))
+        result = self.cli("profiles", "doctor")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in index:
+            self.assertIn(name + ": warning: strict drops claude.ai connectors, plugin and project servers", result.stdout)
 
     def test_doctor_reports_removed_and_unassigned_servers(self):
         self.fx.profiles()
@@ -325,6 +388,35 @@ class Usage(Base):
         with self.assertRaises(self.m.ToolError):
             self.m.find_skill({"tools": data}, "local", "/elsewhere")
 
+    def test_plugin_scopes_and_project_paths_limit_skill_resolution(self):
+        plugin = self.fx.root / "plugin"
+        skill = plugin / "skills/check/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("# Check\n")
+        registry = self.fx.home / ".claude/plugins/installed_plugins.json"
+        registry.parent.mkdir(parents=True)
+        registry.write_text(json.dumps({"plugins": {
+            "global@market": [{"installPath": str(plugin), "scope": "user"}],
+            "scoped@market": [{"installPath": str(plugin), "scope": scope, "projectPath": str(folder)}
+                              for scope, folder in (("project", self.fx.work), ("local", self.fx.root / "other"))],
+            "invalid@market": [{"installPath": str(plugin), "scope": "project"}],
+        }}))
+        data = self.usage.fetch(self.now)
+        model = {"tools": data}
+        self.assertEqual([r["name"] for r in data["skills"]], ["global:check", "scoped:check"])
+        self.assertEqual(self.m.find_skill(model, "global:check", "/elsewhere")[1]["scope"], "user")
+        for scope, folder in (("project", self.fx.work), ("local", self.fx.root / "other")):
+            location = self.m.find_skill(model, "scoped:check", str(folder / "src"))[1]
+            self.assertEqual(location["scope"], scope)
+            self.assertEqual(location["projectPath"], str(folder))
+            self.assertEqual(location["folder"], str(folder))
+        link = self.fx.root / "linked"
+        link.symlink_to(self.fx.work, target_is_directory=True)
+        self.assertEqual(self.m.find_skill(model, "scoped:check", str(link))[1]["scope"], "project")
+        for folder in ("", "/elsewhere", str(self.fx.work) + "-other"):
+            with self.assertRaises(self.m.ToolError):
+                self.m.find_skill(model, "scoped:check", folder)
+
     def test_process_cost_counts_launcher_tree_once_and_rejects_ambiguous(self):
         def proc(parent, command, rss):
             return {"ppid": parent, "etime": "01:00", "command": command, "rss": rss}
@@ -399,6 +491,23 @@ class LeversAndViews(Base):
                             service=SimpleNamespace(model=self.model, prefer=None))
         self.app = m.App(self.fleet, self.quota, self.terminals, None, [str(fx.bin)], True)
 
+    def add_server_copy(self):
+        self.fleet.procs[12] = dict(self.fleet.procs[11])
+        # Mutate the published list as well as the ps fixture: reviewed snapshots must be independent.
+        data = self.fleet.tools.model(self.fleet.procs, list(self.fleet.sessions.values()), self.now)
+        row = next(r for r in self.model["tools"]["servers"] if r["name"] == "notes")
+        fresh = next(r for r in data["servers"] if r["name"] == "notes")
+        row["processes"][:] = fresh["processes"]
+        row["copies"] = fresh["copies"]
+
+    def confirming_server(self, **kwargs):
+        with mock.patch.dict(os.environ, {"ATC_MCP_LEVERS": "confirm"}):
+            return self.m.McpServer(self.ck, "http", **kwargs)
+
+    def restart_call(self, server, ctx=None, **extra):
+        ctx = ctx or {"modern": True, "caps": {"elicitation": {"form": {}}}, "client": None}
+        return server.call_tool(dict(name="atc_restart_server", arguments={"server": "notes"}, **extra), ctx, "other-id")
+
     def test_tools_tab_rendering_at_narrow_and_wide_sizes_is_cached(self):
         m, app = self.m, self.app
         self.assertIn(("7", "tools", "Tools"), m.visible_tabs(self.model, app.ui))
@@ -456,6 +565,44 @@ class LeversAndViews(Base):
         with self.assertRaisesRegex(m.ToolError, "idle session"):
             m.tool_run_skill(self.ck, args, m.Call())
 
+    def test_herdr_skill_run_rechecks_herdr_instead_of_claude_feed(self):
+        m = self.m
+        self.fleet.herdr = m.Herdr(["fake-herdr"], background=False)
+        view = m.herdr_view({"pane_id": "pane-1", "agent_status": "idle", "cwd": str(self.fx.work)}, self.now)
+        self.model["groups"]["waiting"].append(view)
+        args = {"skill": "review", "session": view["sid"]}
+        for status in ("blocked", "working", None, "idle"):
+            with self.subTest(status=status):
+                lever = m.tool_run_skill(self.ck, args, m.Call())
+                agents = [{"pane_id": "pane-1", "agent_status": status}] if status else []
+                responses = [(0, "status: running", ""), (0, json.dumps({"result": {"agents": agents}}), "")]
+                with mock.patch.object(m, "run", side_effect=responses) as run, mock.patch.object(
+                        self.fleet.herdr, "act", return_value="type: done (herdr)") as act:
+                    ok, _ = lever.run()
+                    self.assertEqual(ok, status == "idle")
+                    self.assertEqual(run.call_args_list, [mock.call(["fake-herdr", "status", "server"], timeout=10),
+                                                         mock.call(["fake-herdr", "agent", "list"], timeout=10)])
+                    if status == "idle":
+                        act.assert_called_once_with("pane-1", "type", "/review")
+                    else:
+                        act.assert_not_called()
+        self.fleet.feed.status_now.assert_not_called()
+        self.terminals.act.assert_not_called()
+
+    def test_herdr_delivery_refuses_unavailable_or_failed_state_refresh(self):
+        m = self.m
+        self.fleet.herdr = m.Herdr(["fake-herdr"], background=False)
+        view = m.herdr_view({"pane_id": "pane-1", "agent_status": "idle"}, self.now)
+        for responses in ([(1, "status: stopped", "")],
+                          [(0, "status: running", ""), (1, "", "failed")]):
+            self.fleet.herdr.agents = [{"pane_id": "pane-1", "agent_status": "idle"}]
+            with mock.patch.object(m, "run", side_effect=responses), mock.patch.object(self.fleet.herdr, "act") as act:
+                ok, text = m.deliver(self.fleet, self.terminals, view, "message")
+                self.assertFalse(ok)
+                self.assertIn("recheck Herdr", text)
+                act.assert_not_called()
+        self.fleet.feed.status_now.assert_not_called()
+
     def test_skill_picker_cancel_and_state_change_on_confirmation(self):
         app = self.app
         app.handle("7", self.model)
@@ -505,6 +652,137 @@ class LeversAndViews(Base):
             self.assertFalse(ok)
             self.assertNotIn(self.fx.secret, text)
             kill.assert_not_called()
+
+    def test_restart_mcp_confirmation_only_stops_the_reviewed_snapshot(self):
+        m = self.m
+        server = self.confirming_server()
+        with mock.patch.object(m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+            question = self.restart_call(server)
+            self.assertEqual(question["resultType"], "input_required")
+            self.add_server_copy()
+            answer = self.restart_call(server, requestState=question["requestState"],
+                                       inputResponses={"confirm": {"action": "accept"}})
+            self.assertFalse(answer["isError"], answer)
+            kill.assert_called_once_with(11, m.signal.SIGTERM)
+            replay = self.restart_call(server, requestState=question["requestState"],
+                                       inputResponses={"confirm": {"action": "accept"}})
+            self.assertEqual(replay["resultType"], "input_required")
+            self.assertIn("2 copies", replay["inputRequests"]["confirm"]["params"]["message"])
+            kill.assert_called_once()
+        state = server.read_state(replay["requestState"], "atc_restart_server", {"server": "notes"}, "other-id")
+        self.assertNotIn("/opt/example/notes.js", json.dumps(state))
+        self.assertNotIn(self.fx.secret, json.dumps(state))
+
+    def test_restart_same_pid_new_start_or_command_requires_new_confirmation(self):
+        m = self.m
+        for change in ({"etime": "00:01"}, {"command": "node /opt/example/notes.js --changed"}):
+            with self.subTest(change=change):
+                original = dict(self.fleet.procs[11])
+                server = self.confirming_server()
+                question = self.restart_call(server)
+                self.fleet.procs[11].update(change)
+                self.model["tools"] = self.fleet.tools.model(self.fleet.procs, list(self.fleet.sessions.values()), self.now)
+                with mock.patch.object(m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+                    answer = self.restart_call(server, requestState=question["requestState"],
+                                               inputResponses={"confirm": {"action": "accept"}})
+                    self.assertTrue(answer["isError"])
+                    self.assertIn("changed", answer["content"][0]["text"])
+                    kill.assert_not_called()
+                self.fleet.procs[11] = original
+                self.model["tools"] = self.fleet.tools.model(self.fleet.procs, list(self.fleet.sessions.values()), self.now)
+
+    def test_restart_pending_approval_without_snapshot_requires_new_question(self):
+        m = self.m
+        self.ck.approvals = m.Approvals()
+        args = {"server": "notes"}
+        lever = m.tool_restart_server(self.ck, args, m.Call())
+        row = self.ck.approvals.create("atc_restart_server", args, lever.summary, "other-id", "fixture")
+        self.ck.approvals.decide(row["id"], "approve", "owner", "terminal")
+        with mock.patch.object(m.os, "kill") as kill:
+            result = self.confirming_server().call_tool(
+                {"name": "atc_restart_server", "arguments": dict(args, approval=row["id"])},
+                {"modern": True, "caps": {}, "client": None}, "other-id")
+            self.assertTrue(result["isError"])
+            self.assertIn("no process snapshot", result["content"][0]["text"])
+            kill.assert_not_called()
+
+    def test_restart_pending_approval_binds_snapshot_for_wait_and_retry(self):
+        m = self.m
+        self.ck.approvals = m.Approvals()
+        ctx = {"modern": True, "caps": {}, "client": None}
+        for wait in (False, True):
+            with self.subTest(wait=wait):
+                self.fleet.procs.pop(12, None)
+                self.model["tools"] = self.fleet.tools.model(self.fleet.procs, list(self.fleet.sessions.values()), self.now)
+                server = self.confirming_server()
+
+                def approve(row, args):
+                    self.add_server_copy()
+                    self.ck.approvals.decide(row["id"], "approve", "owner", "terminal")
+
+                with mock.patch.object(m, "approval_wait", return_value=0), mock.patch.object(
+                        m, "notify_approval", side_effect=approve if wait else None), mock.patch.object(
+                        m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+                    result = self.restart_call(server, ctx)
+                    row = self.ck.approvals.access()[-1]
+                    self.assertEqual([p["pid"] for p in row["snapshot"]], [11])
+                    if not wait:
+                        kill.assert_not_called()
+                        approve(row, {})
+                        result = server.call_tool({"name": "atc_restart_server",
+                                                   "arguments": {"server": "notes", "approval": row["id"]}}, ctx, "other-id")
+                    self.assertFalse(result["isError"], result)
+                    kill.assert_called_once_with(11, m.signal.SIGTERM)
+
+    def test_restart_legacy_question_retains_snapshot(self):
+        m = self.m
+
+        def ask(question):
+            self.assertIn("1 copies", question["message"])
+            self.add_server_copy()
+            return {"action": "accept"}
+
+        server = self.confirming_server(ask=ask)
+        ctx = {"modern": False, "caps": {"elicitation": {}}, "version": "2025-11-25", "client": None}
+        with mock.patch.object(m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+            result = self.restart_call(server, ctx)
+            self.assertFalse(result["isError"], result)
+            kill.assert_called_once_with(11, m.signal.SIGTERM)
+
+    def test_restart_screen_retains_reviewed_snapshot_between_presses(self):
+        m, app = self.m, self.app
+        app.dry_run = False
+        app.handle("7", self.model)
+        app.ui["selected"] = "server::notes"
+        with mock.patch.object(m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+            app.handle("x", self.model)
+            self.add_server_copy()
+            app.handle("x", self.model)
+            kill.assert_called_once_with(11, m.signal.SIGTERM)
+
+    def test_web_restart_preview_is_bound_single_use_and_required(self):
+        m = self.m
+        self.terminals.dry_run = False
+        service = m.Service(self.fleet, self.quota, [], self.terminals, background=False, writes=True,
+                            claude_cmd=[str(self.fx.bin)], route_cmd=None)
+        service.model, service.at = self.model, self.now
+        for transport in ("web", "peer"):
+            with self.subTest(transport=transport):
+                self.fleet.procs.pop(12, None)
+                self.model["tools"] = self.fleet.tools.model(self.fleet.procs, list(self.fleet.sessions.values()), self.now)
+                with mock.patch.object(m, "process_table", return_value=self.fleet.procs), mock.patch.object(m.os, "kill") as kill:
+                    body = {"arguments": {"server": "notes"}}
+                    self.assertFalse(service.run_tool(transport, "atc_restart_server", body, "other-id")["ok"])
+                    preview = service.run_tool(transport, "atc_restart_server",
+                                               {"arguments": {"server": "notes", "dry_run": True}}, "other-id")
+                    self.assertTrue(preview["ok"], preview)
+                    self.add_server_copy()
+                    body["requestState"] = preview["requestState"]
+                    result = service.run_tool(transport, "atc_restart_server", body, "other-id")
+                    self.assertTrue(result["ok"], result)
+                    kill.assert_called_once_with(11, m.signal.SIGTERM)
+                    self.assertFalse(service.run_tool(transport, "atc_restart_server", body, "other-id")["ok"])
+                    kill.assert_called_once()
 
     def test_mcp_confirms_skill_run_and_supports_tools_with_levers_disabled(self):
         m = self.m

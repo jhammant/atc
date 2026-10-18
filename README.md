@@ -70,7 +70,11 @@ in user/project `.claude/skills`, `~/.agents/skills` and Claude's installed plug
 **x x** sends SIGTERM to its matched copies. The sessions reconnect, or need `/mcp` to reconnect. Actions have
 dry runs, use the existing confirmation/audit path, and refuse the calling session unless explicitly allowed
 through MCP. Skill runs use `deliver()` and recheck idle/blocked state under its delivery lock. Restarts recheck
-command, session ownership and start time against fresh `ps` output; changed processes require a new confirmation.
+command, session ownership and start time against fresh `ps` output. Each confirmation holds the reviewed
+process snapshot: a new copy is never included by an earlier approval; changed processes require a new
+confirmation. Web/peer tool callers must return the restart dry-run preview's `requestState` when confirming;
+it is single use. The web Tools view remains read-only. Herdr-only targets recheck their state through Herdr. Plugin skills retain their installation
+scope and project folder, so project/local skills can only run in sessions under that folder.
 
 Profiles are opt-in. Nothing modifies `~/.claude.json`, shell files or the native Claude executable. Create and
 review them yourself:
@@ -84,36 +88,43 @@ atc profiles doctor
 atc claude --dry-run --resume session-id
 ```
 
-`init` writes `~/.config/atc/profiles/profiles.json` and one `<name>.json` per starting profile, all mode `0600`
+`init` creates one generic `base` profile with folders `["/"]`, all current user-scope servers, and `strict: false`.
+It writes `~/.config/atc/profiles/profiles.json` and one `<name>.json` per profile, all mode `0600`
 in a `0700` directory. It refuses existing files unless `--force` is supplied. Definitions are copied verbatim
 from the current user-scope configuration, including credentials only inside the private profile files.
-Only servers that exist are included. The starting set uses a base everywhere; company areas add their work
-servers and research tools; personal/family add mail; utilities/homeserver/skills add their workspace tool.
-Reusable-idea tools stay in the base. The roadmap's headquarters area also gets its research tool. No prompt
-nudges, workspace overrides or credentials are invented: configure area-specific workspaces in the private files
-before enabling profiles if your server requires them. Regenerate deliberately when source credentials change.
+To import your own starter set, use `atc profiles init --from starter.json` (add `--force` to replace existing
+profiles). The starter file uses the index format below; only server names that exist in the user-scope
+configuration are included. Omitted `strict` defaults to `false`. The starter contains names and folders,
+not server definitions or credentials. Regenerate deliberately when source credentials change.
 
 Edit the index and matching profile files by hand to customize them. Example index (no TOML):
 
 ```json
 {
-  "base": {"folders": ["/"], "servers": ["notes"], "strict": true},
-  "project": {"folders": ["~/dev/project"], "servers": ["notes", "search"], "strict": true}
+  "base": {"folders": ["/"], "servers": ["notes"], "strict": false},
+  "project": {"folders": ["~/dev/project"], "servers": ["notes", "search"], "strict": false}
 }
 ```
 
 Longest folder prefix wins on path boundaries, with `~` and symlinks resolved. Equal prefixes use the
-alphabetically first profile. Each profile is a complete server list, not an overlay. `show` prints server names
+alphabetically first profile. Profiles do not inherit from each other. `show` prints server names
 only. `which` explains the selected list; `doctor` lists deleted servers, servers in no profile, and unreadable
-or inconsistent files. Profile file server names must agree with the index. Files must be regular, nonsymlink
+or inconsistent files, and warns for each strict profile. Strict warnings alone do not make `doctor` fail.
+Profile file server names must agree with the index. Files must be regular, nonsymlink
 files with mode `0600`. Malformed/unreadable profiles fall through unchanged.
 
 `atc claude [args...]` finds the real executable on PATH, skipping itself; `ATC_CLAUDE` overrides it. It prepends
-`--mcp-config <file>` and, for strict profiles, `--strict-mcp-config`, then preserves the original arguments in
-order. `atc claude --dry-run [args...]` prints the shell-quoted argv, never server definitions. The leading
+`--mcp-config=<file>` and, for strict profiles, `--strict-mcp-config`, then preserves the original arguments in
+order. The attached value keeps positional prompts out of Claude's variadic `--mcp-config` option.
+`atc claude --dry-run [args...]` prints the shell-quoted argv, never server definitions. The leading
 `--dry-run` belongs to atc. `ATC_PROFILES=off`, no match, unavailable profile, `claude mcp ...`, `claude update`,
 `--version`/`-v` and `-p`/`--print` all pass through unchanged. This keeps scripts and hooks on the full setup.
-Strict profiles also exclude other MCP configuration sources; review the list before enabling them.
+The default is additive (`strict: false`): other configured servers and connectors remain available, so
+selecting a smaller profile alone does not reduce the user-scope servers started in each session.
+Opting into `strict: true` passes `--strict-mcp-config`. Verified with Claude Code 2.1.290, this drops
+claude.ai connectors (Gmail, Drive, Calendar, Docs and others), plugin-provided MCP servers, the folder's
+project `.mcp.json` servers, and every user-scope server not listed in the profile, including atc itself if
+omitted. Review those losses before enabling strict mode to reduce running servers.
 
 To opt in manually, add this zsh function (the updater-managed binary remains untouched):
 
