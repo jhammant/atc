@@ -437,3 +437,40 @@ test("Jobs and Later coexist in navigation and keep their needs cards separate",
   assert.match(html, /href="#jobs"[^>]*data-view="jobs"/);
   assert.match(html, /href="#later"[^>]*data-view="later"/);
 });
+
+test("Tools renders server costs, windows, areas and skills as text with no levers", async () => {
+  const data = {...model(), tools: {scanned_at: 100, servers: [
+    {name: "notes<script>", copies: 3, rss_kb: 6144, calls_7d: 2, calls_30d: 9, last_used: 100,
+      areas: ["/workspace/project", "<img src=x>"], configured: true, transport: "stdio"},
+    {name: "remote", copies: 0, rss_kb: 0, calls_7d: 0, calls_30d: 0, last_used: null,
+      areas: [], configured: true, transport: "http"},
+  ], skills: [{name: "review", uses: 4, last_used: 100}, {name: "unused", uses: 0, last_used: null}]}};
+  const p = page(async () => response(200, data), {}, "#tools");
+  await p.settled();
+  const content = descendants(p.get("content"));
+  const text = content.map((n) => n.textContent).join("\n");
+  assert.equal(p.get("view-title").textContent, "Tools");
+  assert.match(text, /3 copies · 6.0 MiB RSS · 2 calls in 7d · 9 in 30d/);
+  assert.match(text, /4 uses in retained history/);
+  assert.match(text, /Last used: never/);
+  assert.match(text, /Remote transport/);
+  assert.ok(content.some((n) => n.textContent === "notes<script>" && n.tag === "h3"));
+  assert.ok(content.some((n) => n.textContent.includes("<img src=x>") && n.tag === "p"));
+  assert.equal(content.filter((n) => n.tag === "button").length, 0);
+  data.tools.servers[0].copies = 1;
+  await p.tick();
+  assert.match(descendants(p.get("content")).map((n) => n.textContent).join("\n"), /1 copies/);
+});
+
+test("Tools distinguishes its initial scan, empty data and read errors", async () => {
+  const data = model();
+  const p = page(async () => response(200, data), {}, "#tools");
+  await p.settled();
+  const text = () => descendants(p.get("content")).map((n) => n.textContent).join("\n");
+  assert.match(text(), /Reading tool usage/);
+  data.tools = {scanned_at: 1, servers: [], skills: [], error: "Some transcripts could not be read."};
+  await p.tick();
+  assert.match(text(), /No configured servers or skill usage found/);
+  assert.match(text(), /Some transcripts could not be read/);
+  assert.doesNotMatch(text(), /Reading tool usage/);
+});

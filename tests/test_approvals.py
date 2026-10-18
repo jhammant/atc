@@ -367,7 +367,7 @@ except m['WebError']:
         for name in ("atc_approve", "atc_deny", "approve", "deny"):
             with self.assertRaises(self.m.BadParams):
                 self.call(name=name)
-        self.assertEqual(len(self.m.TOOLS), 21)
+        self.assertEqual(len(self.m.TOOLS), 25)
 
     def test_cli_listing_tty_rule_and_real_subprocess_refusal(self):
         row = self.pending()

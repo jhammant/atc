@@ -42,14 +42,96 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 - **Quota** (with [quotamax](https://github.com/jhammant/quotamax)): Claude, Codex, Kimi, DeepSeek, and the
   swarm cap that sessions check before fanning out
 
+## Tools and folder profiles
+
+**7 Tools** shows this machine's user-scope MCP servers, copies running, resident memory (MiB), calls in the
+last 7 and 30 days, last use and areas that used them in 30 days. Skills show uses across retained transcript
+history and last use, including installed skills with zero uses. These are resource and usage measurements,
+not monetary estimates. Low usage is information, not a recommendation to disable a tool.
+
+The scanner reads `~/.claude.json` and Claude transcripts, including subagent transcripts, in a background
+thread every 30 seconds. Its in-memory cache tracks file identity, size, mtime and read offsets; unchanged
+files are not reparsed, appended records are read incrementally, and replaced/truncated files are recounted.
+Restarting atc rebuilds the cache. Partial lines wait for the next poll. Duplicate tool-use ids within a file
+count once. Only `mcp__<server>__<tool>` and `Skill` calls count; reading a skill file directly does not.
+Areas are `~/dev/<area>` (or the first folder under home/filesystem root), taken from transcript cwd; unknown
+folders are labelled unknown. The view remains local even with `--here` or remote hosts configured.
+
+Copies are matched by configured command/arguments under live Claude processes, with npm package paths
+recognized after the launcher starts Node. A launcher's child tree contributes RSS to one copy. Ambiguous
+matches are excluded; unrecognized launchers can undercount. RSS includes shared pages, so it is not exclusive
+physical memory. HTTP/SSE servers have no local server process. Definitions, environment values and headers
+never appear in the Tools model or audit log. `--json` and `/api/fleet` include `tools`; the web **Tools** view
+is read-only. MCP offers `atc_tools`, `atc_open_skill`, `atc_run_skill` and `atc_restart_server`.
+
+On a skill row, **Enter** opens its `SKILL.md` in a new terminal tab with `less`. **r** offers local idle sessions;
+use arrows to choose, Enter to review, then Enter to confirm (Escape cancels). Installed skills are discovered
+in user/project `.claude/skills`, `~/.agents/skills` and Claude's installed plugin registry. On a server row,
+**x x** sends SIGTERM to its matched copies. The sessions reconnect, or need `/mcp` to reconnect. Actions have
+dry runs, use the existing confirmation/audit path, and refuse the calling session unless explicitly allowed
+through MCP. Skill runs use `deliver()` and recheck idle/blocked state under its delivery lock. Restarts recheck
+command, session ownership and start time against fresh `ps` output; changed processes require a new confirmation.
+
+Profiles are opt-in. Nothing modifies `~/.claude.json`, shell files or the native Claude executable. Create and
+review them yourself:
+
+```bash
+atc profiles init
+atc profiles list
+atc profiles which ~/dev/project
+atc profiles show base
+atc profiles doctor
+atc claude --dry-run --resume session-id
+```
+
+`init` writes `~/.config/atc/profiles/profiles.json` and one `<name>.json` per starting profile, all mode `0600`
+in a `0700` directory. It refuses existing files unless `--force` is supplied. Definitions are copied verbatim
+from the current user-scope configuration, including credentials only inside the private profile files.
+Only servers that exist are included. The starting set uses a base everywhere; company areas add their work
+servers and research tools; personal/family add mail; utilities/homeserver/skills add their workspace tool.
+Reusable-idea tools stay in the base. The roadmap's headquarters area also gets its research tool. No prompt
+nudges, workspace overrides or credentials are invented: configure area-specific workspaces in the private files
+before enabling profiles if your server requires them. Regenerate deliberately when source credentials change.
+
+Edit the index and matching profile files by hand to customize them. Example index (no TOML):
+
+```json
+{
+  "base": {"folders": ["/"], "servers": ["notes"], "strict": true},
+  "project": {"folders": ["~/dev/project"], "servers": ["notes", "search"], "strict": true}
+}
+```
+
+Longest folder prefix wins on path boundaries, with `~` and symlinks resolved. Equal prefixes use the
+alphabetically first profile. Each profile is a complete server list, not an overlay. `show` prints server names
+only. `which` explains the selected list; `doctor` lists deleted servers, servers in no profile, and unreadable
+or inconsistent files. Profile file server names must agree with the index. Files must be regular, nonsymlink
+files with mode `0600`. Malformed/unreadable profiles fall through unchanged.
+
+`atc claude [args...]` finds the real executable on PATH, skipping itself; `ATC_CLAUDE` overrides it. It prepends
+`--mcp-config <file>` and, for strict profiles, `--strict-mcp-config`, then preserves the original arguments in
+order. `atc claude --dry-run [args...]` prints the shell-quoted argv, never server definitions. The leading
+`--dry-run` belongs to atc. `ATC_PROFILES=off`, no match, unavailable profile, `claude mcp ...`, `claude update`,
+`--version`/`-v` and `-p`/`--print` all pass through unchanged. This keeps scripts and hooks on the full setup.
+Strict profiles also exclude other MCP configuration sources; review the list before enabling them.
+
+To opt in manually, add this zsh function (the updater-managed binary remains untouched):
+
+```zsh
+claude() { atc claude "$@"; }
+```
+
+Revert for the current shell with `unfunction claude`; remove that line from the shell file for future shells.
+Alternatively, `export ATC_PROFILES=off` disables profile selection immediately.
+
 ## Levers
 
-The live screen starts with **1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota**.
+The live screen starts with **1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota · 7 Tools**.
 Tabs appear when their first content arrives and stay available until you quit; their numbers stay fixed.
 Sessions keeps the local session list, swarms, other agents, Later and closed sessions. Needs shows the shared
 queue, including approvals. Agents holds hierarchy and comms; Jobs holds jobs and apps; Servers holds each
 host's sessions and processes. Quota expands every provider, the swarm cap and its pin, and quotamax's advice.
-The Tools tab will arrive with the tools feature. `--once`, `--tree`, `--comms` and `--json` keep their existing output.
+Tools shows MCP resource use and skill usage. `--json` adds `tools`; `--once`, `--tree` and `--comms` keep their existing output.
 
 Press `:` for the command palette. Type words to filter actions, use arrows to choose, and Enter to run.
 For example, `jump beta` finds that session, `message beta` opens its message input, and `run /status` previews
@@ -63,7 +145,7 @@ the tab bar scrolls to keep the active tab visible.
 
 | Key | Does |
 |---|---|
-| `1`–`6` / `←` `→` | Select a tab by its fixed number, or cycle available tabs |
+| `1`–`7` / `←` `→` | Select a tab by its fixed number, or cycle available tabs |
 | `:` | Open the command palette; type to filter, `↑` `↓` choose, `enter` runs, `esc` cancels |
 | `enter` | Jump to the session's terminal tab (iTerm2, Terminal.app, tmux, Herdr). A background session opens attached in a new tab |
 | `enter` on a subagent | Drill in: who started it, its task, every step it took, its report, its own helpers |
@@ -273,6 +355,10 @@ claude mcp add --transport http --scope user atc https://atc.example.ts.net/mcp 
 | `atc_fleet` | Every session by state (blocked, waiting, working, parked, background, other), swarms, other agents, servers | `atc --once` |
 | `atc_needs_me` | The ordered needs-you queue on every machine, including a-mail counts and where to answer | Needs you |
 | `atc_later` | Wake-ups, next cron runs and plug-in items, ordered by time across machines | Later |
+| `atc_tools` | Local MCP copies, RSS, calls in 7/30 days, areas and skill usage | Tools |
+| `atc_open_skill` | Open an installed SKILL.md in a new tab | Enter on a skill |
+| `atc_run_skill` | Run a skill in a chosen idle session, with confirmation | `r` on a skill |
+| `atc_restart_server` | SIGTERM matched server copies and workers, after rechecking ownership | `x x` on a server |
 | `atc_jobs` | Loom jobs and apps, per host; optional job status and recent log | Jobs & apps / Enter |
 | `atc_run_job` | Trigger a known loom job now, with confirmation and audit | `x x` on a job |
 | `atc_session` | One session: folder, state, what it is doing and said, git, helpers and workflow phases, worker processes, recent steps | `enter`, the bottom panel |

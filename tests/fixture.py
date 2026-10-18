@@ -485,7 +485,7 @@ class AmailFixture(Fixture):
         self.write_registry()
         self.write_transcripts()
         self.write_agents_json()
-        processes = "".join(f"{s['pid']} 1 ? 02:00 claude --resume {s['sid']}\n" for s in self.sessions.values())
+        processes = "".join(f"{s['pid']} 1 ? 02:00 10240 claude --resume {s['sid']}\n" for s in self.sessions.values())
         for name, body in (("claude", STUB_CLAUDE), ("ps", '''#!/usr/bin/env python3
 import os
 with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
@@ -632,7 +632,7 @@ with open(os.path.join(os.path.dirname(__file__), "processes.txt")) as fh:
     def write_processes(self):
         with open(os.path.join(self.stub, "processes.txt"), "w", encoding="utf-8") as fh:
             for pid, proc in self.table.items():
-                fh.write(f"{pid} {proc['ppid']} ? {proc['etime']} {proc['command']}\n")
+                fh.write(f"{pid} {proc['ppid']} ? {proc['etime']} {proc.get('rss', 1024)} {proc['command']}\n")
 
     def env(self, **extra):
         return {**os.environ, "HOME": os.path.join(self.root, "home"), "CLAUDE_CONFIG_DIR": self.claude_home,

@@ -574,6 +574,9 @@ class Tiny(unittest.TestCase):
 def tabs_fixture():
     fx = fixture.AmailFixture()
     fx.write_closed_transcript()
+    skill = Path(fx.env()["HOME"], ".claude", "skills", "review", "SKILL.md")
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text("# Review\nA fixture skill.\n")
     swarm = fixture.SwarmFixture()
     try:
         status = swarm.status("release", "release-swarm", state="done")
@@ -588,7 +591,7 @@ def tabs_fixture():
         path.write_text(body)
         path.chmod(0o755)
     with open(os.path.join(fx.stub, "processes.txt"), "a") as fh:
-        fh.write("900 1 ? 02:00 codex exec fixture-worker\n")
+        fh.write("900 1 ? 02:00 1024 codex exec fixture-worker\n")
     server = {"machine": "server1", "counts": {"working": 1}, "groups": {"working": [
         {"sid": "remote-session", "name": "server-session", "group": "working", "state": "busy",
          "doing": "Building on server", "cwd": "/tmp/project"}]}, "agents": []}
@@ -917,7 +920,7 @@ class Tabs(unittest.TestCase):
 
     def test_01_tab_numbers_arrows_content_and_selection(self):
         s = self.s
-        self.assertEqual(s.lines()[0].strip(), "1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota")
+        self.assertEqual(s.lines()[0].strip(), "1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota · 7 Tools")
         s.select("beta-22")
         s.press("2")
         s.wait_for("── Needs you")
@@ -939,8 +942,13 @@ class Tabs(unittest.TestCase):
         for needle in ("Codex (test)", "DeepSeek", "parallelism: 4", "Swarm cap", "auto"):
             self.assertIn(needle, s.text())
         s.press("Right")
+        s.wait_for("── Tools")
+        self.assertIn("Skills", s.text())
+        s.press("Right")
         s.wait_for("── Blocked on you")
         self.assertIn("beta-22", s.selected_line())
+        s.press("Left")
+        s.wait_for("── Tools")
         s.press("Left")
         s.wait_for("── quotamax advice")
 
@@ -1036,7 +1044,23 @@ class Tabs(unittest.TestCase):
         finally:
             subprocess.run([TMUX, "resize-window", "-t", s.name, "-x", "160", "-y", "45"], check=True)
 
-    def test_08_slow_action_does_not_freeze_the_screen(self):
+    def test_08_tools_skill_picker_and_dry_run(self):
+        s = self.s
+        s.press("7")
+        s.wait_for("── Tools")
+        s.wait_for("review · 0 uses")
+        s.select("review")
+        s.press("r")
+        s.wait_for("Run /review in")
+        s.press("Enter")
+        s.wait_for("type /review into")
+        s.press("Escape")
+        s.wait_for("enter SKILL.md")
+        s.press("r", "Enter", "Enter")
+        s.wait_for("dry run: would type")
+        s.press("1")
+
+    def test_10_slow_action_does_not_freeze_the_screen(self):
         s = self.s
         route = Path(self.fx.stub, "route")
         original = route.read_text()

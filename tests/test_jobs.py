@@ -418,8 +418,8 @@ print("stalled daemon poll started", flush=True)
         self.assertFalse(result["isError"])
         self.assertTrue(self.service.mcp.call_tool(params, ctx, "owner-session")["isError"])
         self.assertEqual(self.fx.calls().count("loom jobs run crashed"), 1)
-        self.assertEqual(len(self.m.TOOLS), 21)
-        self.assertEqual(sum(not tool["lever"] for tool in self.m.TOOLS.values()), 9)
+        self.assertEqual(len(self.m.TOOLS), 25)
+        self.assertEqual(sum(not tool["lever"] for tool in self.m.TOOLS.values()), 10)
 
     def test_service_dry_run_reaches_shared_runner_after_approval(self):
         service = self.m.Service(self.fleet, None, [], self.m.Terminals(dry_run=True), writes=True,
