@@ -2668,14 +2668,20 @@ def deliver(fleet, terminals, v, text, dry_run=False):
     Returns (delivered, detail). The screen's m/M/C/F, the HTTP sink and MCP all come through here."""
     if v.get("kind") not in ("interactive", "herdr"):
         return False, "only live interactive sessions take messages (a background session: attach to it)"
-    status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
-    if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
-        return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
-    if v.get("herdr") and fleet.herdr:
-        result = (f"dry run: herdr agent prompt {v['herdr']} {shlex.quote(text)}" if dry_run
-                  else fleet.herdr.act(v["herdr"], "type", text))
-    else:
-        result = (Terminals(dry_run=True) if dry_run else terminals).act(v.get("tty"), "type", text)
+    target = "herdr:" + v["herdr"] if v.get("herdr") and fleet.herdr else "tty:" + (v.get("tty") or v["sid"])
+    directory = os.path.join(HOME, ".config", "atc", "delivery-locks")
+    private_dir(directory)
+    # Independent opens of a flock serialize threads and processes. Never unlink a target's lock file.
+    name = hashlib.sha256(target.encode()).hexdigest() + ".lock"
+    with web_file_lock(directory, name):
+        status = fleet.feed.status_now(v["sid"]) if fleet.feed and fleet.feed.cmd else v.get("status")
+        if (status or v.get("status")) in ("waiting", "blocked") or v.get("group") == "blocked":
+            return False, "blocked on a permission prompt or question: answer it there (typing would answer it)"
+        if v.get("herdr") and fleet.herdr:
+            result = (f"dry run: herdr agent prompt {v['herdr']} {shlex.quote(text)}" if dry_run
+                      else fleet.herdr.act(v["herdr"], "type", text))
+        else:
+            result = (Terminals(dry_run=True) if dry_run else terminals).act(v.get("tty"), "type", text)
     return result.startswith(("type: done", "dry run")), result
 
 
@@ -5336,7 +5342,11 @@ def job_key(host, name):
     return "job::" + urllib.parse.quote(host, safe="") + "::" + name
 
 
-def jobs_lines(model, width, expanded=False):
+def app_key(host, name):
+    return "app::" + urllib.parse.quote(host, safe="") + "::" + name
+
+
+def jobs_lines(model, width, expanded=False, select_apps=False):
     entries = model.get("jobs", {})
     if not entries:
         return []
@@ -5363,13 +5373,13 @@ def jobs_lines(model, width, expanded=False):
         for app in entry["apps"]:
             status = clean(app.get("status"))
             out.append(([("  app " + clean(app["name"]) + " · " + status + " · " + clean(app.get("health")),
-                          "busy" if status == "running" else "warn")], None))
+                          "busy" if status == "running" else "warn")], app_key(host, app["name"]) if select_apps else None))
         if not entry["jobs"] and not entry["apps"]:
             out.append(([("  No jobs or apps.", "dim")], None))
     return out
 
 
-def fleet_lines(model, width, show_all, jobs_all=False):
+def fleet_lines(model, width, show_all, jobs_all=False, sessions_only=False):
     """Every session row, grouped. Returns [(line, sid or None)]."""
     now, groups = model["now"], model["groups"]
     everyone = [v for g in groups.values() for v in g]
@@ -5384,6 +5394,8 @@ def fleet_lines(model, width, show_all, jobs_all=False):
         "other": ("Other", ""),
     }
     for key in ("blocked", "approvals", "waiting", "later", "needs", "working", "swarms", "agents", "jobs", "parked", "background", "other"):
+        if sessions_only and key in ("approvals", "needs", "jobs"):
+            continue
         if key == "later":
             items = [item for item in model.get("later", []) if item.get("in") is not None and item["in"] <= 86400]
             if items:
@@ -5419,7 +5431,8 @@ def fleet_lines(model, width, show_all, jobs_all=False):
                                  (" · " + clean(item["hint"]), "dim")], None))
             continue
         if key in ("blocked", "waiting"):
-            items = [item for item in model.get("needs", []) if item["kind"] == key]
+            items = [item for item in model.get("needs", []) if item["kind"] == key
+                     and (not sessions_only or item["host"] is None)]
             if items:
                 title, extra = titles[key]
                 out.append((rule(f"{title} ({len(items)})", width, extra), None))
@@ -5465,7 +5478,7 @@ def fleet_lines(model, width, show_all, jobs_all=False):
             out.append(([(f"{title} ({len(groups[key])}): ", "dim"), (names, "dim"), ("   p lists them", "dim")], None))
     if not everyone:
         out.append(([("No live Claude Code sessions found.", "dim")], None))
-    for h in model.get("hosts", []):
+    for h in ([] if sessions_only else model.get("hosts", [])):
         out += host_lines(h, width, name_w, needs_shown=True, now=now)
     closed = model.get("closed", [])
     if closed:
@@ -5568,11 +5581,15 @@ def resolve(fleet, model, key):
     ("remote", host, v) | ("closed", c) | ("approval", item) | (None,)."""
     if not key:
         return (None,)
-    if key.startswith("job::"):
+    if key.startswith("need::"):
+        item = next((n for n in model.get("needs", []) if need_key(n) == key), None)
+        return ("need", item) if item else (None,)
+    if key.startswith(("job::", "app::")):
+        kind = key[:3]
         host, _, name = key[5:].partition("::")
         host = urllib.parse.unquote(host)
-        job = next((j for j in model.get("jobs", {}).get(host, {}).get("jobs", []) if j["name"] == name), None)
-        return ("job", host, job) if job else (None,)
+        row = next((j for j in model.get("jobs", {}).get(host, {}).get(kind + "s", []) if j["name"] == name), None)
+        return (kind, host, row) if row else (None,)
     if key.startswith("approval::"):
         item = next((n for n in model.get("needs", []) if n["kind"] == "approval"
                      and n.get("id") == key[10:] and n["host"] is None), None)
@@ -5618,7 +5635,9 @@ def resolve(fleet, model, key):
 
 def selection_name(item):
     kind = item[0]
-    if kind == "job":
+    if kind == "need":
+        return clean(item[1]["title"])
+    if kind in ("job", "app"):
         return item[2]["name"] + " on " + item[1]
     if kind == "approval":
         return "Approval " + item[1]["id"]
@@ -5640,6 +5659,21 @@ def selection_name(item):
 def selection_lines(fleet, model, item, limit, width):
     """The bottom panel, or the full view, for whatever row is selected."""
     kind = item[0]
+    if kind == "app":
+        host, app = item[1], item[2]
+        details = ["App: " + app["name"], "Machine: " + host,
+                   "Status: " + clean(app.get("status")), "Health: " + clean(app.get("health"))]
+        if app.get("url"):
+            details.append("URL: " + clean(app["url"]))
+        lines = [[(line, "plain")] for text in details for line in wrap(text, width)]
+        return lines[:limit] if limit else lines
+    if kind == "need":
+        row = item[1]
+        details = [row["title"], row.get("summary") or row.get("detail"), row.get("hint")]
+        if row.get("host"):
+            details.insert(1, "On " + row["host"])
+        lines = [[(line, "plain")] for text in details if text for line in wrap(text, width)]
+        return lines[:limit] if limit else lines
     if kind == "job":
         host, job = item[1], item[2]
         detail = fleet.loom.details.get((host, job["name"])) if fleet.loom else None
@@ -6017,10 +6051,138 @@ def draw_tree(nodes, prefix=""):
 
 # ---------------------------------------------------------------- the screen
 
-KEYS = ("↑↓ select · enter jump/open · m msg · M broadcast · x x interrupt/stop · C close · F fork · N rename · "
-        "R restore · E exit · S save · D done · c comms · h tree · n task · +/- cap · tab · p · ? help · q quit")
+TABS = (("1", "sessions", "Sessions"), ("2", "needs", "Needs"), ("3", "agents", "Agents"),
+        ("4", "jobs", "Jobs"), ("5", "servers", "Servers"), ("6", "quota", "Quota"))
+
+# Tools can be added here when it has a view; existing tab numbers stay put.
+PALETTE_KEYS = (
+    ("jump / open selected row", "\n"), ("message selected session", "m"),
+    ("broadcast to this project", "M"), ("interrupt session / stop process / run job now", "x"),
+    ("close session (/closecode)", "C"), ("fork session (/forkcode)", "F"),
+    ("restore closed session", "R"), ("exit idle session", "E"), ("save and close session", "S"),
+    ("hide closed session (done)", "D"), ("rename session", "N"),
+    ("approve selected approval", "y"), ("deny selected approval", "n"), ("new task", "n"),
+    ("comms", "c"), ("hierarchy", "h"), ("help", "?"), ("quit / close view", "q"),
+    ("raise swarm cap", "+"), ("lower swarm cap", "-"), ("reset swarm cap to auto", "0"),
+    ("cycle bottom panel", "b"), ("fold / expand quiet rows", "p"),
+    ("select next row / scroll down", curses.KEY_DOWN), ("select previous row / scroll up", curses.KEY_UP),
+    ("scroll page down", curses.KEY_NPAGE), ("scroll page up", curses.KEY_PPAGE),
+    ("filter agents: all / selected session", "s"), ("close view / cancel", "\x1b"),
+    ("next tab", curses.KEY_RIGHT), ("previous tab", curses.KEY_LEFT),
+)
+
+
+def visible_tabs(model, ui):
+    """Keep a tab once seen, so draining a queue does not move the user's view."""
+    quota = model.get("quota")
+    content = {"sessions": True, "needs": bool(model.get("needs")),
+               "agents": bool(ordered_sessions(model, True) or model.get("agents") or model.get("swarms")
+                              or model.get("comms") or model.get("hosts")),
+               "jobs": any(entry.get("jobs") or entry.get("apps") or entry.get("error") or entry.get("apps_error")
+                           for entry in model.get("jobs", {}).values()), "servers": bool(model.get("hosts")),
+               "quota": bool(quota and (quota.data or quota.providers or quota.error))}
+    seen = set(ui.get("tabs", [])) | {tab for tab, present in content.items() if present}
+    ui["tabs"] = [tab for _, tab, _ in TABS if tab in seen]
+    return [entry for entry in TABS if entry[1] in seen]
+
+
+def tab_line(model, ui, width):
+    tabs = visible_tabs(model, ui)
+    active = ui.get("tab", "sessions")
+    # Slide the bar on small terminals so the current tab is always visible.
+    start = 0
+    picked = next((i for i, (_, tab, _) in enumerate(tabs) if tab == active), 0)
+    while start < picked and len(" · ".join(n + " " + label for n, _, label in tabs[start:picked + 1])) > width - 2:
+        start += 1
+    line = [("‹ " if start else " ", "dim")]
+    for number, tab, label in tabs[start:]:
+        if len(line) > 1:
+            line.append((" · ", "dim"))
+        line.append((number + " " + label, "title" if tab == active else "head"))
+    return fit(line, width)
+
+
+def need_key(item):
+    kind, host = item["kind"], item.get("host")
+    if kind == "approval" and not host and item.get("id"):
+        return "approval::" + item["id"]
+    if kind in ("blocked", "waiting") and item.get("sid"):
+        return f"@{host}::s::{item['sid']}" if host else item["sid"]
+    if kind == "job" and item.get("job"):
+        return job_key(host or "local", item["job"])
+    return "need::" + "::".join(urllib.parse.quote(str(item.get(field) or ""), safe="")
+                                for field in ("kind", "host", "sid", "id", "source", "when", "title"))
+
+
+def quota_lines(quota, width):
+    out = [(rule("Quota by provider", width), None)]
+    if not quota:
+        return out + [([("No quota readings yet.", "dim")], None)]
+    data = quota.data or {}
+    if quota.error:
+        out.append(([(clean(quota.error), "warn")], None))
+    session, weekly = data.get("session") or {}, data.get("weekly") or {}
+    percent = weekly.get("effectivePercent", weekly.get("percentUsed"))
+    out.append(([("Claude", "head")], None))
+    out.append(([(f"  5h {session.get('percentUsed', '?')}% · week {percent if percent is not None else '?'}%",
+                  pct_style(percent))], None))
+    for provider in quota.providers:
+        if provider.get("id") == "claude":
+            continue
+        out.append(([(clean(provider.get("label") or provider.get("id")), "head")], None))
+        if not provider.get("configured", True):
+            out.append(([('  not configured', "dim")], None))
+        elif not provider.get("ok"):
+            out.append(([("  " + clean(provider.get("error") or "unavailable"), "warn")], None))
+        for limit in provider.get("limits") or []:
+            percent = limit.get("percent")
+            out.append(([(f"  {clean(limit.get('label'))} {percent if percent is not None else '?'}%",
+                          pct_style(percent))], None))
+        if provider.get("balanceUsd") is not None:
+            out.append(([(f"  balance ${provider['balanceUsd']:.2f}", "warn" if provider.get("low") else "plain")], None))
+    out.append((rule("Swarm cap", width, "+ / - pin · 0 auto"), None))
+    level = quota.level()
+    override = data.get("override") or {}
+    pin = "pinned" if override.get("level") else "auto"
+    if override.get("until"):
+        pin += " until " + clean(str(override["until"]))
+    out.append(([(f"≤{CAP_SIZE.get(level, '?')} {level or 'unknown'} ({pin})", "plain")], None))
+    out.append((rule("quotamax advice", width), None))
+    advice = data.get("advice") or {}
+    for key, value in advice.items():
+        label = re.sub(r"([a-z])([A-Z])", r"\1 \2", key).replace("_", " ").lower()
+        for part in wrap(f"{label}: {value}", width - 2):
+            out.append(([(part, "plain")], None))
+    if not advice:
+        out.append(([('No advice yet.', "dim")], None))
+    return out
+
+
+def tab_rows(model, ui, width):
+    tab = ui.get("tab", "sessions")
+    if tab == "needs":
+        rows = [(rule(f"Needs you ({len(model.get('needs', []))})", width), None)]
+        for item in model.get("needs", []):
+            host = " on " + item["host"] if item.get("host") else ""
+            rows.append(([(clean(item["title"] + host), "warn"),
+                          (" · " + clean(item.get("summary") or item.get("detail")), "plain")], need_key(item)))
+            if item.get("hint"):
+                rows.append(([("  " + clean(item["hint"]), "dim")], None))
+        return rows if model.get("needs") else rows + [([("Nothing needs you.", "dim")], None)]
+    if tab == "jobs":
+        return jobs_lines(model, width, ui.get("jobs_all", False), select_apps=True) or [([("No jobs or apps.", "dim")], None)]
+    if tab == "servers":
+        return [row for host in model.get("hosts", []) for row in host_lines(host, width, 18, now=model["now"])]
+    if tab == "quota":
+        return quota_lines(model.get("quota"), width)
+    if tab == "agents":
+        return []
+    return fleet_lines(model, width, ui["show_all"], ui.get("jobs_all", False), sessions_only=True)
 
 HELP = [
+    "1–6 / ←→   tabs: Sessions, Needs, Agents, Jobs, Servers, Quota (appear when they have content)",
+    ":          command palette: type to filter, ↑↓ choose, enter runs, esc cancels",
+    "           includes jump/message by session, run /<command> in this session, approve/deny by id",
     "enter      jump to the session's terminal tab; a background session opens attached in a new tab",
     "m          type a message into the selected session, as if you typed it in its tab",
     "M          type the same message into every session in the selected session's project (its folder)",
@@ -6042,9 +6204,9 @@ HELP = [
     "           in comms and the tree, s switches between all sessions and the selected one",
     "n          new task: route plans where it should run; enter dispatches it in a new tab",
     "+ - 0      swarm cap via quotamax: raise, lower (pinned for ATC_OVERRIDE_HOURS, default 2h), auto",
-    "tab        bottom panel: all activity, the selected session, comms",
+    "b / tab    bottom panel: all activity, the selected session, comms (tab kept as an alias)",
     "p          hide or show Later, parked, background and other sessions, finished route swarms and idle jobs",
-    "jobs       enter reads status and recent log; x x runs the selected job now",
+    "jobs       enter reads status and recent log; x x runs the selected job now; app rows open read-only details",
     "PgUp PgDn  scroll the bottom panel or the open view",
     "q          quit (esc closes a view or cancels input)",
 ]
@@ -6054,7 +6216,8 @@ def render(fleet, model, ui, width, height=None):
     """The main screen. Returns (frame, selectable session ids)."""
     ui["width"] = width
     frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
-    rows = fleet_lines(model, width, ui["show_all"] or height is None, ui.get("jobs_all", False))
+    rows = (fleet_lines(model, width, True, ui.get("jobs_all", False)) if height is None
+            else tab_rows(model, ui, width))
     selectable = [sid for _l, sid in rows if sid]
     item = resolve(fleet, model, ui.get("selected"))
 
@@ -6066,11 +6229,14 @@ def render(fleet, model, ui, width, height=None):
         frame += [fit(line, width) for line in comm_lines(model["comms"], 12)]
         return frame, selectable
 
-    body = height - 3  # header, quota line and footer
-    top_h = max(4, min(len(rows), int(body * 0.6)))
-    bottom_h = max(3, body - top_h)
+    frame.insert(0, tab_line(model, ui, width))
+    body = max(1, height - 4)  # tabs, header, quota line and footer
+    has_panel = ui.get("tab", "sessions") not in ("quota", "agents")
+    top_h = max(1, min(len(rows), max(4, int(body * 0.6)))) if has_panel else body
+    bottom_h = max(0, body - top_h) if has_panel else 0
     sel_index = next((i for i, (_l, sid) in enumerate(rows) if sid and sid == ui["selected"]), 0)
-    top = max(0, min(ui.get("top_scroll", 0), sel_index), sel_index - top_h + 1)
+    top = (max(0, min(ui.get("top_scroll", 0), sel_index), sel_index - top_h + 1) if selectable
+           else max(0, ui.get("scroll", 0)))
     ui["top_scroll"] = top = min(top, max(0, len(rows) - top_h))
     shown = rows[top: top + top_h]
     for line, sid in shown:
@@ -6084,6 +6250,10 @@ def render(fleet, model, ui, width, height=None):
             frame.append([("  ", "plain")] + line)
     frame += [[]] * (top_h - len(shown))
 
+    if not bottom_h:
+        frame = frame[:height - 1]
+        frame += [[]] * max(0, height - 1 - len(frame))
+        return frame + [fit(ui["footer"], width)], selectable
     panel = ui["panel"]
     room = bottom_h - 1
     if panel == "session":
@@ -6101,7 +6271,7 @@ def render(fleet, model, ui, width, height=None):
             frame.append(pad(left[i] if i < len(left) else [], left_w) + [("  ", "plain")]
                          + fit(right[i] if i < len(right) else [], right_w))
     else:
-        frame.append(rule(title, width, "tab switches"))
+        frame.append(rule(title, width, "b switches"))
         frame += [fit(line, width) for line in left[:room]]
     frame = frame[: height - 1]
     frame += [[]] * (height - 1 - len(frame))
@@ -6126,11 +6296,13 @@ def render_view(fleet, model, ui, width, height):
     name = next((v["name"] for v in ordered_sessions(model, True) if v["sid"] == selected), None)
     if mine and name is None:
         mine = False  # a process or a server row: show everything
-    frame = [fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
-    room = height - 4
+    frame = [tab_line(model, ui, width), fit(header_line(model), width), fit(quota_line(model["quota"]), width)]
+    room = max(1, height - 5)
     if view == "help":
+        lines = [part for line in HELP for part in wrap(line, width)]
+        ui["view_scroll"] = max(0, min(ui["view_scroll"], max(0, len(lines) - room)))
         frame.append(rule("Keys", width))
-        frame += [[(line, "plain")] for line in HELP]
+        frame += [[(line, "plain")] for line in lines[ui["view_scroll"]:ui["view_scroll"] + room]]
     elif view == "detail":
         item = resolve(fleet, model, key)
         lines = selection_lines(fleet, model, item, 0, width)
@@ -6214,7 +6386,8 @@ class App:
         self.claude_cmd = claude_cmd
         self.dry_run = dry_run
         self.ui = {"selected": None, "panel": "activity", "show_all": True, "scroll": 0, "top_scroll": 0,
-                   "footer": [], "view": None, "view_mine": False, "view_scroll": 0, "view_pick": 0}
+                   "footer": [], "view": None, "view_mine": False, "view_scroll": 0, "view_pick": 0,
+                   "tab": "sessions", "agents_view": "tree"}
         self.selectable = []
         self.flash = ("", 0.0)
         self.mode = "normal"   # normal | task | plan | message
@@ -6223,6 +6396,10 @@ class App:
         self.targets = []      # sessions a message goes to
         self.armed = (None, 0.0)
         self.remotes = []
+        self.tab_state = {}
+        self.palette_pick = 0
+        self.command = ""
+        self.in_tui = False
 
     def say(self, message):
         self.flash = (message, time.time())
@@ -6232,7 +6409,17 @@ class App:
         item = resolve(self.fleet, model, self.ui["selected"])
         return item[1] if item[0] == "session" else None
 
-    def footer(self, now):
+    def footer(self, now, model=None):
+        if self.mode == "palette":
+            return [(" ↑↓ choose · enter run · esc close", "dim")]
+        if self.mode == "command":
+            return [(" run /", "title"), (self.buffer + "_", "plain"),
+                    ("   enter: review · esc: cancel", "dim")]
+        if self.mode == "command_confirm":
+            return [(f" Type {self.command} into {self.targets[0]['name']}?", "warn"),
+                    ("   enter: confirm · esc: cancel", "dim")]
+        if self.mode == "planning":
+            return [(" Planning with route… · esc: cancel", "dim")]
         if self.mode == "task":
             return [(" new task in ", "title"), (f" {short_path(self.task['cwd'])}: ", "warn"), (self.buffer + "_", "plain"),
                     ("   enter: plan it with route · esc: cancel", "dim")]
@@ -6256,26 +6443,205 @@ class App:
         message, at = self.flash
         if message and now - at < FLASH_SECONDS:
             return [(" " + message, "warn")]
-        return [(KEYS, "dim")]
+        item = resolve(self.fleet, model, self.ui["selected"]) if model else (None,)
+        kind, view = item[0], self.ui["view"]
+        keys = []
+        if view:
+            keys = ["↑↓ PgUp/PgDn scroll", "esc back"]
+            if view in ("tree", "comms"):
+                keys += ["h tree", "c comms", "s all/selected"]
+            elif view == "detail" and kind == "approval":
+                keys += ["y y approve", "n n deny"]
+        else:
+            if kind:
+                keys = ["↑↓ select"]
+            if kind == "session":
+                v = item[1]
+                keys += ["enter attach", "x x stop"] if v["kind"] == "background" else ["enter jump", "x x interrupt"]
+                if v["kind"] in ("interactive", "herdr") and v["group"] != "blocked":
+                    keys += ["m msg", "M broadcast", "C close", "F fork", "S save"]
+                    if v["status"] != "busy":
+                        keys += ["N rename", "E exit"]
+            elif kind == "closed":
+                keys += ["enter detail", "R R restore", "D D done"]
+            elif kind == "process":
+                keys += ["enter detail", "x x stop"]
+            elif kind == "job":
+                keys += ["enter status", "x x run now", "p idle jobs"]
+            elif kind == "approval":
+                keys += ["enter detail", "y y approve", "n n deny"]
+            elif kind == "remote":
+                keys += ["enter ssh"]
+            elif kind in ("helper", "swarm", "need", "app"):
+                keys += ["enter detail"]
+            if self.ui["tab"] == "quota":
+                keys += ["↑↓ PgUp/PgDn scroll", "+/- pin cap", "0 auto"]
+            else:
+                keys += ["b panel"]
+        # Keep discovery visible even in a narrow terminal.
+        return [(" : actions · ? help · " + " · ".join(keys) + (" · q back" if view else " · q quit"), "dim")]
+
+    def switch_tab(self, tab, model):
+        if tab not in [name for _, name, _ in visible_tabs(model, self.ui)]:
+            return
+        current = self.ui["tab"]
+        self.tab_state[current] = {key: self.ui[key] for key in ("selected", "panel", "scroll", "top_scroll")}
+        saved = self.tab_state.get(tab, {"selected": None, "panel": "session" if tab in ("needs", "jobs", "servers")
+                                       else "activity", "scroll": 0, "top_scroll": 0})
+        if tab == "agents":
+            saved = dict(saved, selected=self.ui["selected"])
+        self.ui.update(saved, tab=tab, view=self.ui["agents_view"] if tab == "agents" else None,
+                       view_scroll=0, view_pick=0, view_mine=False)
+        self.selectable = [key for _, key in tab_rows(model, self.ui, self.ui.get("width", 80)) if key]
+        if tab != "agents" and self.ui["selected"] not in self.selectable:
+            self.ui["selected"] = self.selectable[0] if self.selectable else None
+        self.armed, self.flash = (None, 0.0), ("", 0.0)
+
+    def palette_actions(self, model):
+        actions = [(label, key, None) for label, key in PALETTE_KEYS]
+        actions += [("show " + label + " tab", number, None) for number, _, label in visible_tabs(model, self.ui)]
+        for v in ordered_sessions(model, True):
+            name = v.get("display_name") or v["name"]
+            label = name if name == v["name"] else name + " (" + v["name"] + ")"
+            actions.append(("jump to " + label, "\n", v["sid"]))
+            if v["kind"] in ("interactive", "herdr"):
+                actions.append(("message " + label, "m", v["sid"]))
+        for host in model.get("hosts", []):
+            for group in host["groups"].values():
+                for v in group:
+                    actions.append((f"jump to {v['name']} on {host['host']}", "\n", f"@{host['host']}::s::{v['sid']}"))
+        for item in model.get("needs", []):
+            if item["kind"] == "approval" and not item.get("host"):
+                for label, key in (("approve", "y"), ("deny", "n")):
+                    actions.append((label + " " + item["id"] + " · " + item["title"], key, need_key(item)))
+        query = self.buffer.strip()
+        command = query[4:].strip() if query.lower().startswith("run /") else ""
+        actions.insert(0, ("run " + command + " in this session" if command else "run /<command> in this session",
+                           "command", None))
+        words = query.casefold().split()
+        return [action for action in actions if all(word in action[0].casefold() for word in words)]
+
+    def handle_palette(self, key, model):
+        actions = self.palette_actions(model)
+        self.palette_pick = max(0, min(self.palette_pick, len(actions) - 1))
+        if key == "\x1b":
+            self.mode = "normal"
+        elif key in (curses.KEY_DOWN, curses.KEY_UP):
+            self.palette_pick = max(0, min(len(actions) - 1, self.palette_pick + (1 if key == curses.KEY_DOWN else -1)))
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            if not actions:
+                return True
+            label, action, target = actions[self.palette_pick]
+            query = self.buffer.strip()
+            self.mode = "normal"
+            if target:
+                tab = "needs" if target.startswith("approval::") else "servers" if target.startswith("@") else "sessions"
+                self.switch_tab(tab, model)
+                self.ui["selected"] = target
+            if action == "command":
+                v = self.selected_view(model)
+                if not v or v["kind"] not in ("interactive", "herdr") or v["group"] == "blocked" or v["status"] == "busy":
+                    self.say("select an idle session to run a command")
+                    return True
+                self.targets, self.buffer, self.mode = [v], "", "command"
+                if query.lower().startswith("run /"):
+                    self.review_command(query[4:])
+                return True
+            if label == "new task":  # n means deny on an approval row
+                self.new_task(self.selected_view(model))
+                return True
+            if label in ("approve selected approval", "deny selected approval"):
+                if resolve(self.fleet, model, self.ui["selected"])[0] != "approval":
+                    self.say("select an approval in Needs")
+                    return True
+            if action in ("\n", "m", "M", "x", "C", "F", "R", "E", "S", "D", "N", "y", "n", "+", "-", "0", "b", "p"):
+                selected = self.ui["selected"]
+                if self.ui["tab"] == "agents":
+                    self.switch_tab("sessions", model)
+                    self.ui["selected"] = selected
+                self.ui["view"] = None
+            return self.handle(action, model)
+        else:
+            self.palette_pick = 0
+            self.edit(key, lambda text: None)
+        return True
+
+    def review_command(self, text):
+        command = "/" + text.lstrip("/").strip()
+        if not re.match(r"^/[A-Za-z0-9][A-Za-z0-9:_-]*(?:\s.*)?$", command) or any(ord(c) < 32 for c in command):
+            return self.say("enter a slash command, for example /status")
+        self.command, self.mode = command, "command_confirm"
+
+    def perform(self, action, *args):
+        if self.in_tui:
+            threading.Thread(target=action, args=args, daemon=True).start()
+        else:
+            action(*args)
+
+    def new_task(self, v):
+        self.task = {"cwd": v["cwd"] if v else os.getcwd(), "text": "", "plan": None, "error": None}
+        self.buffer, self.mode = "", "task"
 
     # -- keys
 
     def handle(self, key, model):
+        if self.mode == "palette":
+            return self.handle_palette(key, model)
+        if self.mode == "command":
+            return self.edit(key, self.review_command)
+        if self.mode == "command_confirm":
+            if key == "\x1b":
+                self.mode = "normal"
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.mode = "normal"
+                v = resolve(self.fleet, model, self.targets[0]["sid"])
+                if v[0] != "session" or v[1]["status"] == "busy" or v[1]["group"] == "blocked":
+                    self.say("session is no longer idle; command cancelled")
+                elif self.command == "/exit" and exit_refusal(v[1]):
+                    self.say(exit_refusal(v[1]))
+                else:
+                    self.queue_message(self.command, [v[1]])
+            return True
+        if self.mode == "planning":
+            if key == "\x1b":
+                self.mode = "normal"
+            return True
         if self.mode == "task":
             return self.edit(key, self.submit_task)
         if self.mode == "message":
-            return self.edit(key, self.submit_message)
+            return self.edit(key, lambda text: self.queue_message(text, self.targets))
         if self.mode == "rename":
-            return self.edit(key, self.submit_rename)
+            return self.edit(key, lambda text: self.perform(self.submit_rename, text, self.targets[0]))
         if self.mode == "plan":
             return self.handle_plan_key(key)
+        if key == ":":
+            self.mode, self.buffer, self.palette_pick = "palette", "", 0
+            return True
+        tabs = visible_tabs(model, self.ui)
+        if key in [number for number, _, _ in TABS]:
+            tab = next(tab for number, tab, _ in TABS if number == key)
+            self.switch_tab(tab, model)
+            return True
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            names = [tab for _, tab, _ in tabs]
+            index = names.index(self.ui["tab"])
+            self.switch_tab(names[(index + (1 if key == curses.KEY_RIGHT else -1)) % len(names)], model)
+            return True
+        if key in ("h", "c"):
+            view = "tree" if key == "h" else "comms"
+            if self.ui["tab"] == "agents" and self.ui["view"] == view:
+                self.switch_tab("sessions", model)
+            else:
+                self.ui["agents_view"] = view
+                self.switch_tab("agents", model)
+            return True
         if key in ("y", "n") and self.ui["view"] in (None, "detail"):
             item = resolve(self.fleet, model, self.ui["selected"])
             if item[0] == "approval":
                 self.confirm_approval(key, item[1])
                 return True
         if self.ui["view"]:
-            return self.handle_view_key(key)
+            return self.handle_view_key(key, model)
         if key in ("q", "Q"):
             return False
         sel = self.selectable
@@ -6289,7 +6655,7 @@ class App:
             self.ui["scroll"] += 10
         elif key in (curses.KEY_PPAGE, "K"):
             self.ui["scroll"] = max(0, self.ui["scroll"] - 10)
-        elif key == "\t":
+        elif key in ("b", "\t") and self.ui["tab"] != "quota":
             order = ["activity", "session"] if self.ui.get("width", 0) >= 150 else ["activity", "session", "comms"]
             if self.ui["panel"] not in order:
                 self.ui["panel"] = order[-1]
@@ -6299,27 +6665,27 @@ class App:
             if item[0] == "job":
                 self.fleet.loom.load_detail(item[1], item[2]["name"])
                 self.ui.update(view="detail", view_scroll=0)
-            elif item[0] in ("helper", "process", "closed", "swarm", "approval"):
+            elif item[0] in ("helper", "process", "closed", "swarm", "approval", "need", "app"):
                 self.ui.update(view="detail", view_scroll=0)
             elif item[0] == "remote":
-                self.open_remote(item[1], item[2])
+                self.perform(self.open_remote, item[1], item[2])
             else:
-                self.jump(v)
+                self.perform(self.jump, v)
         elif key == "p":
-            self.ui["show_all"] = not self.ui["show_all"]
-            self.ui["jobs_all"] = not self.ui.get("jobs_all", False)
-        elif key in ("c", "h", "?"):
-            self.ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0,
-                           view_mine=False)
+            if self.ui["tab"] == "jobs":
+                self.ui["jobs_all"] = not self.ui.get("jobs_all", False)
+            else:
+                self.ui["show_all"] = not self.ui["show_all"]
+        elif key == "?":
+            self.ui.update(view="help", view_scroll=0, view_pick=0, view_mine=False)
         elif key in ("+", "="):
-            self.say(self.quota.step(+1))
+            self.perform(lambda: self.say(self.quota.step(+1, self.dry_run)))
         elif key in ("-", "_"):
-            self.say(self.quota.step(-1))
+            self.perform(lambda: self.say(self.quota.step(-1, self.dry_run)))
         elif key == "0":
-            self.say(self.quota.clear())
+            self.perform(lambda: self.say(self.quota.clear(self.dry_run)))
         elif key == "n":
-            self.task = {"cwd": v["cwd"] if v else os.getcwd(), "text": "", "plan": None, "error": None}
-            self.buffer, self.mode = "", "task"
+            self.new_task(v)
         elif key in ("C", "F"):
             self.session_command(v, {"C": "/closecode", "F": "/forkcode"}[key], key)
         elif key == "m":
@@ -6357,6 +6723,10 @@ class App:
             self.save_close_session(v)
         elif key == "N":
             self.start_rename(v)
+        elif key in (curses.KEY_DOWN, "j") and self.ui["tab"] == "quota":
+            self.ui["scroll"] += 1
+        elif key in (curses.KEY_UP, "k") and self.ui["tab"] == "quota":
+            self.ui["scroll"] = max(0, self.ui["scroll"] - 1)
         return True
 
     def confirm_approval(self, key, item):
@@ -6389,7 +6759,7 @@ class App:
         host, agent = item[1], item[2]
         where = f" on {host['host']}" if host else ""
         if self.confirm(f"x:{agent['pid']}{where}", f"stop {agent['tool']} pid {agent['pid']}{where}"):
-            self.say(stop_process(host["host"] if host else None, agent["pid"], self.dry_run))
+            self.perform(lambda: self.say(stop_process(host["host"] if host else None, agent["pid"], self.dry_run)))
 
     def run_job(self, item):
         host, name = item[1], item[2]["name"]
@@ -6418,16 +6788,19 @@ class App:
             return self.say(f"{v['name']} is blocked on a prompt: answer it first (enter jumps there)")
         if self.confirm(f"{key}:{v['sid']}", f"type {command} into {v['name']}"):
             self.targets = [v]
-            self.submit_message(command)
+            self.queue_message(command, [v])
 
     def open_remote(self, host, v):
         self.say(open_tab(HOME, remote_shell_command(host["host"], v.get("cwd")), self.dry_run))
 
-    def handle_view_key(self, key):
+    def handle_view_key(self, key, model):
         ui = self.ui
         if key in ("\x1b", "q", "c", "h", "?") and not (key == "c" and ui["view"] != "comms") \
                 and not (key == "h" and ui["view"] != "tree") and not (key == "?" and ui["view"] != "help"):
-            ui["view"] = None
+            if ui["tab"] == "agents" and ui["view"] in ("tree", "comms"):
+                self.switch_tab("sessions", model)
+            else:
+                ui["view"] = ui["agents_view"] if ui["tab"] == "agents" else None
         elif key in ("c", "h", "?"):
             ui.update(view={"c": "comms", "h": "tree", "?": "help"}[key], view_scroll=0, view_pick=0, view_mine=False)
         elif key == "s":
@@ -6439,10 +6812,10 @@ class App:
         elif key in (curses.KEY_UP, "k"):
             ui["view_pick"] = max(0, ui["view_pick"] - 1)
             ui["view_scroll"] = max(0, ui["view_scroll"] - 1)
-        elif key == curses.KEY_NPAGE:
+        elif key in (curses.KEY_NPAGE, "J"):
             ui["view_pick"] += 10
             ui["view_scroll"] += 10
-        elif key == curses.KEY_PPAGE:
+        elif key in (curses.KEY_PPAGE, "K"):
             ui["view_pick"] = max(0, ui["view_pick"] - 10)
             ui["view_scroll"] = max(0, ui["view_scroll"] - 10)
         return True
@@ -6476,20 +6849,28 @@ class App:
             return self.say("nothing to message (background sessions: enter attaches to them)")
         self.targets, self.buffer, self.mode = targets, "", "message"
 
-    def submit_message(self, text):
+    def submit_message(self, text, targets=None):
         sent, skipped = [], []
-        for v in self.targets:
-            delivered, detail = deliver(self.fleet, self.terminals, v, text)
+        for v in self.targets if targets is None else targets:
+            delivered, detail = deliver(self.fleet, self.terminals, v, text, self.dry_run)
+            audit({"transport": "screen", "tool": "atc_message", "arguments": {"session": v["sid"], "text": text},
+                   "outcome": "dry run" if self.dry_run else "done" if delivered else "refused", "detail": detail})
             if delivered:
                 sent.append(v["name"])
             elif detail.startswith("blocked"):
                 skipped.append(v["name"])  # typing would answer its permission prompt or question
             else:
                 skipped.append(f"{v['name']} ({detail})")
-        message = f"sent to {', '.join(sent)}" if sent else "sent to nobody"
+        message = ("dry run: message to " if self.dry_run else "sent to ") + (", ".join(sent) if sent else "nobody")
         if skipped:
             message += f"; skipped {', '.join(skipped)} (blocked on a prompt: answer it there)"
         self.say(message)
+
+    def queue_message(self, text, targets):
+        targets = list(targets)
+        who = targets[0]["name"] if len(targets) == 1 else f"{len(targets)} sessions"
+        self.say("sending to " + who + "…")
+        self.perform(self.submit_message, text, targets)
 
     def interrupt(self, v):
         if not v:
@@ -6499,18 +6880,20 @@ class App:
             return
         if v["kind"] == "background" and self.dry_run:
             return self.say(f"dry run: claude stop {v['id']}")
-        self.say(interrupt_session(self.fleet, self.terminals, self.claude_cmd, v))
+        self.perform(lambda: self.say(interrupt_session(self.fleet, self.terminals, self.claude_cmd, v, self.dry_run)))
 
     def restore_closed(self, c):
         """R R: open a closed session with `claude --resume <sid>` in a new tab."""
         if not self.confirm(f"R:{c['sid']}", f"restore {c.get('title') or c['sid'][:8]}"):
             return
-        self.say(open_tab(c.get("cwd") or HOME, resume_command(self.claude_cmd, c["sid"]), self.dry_run))
+        self.perform(lambda: self.say(open_tab(c.get("cwd") or HOME, resume_command(self.claude_cmd, c["sid"]), self.dry_run)))
 
     def hide_closed(self, c):
         """D D: hide a closed session from the list."""
         if not self.confirm(f"D:{c['sid']}", f"hide {c.get('title') or c['sid'][:8]}"):
             return
+        if self.dry_run:
+            return self.say("dry run: hide " + (c.get("title") or c["sid"][:8]))
         if self.fleet.closed:
             self.fleet.closed.hide(c["sid"], "done")
             self.say(f"hidden {c.get('title') or c['sid'][:8]}")
@@ -6524,7 +6907,7 @@ class App:
             return self.say(refusal)
         if self.confirm(f"E:{v['sid']}", f"exit {v['name']} (/exit)"):
             self.targets = [v]
-            self.submit_message("/exit")
+            self.queue_message("/exit", [v])
 
     def start_rename(self, v):
         """N N: open the rename input, pre-filled with a suggestion."""
@@ -6543,17 +6926,17 @@ class App:
         self.buffer = suggestion
         self.mode = "rename"
 
-    def submit_rename(self, text):
+    def submit_rename(self, text, target=None):
         """Send /rename <name> to the session."""
         name = rename_slug(text)
         if not name:
             return self.say("name must be lowercase-hyphen (a-z, 0-9, -)")
-        v = self.targets[0]
-        delivered, detail = deliver(self.fleet, self.terminals, v, f"/rename {name}")
+        v = target or self.targets[0]
+        delivered, detail = deliver(self.fleet, self.terminals, v, f"/rename {name}", self.dry_run)
         if delivered:
             # Also rename the terminal tab
             self.rename_terminal(v, name)
-            self.say(f"sent /rename {name} to {v['name']}")
+            self.say(("dry run: " if self.dry_run else "sent ") + f"/rename {name} to {v['name']}")
         else:
             self.say(f"couldn't rename: {detail}")
 
@@ -6570,12 +6953,18 @@ class App:
             return self.say(f"{v['name']} is blocked: answer it first")
         if self.confirm(f"S:{v['sid']}", f"save and close {v['name']} (/closecode)"):
             self.targets = [v]
-            self.submit_message("/closecode")
+            self.queue_message("/closecode", [v])
 
     def submit_task(self, text):
-        self.task["text"] = text
-        self.task["plan"], self.task["error"] = route_plan(self.route_cmd, text, self.task["cwd"])
-        self.mode = "plan"
+        task = self.task
+        task["text"] = text
+        self.mode = "planning"
+
+        def work():
+            task["plan"], task["error"] = route_plan(self.route_cmd, text, task["cwd"])
+            if self.task is task and self.mode == "planning":
+                self.mode = "plan"
+        self.perform(work)
 
     def handle_plan_key(self, key):
         task = self.task
@@ -6583,24 +6972,48 @@ class App:
             self.mode = "normal"
         elif key in ("c", "C"):
             claude = " ".join(shlex.quote(p) for p in self.claude_cmd)
-            self.say(open_tab(task["cwd"], f"{claude} {shlex.quote(task['text'])}", self.dry_run))
+            self.perform(lambda: self.say(open_tab(task["cwd"], f"{claude} {shlex.quote(task['text'])}", self.dry_run)))
             self.mode = "normal"
         elif key in ("\n", "\r", curses.KEY_ENTER) and task.get("plan"):
             command = dispatch_command(self.route_cmd, self.claude_cmd, task["plan"], task["text"])
-            self.say(f"{task['plan'].get('chosen')}: " + open_tab(task["cwd"], command, self.dry_run))
+            self.perform(lambda: self.say(f"{task['plan'].get('chosen')}: " + open_tab(task["cwd"], command, self.dry_run)))
             self.mode = "normal"
         return True
 
 
+def palette_frame(app, model, width, height):
+    actions = app.palette_actions(model)
+    app.palette_pick = max(0, min(app.palette_pick, len(actions) - 1))
+    room = max(1, height - 4)
+    top = max(0, app.palette_pick - room + 1)
+    frame = [tab_line(model, app.ui, width), rule("Command palette", width, f"{len(actions)} actions"),
+             fit([(" : " + app.buffer + "_", "plain")], width)]
+    for i, (label, key, _) in enumerate(actions[top:top + room], start=top):
+        hint = {"\n": "enter", "\x1b": "esc", curses.KEY_DOWN: "↓/j", curses.KEY_UP: "↑/k",
+                curses.KEY_NPAGE: "PgDn/J", curses.KEY_PPAGE: "PgUp/K", curses.KEY_LEFT: "←",
+                curses.KEY_RIGHT: "→", "command": ""}.get(key, key)
+        label = clean(label) + ("  [" + str(hint) + "]" if hint else "")
+        frame.append(fit([("▶ " if i == app.palette_pick else "  ", "sel"),
+                          (label, "plain+sel" if i == app.palette_pick else "plain")], width))
+    if not actions:
+        frame.append([("  No matching actions.", "dim")])
+    frame = frame[:height - 1]
+    frame += [[]] * max(0, height - 1 - len(frame))
+    return frame + [fit(app.footer(time.time(), model), width)]
+
+
 def draw(stdscr, app, model, styles):
-    app.ui["footer"] = app.footer(time.time())
     height, width = stdscr.getmaxyx()
+    app.ui["footer"] = app.footer(time.time(), model)
     frame, app.selectable = render(app.fleet, model, app.ui, width, height)
-    if app.selectable and app.ui["selected"] not in app.selectable:
-        app.ui["selected"] = app.selectable[0]
+    if app.ui["tab"] != "agents" and app.ui["selected"] not in app.selectable:
+        app.ui["selected"] = app.selectable[0] if app.selectable else None
+        app.ui["footer"] = app.footer(time.time(), model)
         frame, app.selectable = render(app.fleet, model, app.ui, width, height)
     if app.ui["view"]:
         frame = render_view(app.fleet, model, app.ui, width, height)
+    if app.mode == "palette":
+        frame = palette_frame(app, model, width, height)
     stdscr.erase()
     for y, line in enumerate(frame[:height]):
         x = 0
@@ -6621,6 +7034,7 @@ def tui(stdscr, app):
     curses' own key timeout stops being honoured after the terminal grows, which froze the screen."""
     curses.curs_set(0)
     stdscr.nodelay(True)
+    app.in_tui = True
     styles = init_styles()
     model, refreshed = None, 0.0
     debug = open(os.environ["ATC_DEBUG_LOG"], "a", buffering=1) if os.environ.get("ATC_DEBUG_LOG") else None

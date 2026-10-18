@@ -44,8 +44,27 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 
 ## Levers
 
+The live screen starts with **1 Sessions · 2 Needs · 3 Agents · 4 Jobs · 5 Servers · 6 Quota**.
+Tabs appear when their first content arrives and stay available until you quit; their numbers stay fixed.
+Sessions keeps the local session list, swarms, other agents, Later and closed sessions. Needs shows the shared
+queue, including approvals. Agents holds hierarchy and comms; Jobs holds jobs and apps; Servers holds each
+host's sessions and processes. Quota expands every provider, the swarm cap and its pin, and quotamax's advice.
+The Tools tab will arrive with the tools feature. `--once`, `--tree`, `--comms` and `--json` keep their existing output.
+
+Press `:` for the command palette. Type words to filter actions, use arrows to choose, and Enter to run.
+For example, `jump beta` finds that session, `message beta` opens its message input, and `run /status` previews
+a slash command for the selected idle session, then asks for Enter to confirm. `approve <id>` and `deny <id>`
+select a local approval and start the usual two-press confirmation. Escape cancels. Actions use the same
+guards and confirmations as their keys, including `--dry-run`.
+
+The footer shows actions for the selected row; `?` shows the full, scrollable help. Each tab remembers its
+selection and bottom panel. `h` and `c` open the Agents tab; Escape returns to Sessions. On narrow terminals,
+the tab bar scrolls to keep the active tab visible.
+
 | Key | Does |
 |---|---|
+| `1`–`6` / `←` `→` | Select a tab by its fixed number, or cycle available tabs |
+| `:` | Open the command palette; type to filter, `↑` `↓` choose, `enter` runs, `esc` cancels |
 | `enter` | Jump to the session's terminal tab (iTerm2, Terminal.app, tmux, Herdr). A background session opens attached in a new tab |
 | `enter` on a subagent | Drill in: who started it, its task, every step it took, its report, its own helpers |
 | `enter` on a process or server row | Its command, uptime and what started it; on a server's session, an ssh shell there in a new tab |
@@ -55,12 +74,23 @@ the agents already write to disk, puts it on one screen, and lets you act on it 
 | `C` `C` / `F` `F` | Type `/closecode` or `/forkcode` into the session: wrap it up, or split work off |
 | `+` `-` `0` | Raise, lower or reset the swarm cap (`quotamax override`, pinned for 2h by default) |
 | `n` | New task: `route --plan-only` says where it should run (Claude, Codex, Kimi …); `enter` dispatches it in a new tab |
-| `c` `h` `tab` `p` `?` `q` | Comms, hierarchy, bottom panel, fold parked sessions away, help, quit |
+| `R` `R` / `D` `D` | Restore a closed session / hide it as done |
+| `E` `E` / `S` `S` / `N` `N` | Exit an idle session if its repo is saved / save and close / rename |
+| `y` `y` / `n` `n` | Approve / deny a local approval in Needs, on its row or in its detail view |
+| `c` / `h` / `s` | Agents: comms / hierarchy / all or selected session |
+| `b` | Cycle the bottom panel: activity, selected row detail, comms (wide screens keep comms alongside); `tab` remains an alias |
+| `p` | Fold or expand quiet sessions, Later and finished swarms in Sessions; idle jobs in Jobs |
+| `PgUp` `PgDn` / `J` `K` | Scroll activity or an open view; scroll the Quota tab |
+| `?` / `q` / `esc` | Full help / quit (close an open view first) / close view or cancel input |
 
 **Steering never types into a session that is blocked on a prompt.** A permission prompt's default answer is
 "Yes", so a message ending in Enter would approve whatever it was asking. `atc` re-reads the session's state
 right before typing and skips it; press `enter` to go and answer the prompt yourself. Sessions in Herdr panes
 are steered through `herdr agent prompt`, which has the same guard.
+Deliveries to the same terminal or Herdr pane are serialized across threads and local atc processes: each
+fresh state check, message and Enter completes before the next delivery checks again. Different targets can
+still receive messages in parallel. While a message or project broadcast runs, the footer shows its progress
+before reporting all recipients and skips.
 
 ## Install
 
@@ -116,8 +146,10 @@ The web Needs view, MCP `atc_needs_me`, `--json` (including menu-bar consumers s
 share `needs`. Blocked sessions from every machine come first, then pending lever approvals, a-mail approvals, requests, proposals and
 devices awaiting approval, then failing loom jobs, Later items due within an hour, waiting sessions (newest first
 across machines), and a-mail inbox waiting.
-The terminal keeps its session sections and adds an **a-mail** section after Waiting and a short header note;
-`--once` includes both. Answer session prompts in that session, and a-mail items in **Roost or the a-mail app**.
+The terminal's **Needs** tab shows the whole queue in order, with details and a hint about where to answer.
+`--once` keeps its session sections, **a-mail** section and short header note. Answer session prompts in that
+session, and a-mail items in **Roost or the a-mail app**. Remote approvals show where to decide them;
+`y y` and `n n` decide only this machine's approvals.
 
 The public a-mail CLI's `status --json` returns counts without reading or acknowledging messages. atc only
 uses those counts; it does not fetch message content or retain the returned server or address. Polls run in the
@@ -186,15 +218,16 @@ mark cached items from unavailable machines as last seen. Due Later items retain
 
 ### Loom jobs and apps
 
-When `loom` is on `PATH`, **Jobs & apps** appears after Other agents in the terminal, and **Jobs** appears in the
+When `loom` is on `PATH`, **Jobs & apps** appears in the terminal's **4 Jobs** tab, and **Jobs** appears in the
 web navigation. Set `ATC_LOOM` to a command override (arguments are supported), or to an empty string to disable
 it. Missing loom is silent. Add loom hosts with `ATC_LOOM_HOSTS=server1,server2`; these are separate from atc's
 agent hosts and are reached with `loom --host <host> jobs list --json`. Apps come from local `loom list --json`.
 
 Each host lists failing jobs first, then running jobs, then estimated due times. The terminal shows the nearest
 due job and folds the remaining healthy idle jobs into one line, including an expired count; `p` toggles those
-rows alongside Parked. Select a job and press Enter for status and recent logs. `x x` triggers it now. The web
-Jobs view shows all jobs, links to status, and has **Run now** buttons using the existing preview and confirm
+rows in Jobs. Select a job and press Enter for status and recent logs. `x x` triggers it now.
+App rows are also selectable, including those after the last job; Enter shows their cached status, health and URL.
+The web Jobs view shows all jobs, links to status, and has **Run now** buttons using the existing preview and confirm
 dialog. MCP `atc_jobs` reads the same list; pass `job` and optionally `host` for status. `atc_run_job` accepts the
 exact `job` name and an optional `host` (default `local`), and supports confirmation, `dry_run`, and the audit log.
 Manual runs are allowed for known expired jobs; expiration excludes them from due estimates.
